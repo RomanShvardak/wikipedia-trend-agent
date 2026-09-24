@@ -256,8 +256,11 @@ def cache_fresh(path: Path, ttl_hours: int) -> bool:
 def _read_cached_response(
     url: str,
     ttl_hours: int,
-    series_id: str,
-) -> dict[str, Any] | None:
+    series: Mapping[str, Any],
+    start_ymd: str,
+    end_ymd: str,
+) -> list[SeriesRow] | None:
+    series_id = series["id"]
     cache_path = cache_path_for_key(cache_key_for_url(url))
     if not cache_path.exists():
         return None
@@ -265,9 +268,23 @@ def _read_cached_response(
     if cache_fresh(cache_path, ttl_hours):
         try:
             envelope = json.loads(cache_path.read_text(encoding="utf-8"))
-            return envelope["response"]
-        except (OSError, TypeError, KeyError, json.JSONDecodeError):
-            pass
+            payload_bytes = json.dumps(
+                envelope["response"], ensure_ascii=False
+            ).encode("utf-8")
+            return _parse_response(payload_bytes, series, start_ymd, end_ymd)
+        except (OSError, TypeError, KeyError, json.JSONDecodeError, FetchError):
+            print(
+                f"{series_id}: invalid cache entry; refetching from network",
+                file=sys.stderr,
+            )
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError as error:
+                print(
+                    f"{series_id}: could not remove invalid cache entry: {error}",
+                    file=sys.stderr,
+                )
+            return None
 
     try:
         envelope = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -293,7 +310,12 @@ def _read_cached_response(
     return None
 
 
-def _parse_response(body: bytes, series: Mapping[str, Any]) -> list[SeriesRow]:
+def _parse_response(
+    body: bytes,
+    series: Mapping[str, Any],
+    start_ymd: str,
+    end_ymd: str,
+) -> list[SeriesRow]:
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -301,6 +323,8 @@ def _parse_response(body: bytes, series: Mapping[str, Any]) -> list[SeriesRow]:
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
         raise FetchError("response body must be an AQS object with an items list")
 
+    start_date = _parse_ymd(start_ymd)
+    end_date = _parse_ymd(end_ymd)
     rows: list[SeriesRow] = []
     for index, item in enumerate(payload["items"]):
         if not isinstance(item, dict):
@@ -310,19 +334,24 @@ def _parse_response(body: bytes, series: Mapping[str, Any]) -> list[SeriesRow]:
             not isinstance(timestamp, str)
             or len(timestamp) != 10
             or not timestamp.isdigit()
+            or timestamp[-2:] != "00"
         ):
             raise FetchError(f"item {index} has an invalid timestamp")
         raw_views = item.get("views")
         if isinstance(raw_views, bool) or not isinstance(raw_views, (int, str)):
             raise FetchError(f"item {index} has an invalid views value")
         try:
-            date = datetime.strptime(timestamp[:8], "%Y%m%d").date().isoformat()
+            item_date = datetime.strptime(timestamp[:8], "%Y%m%d").date()
             views = int(raw_views)
         except (TypeError, ValueError) as error:
             raise FetchError(f"item {index} has an invalid date or views value") from error
+        if not start_date <= item_date <= end_date:
+            raise FetchError(f"item {index} is outside the requested chunk")
+        if views < 0:
+            raise FetchError(f"item {index} has a negative views value")
         rows.append(
             {
-                "date": date,
+                "date": item_date.isoformat(),
                 "views": views,
                 "series_id": series["id"],
                 "project": series["project"],
@@ -343,14 +372,14 @@ def _fetch_series(
     yesterday_utc: date,
 ) -> tuple[list[SeriesRow], bool, str]:
     url = series_url(series["project"], series["article"], start_ymd, end_ymd)
-    cached = _read_cached_response(url, ttl_hours, series["id"])
-    if cached is not None:
-        cache_hit = True
-        payload_bytes = json.dumps(cached, ensure_ascii=False).encode("utf-8")
-    else:
-        cache_hit = False
-        payload_bytes = b""
-        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+    cached_rows = _read_cached_response(
+        url, ttl_hours, series, start_ymd, end_ymd
+    )
+    if cached_rows is not None:
+        return cached_rows, True, "ok"
+
+    payload_bytes = b""
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
             common.throttle(1.0, pace)
             try:
                 response = transport(url, headers, 30.0)
@@ -384,19 +413,18 @@ def _fetch_series(
             payload_bytes = response.body
             break
 
-    rows = _parse_response(payload_bytes, series)
-    if not cache_hit:
-        parsed_payload = json.loads(payload_bytes.decode("utf-8"))
-        cache_path = cache_path_for_key(cache_key_for_url(url))
-        dump_json(
-            {
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-                "status": 200,
-                "response": parsed_payload,
-            },
-            cache_path,
-        )
-    return rows, cache_hit, "ok"
+    rows = _parse_response(payload_bytes, series, start_ymd, end_ymd)
+    parsed_payload = json.loads(payload_bytes.decode("utf-8"))
+    cache_path = cache_path_for_key(cache_key_for_url(url))
+    dump_json(
+        {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "status": 200,
+            "response": parsed_payload,
+        },
+        cache_path,
+    )
+    return rows, False, "ok"
 
 
 def _write_series_csv(out_dir: str | Path, rows: list[SeriesRow]) -> Path:

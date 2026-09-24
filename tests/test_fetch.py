@@ -138,7 +138,12 @@ def test_valid_spec_writes_exact_deterministic_csv(
         ["pl-post-przerywany", "pl.wikipedia", "Post_przerywany"],
         ["pl-post-przerywany", "pl.wikipedia", "Post_przerywany"],
     ]
-    assert [(row[0], row[1]) for row in rows[1:]] == [("2026-09-23", "1868")] * 4
+    assert [(row[0], row[1]) for row in rows[1:]] == [
+        ("2024-09-23", "1868"),
+        ("2025-09-23", "1868"),
+        ("2024-09-23", "1868"),
+        ("2025-09-23", "1868"),
+    ]
     assert len(stub.calls) == 4
     assert len(throttle_calls) == 4
     stdout = capsys.readouterr().out
@@ -472,11 +477,14 @@ def test_stale_cache_envelope_refetches_and_is_rewritten(
     stale_path = _write_cache(spec_example_path, response, stale_at)
     second_url = _series_urls(spec_example_path)[2]
     second_path = common.cache_path_for_key(common.cache_key_for_url(second_url))
+    second_response = json.loads(
+        _chunk_aware_body(second_url, json.dumps(response).encode("utf-8"))
+    )
     common.dump_json(
         {
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "status": 200,
-            "response": response,
+            "response": second_response,
         },
         second_path,
     )
