@@ -1,11 +1,14 @@
 """End-to-end tests for the offline Wikipedia trend analyzer."""
 from __future__ import annotations
 
+import ast
 import csv
 import json
 import math
 from datetime import date, timedelta
 from pathlib import Path
+
+import pytest
 
 import analyze_trends
 
@@ -163,6 +166,7 @@ def _write_two_series_spec(tmp_path: Path) -> Path:
         ],
     }
     path = tmp_path / "two-series-spec.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -243,3 +247,298 @@ def test_two_series_preserves_spec_order_and_one_spike_is_median_replaced(
         after_z["growth"]["y1"]["clean"], sort_keys=True
     )
     assert before_z["trend_direction"] == after_z["trend_direction"]
+
+
+def _observation(
+    day: date, views: int = 100, *, series_id: str = "growth-series"
+) -> analyze_trends.Observation:
+    return analyze_trends.Observation(
+        date=day,
+        views=views,
+        series_id=series_id,
+        project="en.wikipedia",
+        article="Growth_series",
+    )
+
+
+def _constant_observations(start: date, count: int, views: int = 100) -> list[analyze_trends.Observation]:
+    return [_observation(start + timedelta(days=index), views) for index in range(count)]
+
+
+@pytest.mark.parametrize(
+    ("days", "start", "previous_start", "previous_end"),
+    [
+        (91, date(2024, 1, 1), date(2023, 10, 2), date(2023, 12, 31)),
+        (365, date(2023, 4, 2), date(2022, 4, 2), date(2023, 4, 1)),
+        (730, date(2022, 4, 2), date(2020, 4, 2), date(2022, 4, 1)),
+    ],
+)
+def test_growth_windows_use_inclusive_equal_calendar_ranges(
+    days: int,
+    start: date,
+    previous_start: date,
+    previous_end: date,
+) -> None:
+    end = start + timedelta(days=days - 1)
+    observations = _constant_observations(previous_start, days * 2)
+
+    result = analyze_trends.compute_growth_for_days(observations, end, days)
+
+    assert result["start"] == start.isoformat()
+    assert result["end"] == end.isoformat()
+    assert result["previous_start"] == previous_start.isoformat()
+    assert result["previous_end"] == previous_end.isoformat()
+    assert result["pct"] == 0.0
+    assert result["clean"]["pct"] == 0.0
+
+
+@pytest.mark.parametrize(("days", "floor"), [(91, 73), (365, 292), (730, 584)])
+def test_growth_coverage_floor_boundaries(days: int, floor: int) -> None:
+    start = date(2020, 1, 1)
+    end = start + timedelta(days=days * 2 - 1)
+    current_start = end - timedelta(days=days - 1)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=days - 1)
+    all_days = _constant_observations(previous_start, days * 2)
+
+    below_floor = [
+        observation
+        for observation in all_days
+        if previous_start <= observation.date <= previous_end
+    ][: floor - 1] + [
+        observation
+        for observation in all_days
+        if current_start <= observation.date <= end
+    ][: floor - 1]
+    below_result = analyze_trends.compute_growth_for_days(below_floor, end, days)
+    assert below_result["pct"] is None
+    assert below_result["clean"]["pct"] is None
+    assert below_result["reason"] == analyze_trends.INSUFFICIENT_OBSERVATIONS_REASON
+    assert below_result["clean"]["reason"] == analyze_trends.INSUFFICIENT_OBSERVATIONS_REASON
+
+    exact_floor = [
+        observation
+        for observation in all_days
+        if previous_start <= observation.date <= previous_end
+    ][:floor] + [
+        observation
+        for observation in all_days
+        if current_start <= observation.date <= end
+    ][:floor]
+    exact_result = analyze_trends.compute_growth_for_days(exact_floor, end, days)
+    assert len([row for row in exact_floor if current_start <= row.date <= end]) == floor
+    assert len([row for row in exact_floor if previous_start <= row.date <= previous_end]) == floor
+    assert exact_result["pct"] == 0.0
+    assert exact_result["clean"]["pct"] == 0.0
+
+
+def test_growth_preserves_numeric_zero_and_previous_zero_null() -> None:
+    end = date(2024, 3, 31)
+    unchanged = _constant_observations(date(2022, 4, 2), 730)
+    assert analyze_trends.compute_growth_for_days(unchanged, end, 365)["pct"] == 0.0
+
+    previous_zero = _constant_observations(date(2022, 4, 2), 365, views=0)
+    current = _constant_observations(date(2023, 4, 2), 365, views=100)
+    result = analyze_trends.compute_growth_for_days(previous_zero + current, end, 365)
+    assert result["pct"] is None
+    assert result["abs"] is None
+    assert result["reason"] == analyze_trends.ZERO_PREVIOUS_MEAN_REASON
+    assert result["clean"]["pct"] is None
+    assert result["clean"]["reason"] == analyze_trends.ZERO_PREVIOUS_MEAN_REASON
+
+
+def test_anomaly_detector_handles_short_zero_mad_and_date_windows() -> None:
+    short = _constant_observations(date(2024, 1, 1), 13)
+    assert analyze_trends.detect_anomalies(short) == []
+
+    zero_mad = _constant_observations(date(2024, 1, 1), 20)
+    assert analyze_trends.detect_anomalies(zero_mad) == []
+
+    rows = [
+        _observation(date(2024, 1, 1) + timedelta(days=index), 100 + (index % 3) - 1)
+        for index in range(20)
+    ]
+    rows[9] = _observation(rows[9].date, 1000)
+    found = analyze_trends.detect_anomalies(rows)
+    assert any(item["date"] == "2024-01-10" for item in found)
+
+
+def test_anomaly_share_uses_observed_days(tmp_path: Path) -> None:
+    spec_path = _write_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    rows = _daily_rows()
+    rows = [row for row in rows if row["date"] != "2023-06-01"]
+    _write_series_csv(out_dir / "series.csv", rows)
+
+    assert _run_analyzer(spec_path, out_dir) == 0
+    document = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+    series = document["series"][0]
+    assert series["anomaly_share"] == len(series["anomalies"]) / len(rows)
+
+
+def test_injected_spike_does_not_flip_direction(tmp_path: Path) -> None:
+    spec_path = _write_spec(tmp_path)
+    before_dir = tmp_path / "before"
+    after_dir = tmp_path / "after"
+    before_rows = [
+        {**row, "views": row["views"] // 10} if row["date"] == "2024-01-01" else row
+        for row in _daily_rows()
+    ]
+    after_rows = [
+        {**row, "views": row["views"] * 10} if row["date"] == "2024-01-01" else row
+        for row in before_rows
+    ]
+    _write_series_csv(before_dir / "series.csv", before_rows)
+    _write_series_csv(after_dir / "series.csv", after_rows)
+    assert _run_analyzer(spec_path, before_dir) == 0
+    assert _run_analyzer(spec_path, after_dir) == 0
+    before = json.loads((before_dir / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    after = json.loads((after_dir / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    assert before["growth"]["y1"]["clean"] == after["growth"]["y1"]["clean"]
+    assert before["trend_direction"] == after["trend_direction"]
+
+
+def test_growth_rejects_malformed_or_oversized_csv_before_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec_path = _write_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    _write_series_csv(out_dir / "series.csv", _daily_rows())
+    assert _run_analyzer(spec_path, out_dir) == 0
+    sentinel = out_dir / "metrics.json"
+    sentinel.write_text("sentinel", encoding="utf-8")
+    monkeypatch.setattr(
+        analyze_trends,
+        "build_metrics",
+        lambda *args: (_ for _ in ()).throw(AssertionError("statistics must not run")),
+    )
+
+    malformed = tmp_path / "malformed"
+    malformed.mkdir()
+    (malformed / "series.csv").write_text("wrong,header\n", encoding="utf-8")
+    assert analyze_trends.main(["--spec", str(spec_path), "--out", str(malformed)]) == 1
+
+    oversized = tmp_path / "oversized"
+    oversized.mkdir()
+    (oversized / "series.csv").write_text(
+        "date,views,series_id,project,article\n" + ("x" * 64), encoding="utf-8"
+    )
+    monkeypatch.setattr(analyze_trends, "MAX_CSV_BYTES", 16)
+    assert analyze_trends.main(["--spec", str(spec_path), "--out", str(oversized)]) == 1
+    assert sentinel.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_growth_candidate_metrics_reject_non_finite_values_before_dump(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    spec_path = _write_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    _write_series_csv(out_dir / "series.csv", _daily_rows())
+    monkeypatch.setattr(
+        analyze_trends,
+        "build_metrics",
+        lambda *args: {"series": [{"value": float("nan")}]},
+    )
+    called = False
+
+    def unexpected_dump(*args: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(analyze_trends, "dump_json", unexpected_dump)
+    assert analyze_trends.main(["--spec", str(spec_path), "--out", str(out_dir)]) == 1
+    assert not called
+    assert "non-finite" in capsys.readouterr().err
+
+
+def test_growth_identity_and_partial_input_fail_without_replacing_metrics(tmp_path: Path) -> None:
+    spec_path = _write_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    rows = _daily_rows()
+    rows[0] = {**rows[0], "article": "Tampered_article"}
+    _write_series_csv(out_dir / "series.csv", rows)
+    sentinel = out_dir / "metrics.json"
+    sentinel.write_text("sentinel", encoding="utf-8")
+    assert _run_analyzer(spec_path, out_dir) == 1
+    assert sentinel.read_text(encoding="utf-8") == "sentinel"
+
+    partial_spec = _write_two_series_spec(tmp_path / "partial")
+    partial_out = tmp_path / "partial-out"
+    _write_series_csv(partial_out / "series.csv", _daily_rows())
+    partial_sentinel = partial_out / "metrics.json"
+    partial_sentinel.write_text("sentinel", encoding="utf-8")
+    assert _run_analyzer(partial_spec, partial_out) == 1
+    assert partial_sentinel.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_growth_source_has_no_dynamic_execution_path() -> None:
+    source = Path(analyze_trends.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    forbidden_calls = {"eval", "exec", "compile", "__import__"}
+    forbidden_imports = {"subprocess", "pickle", "multiprocessing", "runpy"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id not in forbidden_calls
+        if isinstance(node, ast.Import):
+            assert not {alias.name.split(".")[0] for alias in node.names} & forbidden_imports
+        if isinstance(node, ast.ImportFrom):
+            assert (node.module or "").split(".")[0] not in forbidden_imports
+
+
+def test_threshold_fixture_matches_frozen_constants() -> None:
+    fixture = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "analysis.threshold-validation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert fixture["algorithm_version"] == "rolling-median-mad-v1"
+    assert fixture["source_date"] == "2026-09-24"
+    assert fixture["mad_k"] == analyze_trends.MAD_K
+    assert fixture["mad_scale"] == analyze_trends.MAD_SCALE
+    assert fixture["coverage_ratio"] == analyze_trends.COVERAGE_RATIO
+    assert fixture["direction_band_pct"] == analyze_trends.DIRECTION_BAND_PCT
+    assert fixture["minimum_monthly_views"] == analyze_trends.MIN_MONTHLY_VIEWS
+    assert fixture["maximum_reliable_anomaly_share"] == analyze_trends.ANOMALY_SHARE_BOUNDARY
+    assert len(fixture["series"]) == 8
+
+
+def test_threshold_fixture_summaries_remain_inside_calibrated_bands() -> None:
+    fixture = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "analysis.threshold-validation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    expected = {
+        "fasting-pl": (727, 728, 239.6, 0.0179, -37.5, -38.5, "medium", "noise"),
+        "fasting-cs": (725, 728, 276.4, 0.0331, -54.3, -44.5, "medium", "noise"),
+        "astronomy-uk": (1094, 1094, 1417.5, 0.0219, -56.0, -56.2, "medium", "down"),
+        "space-exploration-uk": (1092, 1094, 545.8, 0.0247, -55.7, -57.7, "medium", "noise"),
+        "english-pl": (728, 728, 8801.0, 0.0412, -18.6, -19.2, "medium", "down"),
+        "english-cs": (728, 728, 3183.8, 0.0316, -22.3, -22.8, "medium", "down"),
+        "english-uk": (728, 728, 8230.5, 0.0288, -36.2, -36.5, "medium", "down"),
+        "english-pt": (728, 728, 10458.5, 0.0247, -24.7, -25.1, "high", "down"),
+    }
+    assert {item["id"] for item in fixture["series"]} == set(expected)
+    for item in fixture["series"]:
+        summary = expected[item["id"]]
+        actual = (
+            item["rows"],
+            item["span_days"],
+            item["monthly_30d"],
+            item["anomaly_share"],
+            item["raw_y1_pct"],
+            item["clean_y1_pct"],
+            item["confidence"],
+            item["direction"],
+        )
+        assert actual == summary
+        _assert_all_finite(item)
+        assert 0.0 <= item["anomaly_share"] < analyze_trends.ANOMALY_SHARE_BOUNDARY
+        assert item["monthly_30d"] >= 0.0
+        assert analyze_trends.safe_direction(
+            item["span_days"],
+            item["raw_y1_pct"],
+            item["clean_y1_pct"],
+            item["confidence"],
+            item["monthly_30d"],
+        ) == item["direction"]
