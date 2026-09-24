@@ -352,7 +352,15 @@ def _fetch_series(
         payload_bytes = b""
         for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
             common.throttle(1.0, pace)
-            response = transport(url, headers, 30.0)
+            try:
+                response = transport(url, headers, 30.0)
+            except FetchTransportError:
+                if attempt < MAX_FETCH_ATTEMPTS:
+                    sleep(RETRY_FALLBACK_SECONDS)
+                    continue
+                message = f"request failed after {attempt} attempt(s) (transport error)"
+                _diagnostic(series["id"], message)
+                return [], False, "failed"
             if response.status == 403:
                 message = "HTTP 403 — set a real WTI_USER_AGENT contact and retry"
                 _diagnostic(series["id"], message)

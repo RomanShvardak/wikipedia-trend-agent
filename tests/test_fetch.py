@@ -943,13 +943,19 @@ def test_transport_exception_retries_then_preserves_successful_sibling(
             raise fetch_pageviews.FetchTransportError("offline")
         return fetch_pageviews.TransportResponse(status=200, headers={}, body=valid_body)
 
+    spec = copy.deepcopy(json.loads(spec_example_path.read_text(encoding="utf-8")))
+    spec["window"]["start"] = "20240923"
+    spec["window"]["end"] = "20250922"
+    spec_path = tmp_path / "transport-siblings.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
     assert main(
-        _args(spec_example_path, tmp_path / "out"),
+        _args(spec_path, tmp_path / "out"),
         transport=raising_transport,
         today_utc=date(2026, 9, 24),
     ) == 3
 
-    assert len(calls) == 5
+    assert len(calls) == 4
     assert sleeps == [5.0, 5.0]
     with (tmp_path / "out" / "series.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
