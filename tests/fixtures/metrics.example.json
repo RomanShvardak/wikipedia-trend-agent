@@ -1,6 +1,6 @@
 {
   "spec_name": "intermittent_fasting_pl_cs",
-  "as_of": "2026-09-23",
+  "as_of": "2026-09-20",
   "generated_from": "tests/fixtures/spec.example.json",
   "series": [
     {
@@ -9,47 +9,60 @@
       "article": "Post_przerywany",
       "label": "Польська: інтервальне голодування",
       "language": "pl",
-      "total_views": 1392124,
-      "avg_daily_views": 1912.3,
-      "period": { "start": "2024-09-23", "end": "2026-09-20", "days": 728 },
+      "total_views": 1487229,
+      "avg_daily_views": 2042.9,
+      "period": {
+        "start": "2024-09-23",
+        "end": "2026-09-20",
+        "days": 728
+      },
       "growth": {
         "m3": {
-          "pct": 6.2,
-          "abs": 96,
-          "start": "2026-06-21",
+          "pct": 0.5,
+          "abs": 10,
+          "start": "2026-06-22",
           "end": "2026-09-20",
-          "clean": { "pct": 7.1, "abs": 110 }
+          "clean": {
+            "pct": 0.5,
+            "abs": 10
+          }
         },
         "y1": {
-          "pct": 18.7,
-          "abs": 287,
-          "start": "2025-09-23",
+          "pct": 1.8,
+          "abs": 36,
+          "start": "2025-09-21",
           "end": "2026-09-20",
-          "clean": { "pct": 17.9, "abs": 274 }
+          "clean": {
+            "pct": 1.8,
+            "abs": 36
+          }
         },
         "y2": {
-          "pct": 34.2,
-          "abs": 487,
-          "start": "2024-09-23",
+          "pct": null,
+          "abs": null,
+          "start": "2024-09-21",
           "end": "2026-09-20",
-          "clean": { "pct": 33.5, "abs": 478 }
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
         }
       },
-      "anomaly_share": 0.03,
-      "trend_direction": "up",
+      "anomaly_share": 0.0,
+      "trend_direction": "flat",
       "confidence": "high",
       "confidence_reasons": [
-        "період ≥ 2 роки",
-        "обсяг ≥ 1000 переглядів на місяць",
-        "частка аномалій низька"
+        "period at least 91 days",
+        "monthly 30-day views at least 10000",
+        "no anomalies detected"
       ],
       "seasonality": {
-        "months": [1, 2, 11, 12],
-        "note": "зимовий пік, та сама пора року"
+        "months": [],
+        "note": "insufficient observations in one or both aligned 365-day halves"
       },
-      "anomalies": [
-        { "date": "2025-12-25", "value": 31240, "median": 1870 }
-      ]
+      "anomalies": []
     },
     {
       "series_id": "cs-pust-prerusovany",
@@ -57,47 +70,58 @@
       "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
       "label": "Чеська: інтервальне голодування",
       "language": "cs",
-      "total_views": 41230,
-      "avg_daily_views": 56.6,
-      "period": { "start": "2024-09-23", "end": "2026-09-20", "days": 728 },
+      "total_views": 613629,
+      "avg_daily_views": 842.9,
+      "period": {
+        "start": "2024-09-23",
+        "end": "2026-09-20",
+        "days": 728
+      },
       "growth": {
         "m3": {
-          "pct": null,
-          "abs": null,
-          "start": "2026-06-21",
+          "pct": 1.2,
+          "abs": 10,
+          "start": "2026-06-22",
           "end": "2026-09-20",
-          "reason": "недостатньо даних для двох вікон",
           "clean": {
-            "pct": null,
-            "abs": null,
-            "reason": "недостатньо даних для двох вікон"
+            "pct": 1.2,
+            "abs": 10
           }
         },
         "y1": {
-          "pct": 12.5,
-          "abs": 6,
-          "start": "2025-09-23",
+          "pct": 4.4,
+          "abs": 36,
+          "start": "2025-09-21",
           "end": "2026-09-20",
-          "clean": { "pct": 12.1, "abs": 6 }
+          "clean": {
+            "pct": 4.4,
+            "abs": 36
+          }
         },
         "y2": {
-          "pct": 18.9,
-          "abs": 9,
-          "start": "2024-09-23",
+          "pct": null,
+          "abs": null,
+          "start": "2024-09-21",
           "end": "2026-09-20",
-          "clean": { "pct": 18.2, "abs": 9 }
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
         }
       },
       "anomaly_share": 0.0,
       "trend_direction": "flat",
-      "confidence": "medium",
+      "confidence": "high",
       "confidence_reasons": [
-        "обсяг < 1000 переглядів на місяць",
-        "період ≥ 2 роки"
+        "period at least 91 days",
+        "monthly 30-day views at least 10000",
+        "no anomalies detected"
       ],
       "seasonality": {
         "months": [],
-        "note": "недостатньо виражена сезонність"
+        "note": "insufficient observations in one or both aligned 365-day halves"
       },
       "anomalies": []
     }
