@@ -11,11 +11,13 @@ import csv
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -32,6 +34,9 @@ from common import (
 log = common.log
 CSV_HEADER = ("date", "views", "series_id", "project", "article")
 NOT_LOADED_GAP_DAYS = 2
+MAX_FETCH_ATTEMPTS = 3
+RETRY_FALLBACK_SECONDS = 5.0
+sleep = time.sleep
 Transport = Callable[[str, dict[str, str], float], "TransportResponse"]
 
 
@@ -49,6 +54,14 @@ class FetchError(RuntimeError):
 
 class FetchTransportError(FetchError):
     """The transport could not complete an HTTP exchange."""
+
+
+class SeriesFetchError(FetchError):
+    """A fatal response tied to a specific series."""
+
+    def __init__(self, series_id: str, message: str) -> None:
+        super().__init__(message)
+        self.series_id = series_id
 
 
 @dataclass
@@ -133,6 +146,61 @@ def _date_range(start: date, end: date):
 def _diagnostic(series_id: str, message: str) -> None:
     """Write one grep-friendly per-series diagnostic to stderr."""
     print(f"{series_id}: {message}", file=sys.stderr)
+
+
+def _header_value(headers: Mapping[str, Any], name: str) -> str | None:
+    """Read a response header case-insensitively without exposing its value."""
+    wanted = name.casefold()
+    for key, value in headers.items():
+        if str(key).casefold() == wanted and isinstance(value, str):
+            return value
+    return None
+
+
+def retry_after_seconds(
+    headers: Mapping[str, Any],
+    now: datetime | None = None,
+) -> float:
+    """Parse Retry-After seconds or an HTTP-date, with a safe 5-second fallback."""
+    raw = _header_value(headers, "Retry-After")
+    if raw is None:
+        return RETRY_FALLBACK_SECONDS
+
+    value = raw.strip()
+    if value.isdigit():
+        seconds = int(value)
+        return float(seconds) if seconds > 0 else RETRY_FALLBACK_SECONDS
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return RETRY_FALLBACK_SECONDS
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - current).total_seconds())
+
+
+def _is_retryable_status(status: int) -> bool:
+    return status == 429 or 500 <= status <= 599
+
+
+def _print_summary(
+    series_count: int,
+    failures: int,
+    cache_hits: int,
+    rows: list[SeriesRow],
+    output: Path | None,
+) -> None:
+    date_values = [row["date"] for row in rows]
+    date_range = f"{min(date_values)}..{max(date_values)}" if date_values else "empty"
+    output_text = f"; output: {output}" if output is not None else ""
+    print(
+        f"Fetched {len(rows)} row(s) for {series_count} series "
+        f"({date_range}; failures: {failures}; cache hits: {cache_hits}/{series_count}{output_text})"
+    )
 
 
 def cache_fresh(path: Path, ttl_hours: int) -> bool:
@@ -252,23 +320,35 @@ def _fetch_series(
         cache_hit = True
         payload_bytes = json.dumps(cached, ensure_ascii=False).encode("utf-8")
     else:
-        common.throttle(1.0, pace)
-        response = transport(url, headers, 30.0)
         cache_hit = False
-        if response.status == 404:
-            classification = classify_404(end_ymd, yesterday_utc)
-            if classification == "not_loaded":
-                _diagnostic(series["id"], "data not yet loaded — retry later")
-            else:
-                _diagnostic(series["id"], "no views for the requested window")
-            if fail_on_empty_series:
-                return [], False, "fatal"
-            if classification == "not_loaded":
-                return [], False, "not_loaded"
-            return _zero_rows(series, start_ymd, end_ymd), False, "no_views"
-        if response.status != 200:
-            raise FetchError(f"unexpected HTTP {response.status}")
-        payload_bytes = response.body
+        payload_bytes = b""
+        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+            common.throttle(1.0, pace)
+            response = transport(url, headers, 30.0)
+            if response.status == 403:
+                message = "HTTP 403 — set a real WTI_USER_AGENT contact and retry"
+                _diagnostic(series["id"], message)
+                raise SeriesFetchError(series["id"], message)
+            if response.status == 404:
+                classification = classify_404(end_ymd, yesterday_utc)
+                if classification == "not_loaded":
+                    _diagnostic(series["id"], "data not yet loaded — retry later")
+                else:
+                    _diagnostic(series["id"], "no views for the requested window")
+                if fail_on_empty_series:
+                    return [], False, "fatal"
+                if classification == "not_loaded":
+                    return [], False, "not_loaded"
+                return _zero_rows(series, start_ymd, end_ymd), False, "no_views"
+            if _is_retryable_status(response.status) and attempt < MAX_FETCH_ATTEMPTS:
+                sleep(retry_after_seconds(response.headers))
+                continue
+            if response.status != 200:
+                message = f"request failed after {attempt} attempt(s) (HTTP {response.status})"
+                _diagnostic(series["id"], message)
+                return [], False, "failed"
+            payload_bytes = response.body
+            break
 
     rows = _parse_response(payload_bytes, series)
     if not cache_hit:
@@ -325,12 +405,13 @@ def main(
     window = spec["window"]
     rows: list[SeriesRow] = []
     cache_hits = 0
+    failures = 0
+    outcomes: list[str] = []
     yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days=1)
     fail_on_empty_series = bool(spec.get("quality", {}).get("fail_on_empty_series", False))
-    outcomes: list[str] = []
 
-    try:
-        for series in spec["series"]:
+    for series in spec["series"]:
+        try:
             series_rows, cache_hit, outcome = _fetch_series(
                 series=series,
                 start_ymd=window["start"],
@@ -342,27 +423,29 @@ def main(
                 yesterday_utc=yesterday_utc,
                 fail_on_empty_series=fail_on_empty_series,
             )
-            outcomes.append(outcome)
-            if outcome == "fatal":
-                return 1
-            rows.extend(series_rows)
-            cache_hits += int(cache_hit)
-            log.debug("%s: fetched %d item(s)", series["id"], len(series_rows))
-    except FetchError as error:
-        print(f"fetch_pageviews: {error}", file=sys.stderr)
-        return 1
+        except SeriesFetchError:
+            _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None)
+            return 1
+        except FetchError as error:
+            _diagnostic(series["id"], str(error))
+            _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None)
+            return 1
 
-    if "fatal" in outcomes:
+        outcomes.append(outcome)
+        failures += int(outcome in {"failed", "fatal"})
+        if outcome == "fatal":
+            _print_summary(len(spec["series"]), failures, cache_hits, rows, None)
+            return 1
+        rows.extend(series_rows)
+        cache_hits += int(cache_hit)
+
+    if failures == len(spec["series"]):
+        _print_summary(len(spec["series"]), failures, cache_hits, rows, None)
         return 1
 
     output = _write_series_csv(args.out, rows)
-    date_values = [row["date"] for row in rows]
-    date_range = f"{min(date_values)}..{max(date_values)}" if date_values else "empty"
-    print(
-        f"Fetched {len(rows)} row(s) for {len(spec['series'])} series "
-        f"({date_range}; cache hits: {cache_hits}/{len(spec['series'])}; output: {output})"
-    )
-    return 0
+    _print_summary(len(spec["series"]), failures, cache_hits, rows, output)
+    return 3 if failures else 0
 
 
 if __name__ == "__main__":

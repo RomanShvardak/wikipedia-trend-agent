@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from email.message import Message
+from email.utils import format_datetime
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,7 @@ def _configure(monkeypatch, tmp_path: Path) -> list[tuple[float, list[float]]]:
         last[0] = time.monotonic()
 
     monkeypatch.setattr(common, "throttle", record_throttle)
+    monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
     return throttle_calls
 
 
@@ -319,21 +321,22 @@ def test_non_200_never_writes_cache_and_later_200_refetches(
     failure_status,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub(
-        [
-            (failure_status, {}, b"failure"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
-    )
+    if failure_status == 404:
+        first_stub = transport_stub([(404, {}, b"failure"), (200, {}, _response_body("pageviews.200.json")), (200, {}, _response_body("pageviews.200.json"))])
+        expected_first_calls = 1
+    else:
+        first_stub = transport_stub([(503, {}, b"failure")] * 6)
+        expected_first_calls = 6
     out_dir = tmp_path / "out"
 
-    assert main(_args(spec_example_path, out_dir), transport=stub) == 1
+    assert main(_args(spec_example_path, out_dir), transport=first_stub) == 1
+    assert len(first_stub.calls) == expected_first_calls
     assert list((tmp_path / "cache").glob("*.json")) == []
     assert not (out_dir / "series.csv").exists()
 
-    assert main(_args(spec_example_path, out_dir), transport=stub) == 0
-    assert len(stub.calls) == 3
+    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    assert main(_args(spec_example_path, out_dir), transport=second_stub) == 0
+    assert len(second_stub.calls) == 2
     assert len(list((tmp_path / "cache").glob("*.json"))) == 2
 
 
@@ -527,3 +530,160 @@ def test_fail_on_empty_series_controls_404_fatal_exit(
     assert main(_args(permissive_spec, tmp_path / "permissive" / "out"), transport=permissive_stub) == 0
     assert "no views for the requested window" in capsys.readouterr().err
     assert (tmp_path / "permissive" / "out" / "series.csv").exists()
+
+
+def test_retry_after_integer_seconds_is_honored(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
+    stub = transport_stub(
+        [
+            (429, {"Retry-After": "3"}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (429, {"Retry-After": "3"}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
+    assert sleeps == [3.0, 3.0]
+    assert len(stub.calls) == 4
+
+
+def test_retry_after_http_date_is_parsed(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=8)
+    stub = transport_stub(
+        [
+            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
+    assert len(sleeps) == 2
+    assert all(seconds >= 5 for seconds in sleeps)
+
+
+def test_retry_after_missing_uses_five_second_fallback(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
+    stub = transport_stub(
+        [
+            (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
+    assert sleeps == [5.0, 5.0]
+
+
+def test_retry_cap_marks_series_failed_and_continues(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
+    stub = transport_stub(
+        [
+            (429, {}, b"rate limited"),
+            (429, {}, b"rate limited"),
+            (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 3
+    assert len(stub.calls) == 4
+    assert (tmp_path / "out" / "series.csv").exists()
+    assert list((tmp_path / "cache").glob("*.json"))
+
+
+def test_all_series_fail_returns_one_without_cache(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
+    stub = transport_stub([(429, {}, b"rate limited")] * 6)
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 1
+    assert len(stub.calls) == 6
+    assert not (tmp_path / "out" / "series.csv").exists()
+    assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+def test_403_aborts_immediately_without_retry_or_cache(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    stub = transport_stub([(403, {}, b"forbidden"), (200, {}, _response_body("pageviews.200.json"))])
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 1
+
+    captured = capsys.readouterr()
+    assert len(captured.out.splitlines()) == 1
+    assert "pl-post-przerywany: HTTP 403 — set a real WTI_USER_AGENT contact and retry" in captured.err
+    assert len(stub.calls) == 1
+    assert not (tmp_path / "out" / "series.csv").exists()
+    assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+def test_stream_contract_keeps_diagnostics_off_stdout(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
+    stub = transport_stub(
+        [
+            (429, {}, b"rate limited"),
+            (429, {}, b"rate limited"),
+            (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 3
+
+    captured = capsys.readouterr()
+    assert len(captured.out.splitlines()) == 1
+    assert "series=2" not in captured.out
+    diagnostic_lines = captured.err.splitlines()
+    assert diagnostic_lines
+    assert all(line.startswith(("pl-post-przerywany: ", "cs-pust-prerusovany: ")) for line in diagnostic_lines)
+    assert "rate limited" not in " ".join(diagnostic_lines)
