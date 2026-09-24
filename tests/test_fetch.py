@@ -11,6 +11,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 
@@ -44,6 +45,25 @@ def _configure(monkeypatch, tmp_path: Path) -> list[tuple[float, list[float]]]:
 
 def _args(spec_path: Path, out_path: Path) -> list[str]:
     return ["--spec", str(spec_path), "--out", str(out_path)]
+
+
+def _series_urls(spec_path: Path) -> list[str]:
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    window = spec["window"]
+    return [
+        series_url(series["project"], series["article"], window["start"], window["end"])
+        for series in spec["series"]
+    ]
+
+
+def _write_cache(spec_path: Path, response: object, fetched_at: datetime) -> Path:
+    url = _series_urls(spec_path)[0]
+    path = common.cache_path_for_key(common.cache_key_for_url(url))
+    common.dump_json(
+        {"fetched_at": fetched_at.isoformat(), "status": 200, "response": response},
+        path,
+    )
+    return path
 
 
 def test_valid_spec_writes_exact_deterministic_csv(
@@ -215,7 +235,177 @@ def test_default_transport_converts_http_error_to_response(monkeypatch):
 
     monkeypatch.setattr(fetch_pageviews.urllib.request, "urlopen", fail_urlopen)
 
-    response = default_transport("https://wikimedia.org/example", {"User-Agent": DESCRIPTIVE_UA}, 3.0)
+    response = default_transport(
+        "https://wikimedia.org/example",
+        {"User-Agent": DESCRIPTIVE_UA},
+        3.0,
+    )
 
     assert response.status == 404
     assert response.body == body
+
+
+def test_stale_cache_envelope_refetches_and_is_rewritten(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    response = json.loads(_response_body("pageviews.200.json"))
+    stale_at = datetime.now(timezone.utc) - timedelta(days=2)
+    stale_path = _write_cache(spec_example_path, response, stale_at)
+    second_url = _series_urls(spec_example_path)[1]
+    second_path = common.cache_path_for_key(common.cache_key_for_url(second_url))
+    common.dump_json(
+        {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "status": 200,
+            "response": response,
+        },
+        second_path,
+    )
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))])
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
+
+    assert len(stub.calls) == 1
+    rewritten = json.loads(stale_path.read_text(encoding="utf-8"))
+    assert datetime.fromisoformat(rewritten["fetched_at"]) > stale_at
+    assert rewritten["status"] == 200
+    assert isinstance(rewritten["response"]["items"], list)
+
+
+def test_ttl_hours_zero_forces_cache_refetch(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=first_stub) == 0
+    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    args = [*_args(spec_example_path, tmp_path / "out"), "--ttl-hours", "0"]
+
+    assert main(args, transport=second_stub) == 0
+
+    assert len(second_stub.calls) == 2
+
+
+def test_ttl_hours_environment_default_forces_cache_refetch(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=first_stub) == 0
+    monkeypatch.setenv("WTI_TTL_HOURS", "0")
+    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=second_stub) == 0
+
+    assert len(second_stub.calls) == 2
+
+
+@pytest.mark.parametrize("failure_status", [404, 503])
+def test_non_200_never_writes_cache_and_later_200_refetches(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    failure_status,
+):
+    _configure(monkeypatch, tmp_path)
+    stub = transport_stub(
+        [
+            (failure_status, {}, b"failure"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+    out_dir = tmp_path / "out"
+
+    assert main(_args(spec_example_path, out_dir), transport=stub) == 1
+    assert list((tmp_path / "cache").glob("*.json")) == []
+    assert not (out_dir / "series.csv").exists()
+
+    assert main(_args(spec_example_path, out_dir), transport=stub) == 0
+    assert len(stub.calls) == 3
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 2
+
+
+def test_corrupt_cache_warns_drops_entry_and_refetches(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    corrupt_path = _write_cache(
+        spec_example_path,
+        {"unexpected": True},
+        datetime.now(timezone.utc),
+    )
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+
+    assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
+
+    warning = "pl-post-przerywany: corrupt cache entry; refetching from network"
+    assert warning in capsys.readouterr().err
+    assert len(stub.calls) == 2
+    rewritten = json.loads(corrupt_path.read_text(encoding="utf-8"))
+    assert isinstance(rewritten["response"]["items"], list)
+
+
+def test_malformed_200_is_reported_and_not_cached(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    stub = transport_stub([(200, {}, b'{"unexpected": []}')])
+    out_dir = tmp_path / "out"
+
+    assert main(_args(spec_example_path, out_dir), transport=stub) == 1
+
+    assert "items list" in capsys.readouterr().err
+    assert list((tmp_path / "cache").glob("*.json")) == []
+    assert not (out_dir / "series.csv").exists()
+
+
+def test_cached_item_with_invalid_types_never_reaches_csv(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    invalid_response = {
+        "items": [
+            {
+                "project": "pl.wikipedia",
+                "article": "Warszawa",
+                "granularity": "daily",
+                "timestamp": "20260923",
+                "access": "all-access",
+                "agent": "user",
+                "views": 1.5,
+            }
+        ]
+    }
+    _write_cache(spec_example_path, invalid_response, datetime.now(timezone.utc))
+    out_dir = tmp_path / "out"
+
+    def forbidden_transport(url, headers, timeout=30.0):
+        raise AssertionError("valid-looking cache should not reach transport")
+
+    assert main(_args(spec_example_path, out_dir), transport=forbidden_transport) == 1
+
+    assert "invalid timestamp" in capsys.readouterr().err
+    assert not (out_dir / "series.csv").exists()

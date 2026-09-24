@@ -89,23 +89,65 @@ def series_url(project: str, article: str, start_ymd: str, end_ymd: str) -> str:
     )
 
 
-def _read_cached_response(url: str, ttl_hours: int) -> dict[str, Any] | None:
-    cache_path = cache_path_for_key(cache_key_for_url(url))
-    if not cache_path.exists():
-        return None
+def cache_fresh(path: Path, ttl_hours: int) -> bool:
+    """Return whether a cache envelope is fresh and structurally usable."""
+    if ttl_hours <= 0:
+        return False
     try:
-        envelope = json.loads(cache_path.read_text(encoding="utf-8"))
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("status") != 200
+            or not isinstance(envelope.get("response"), dict)
+            or not isinstance(envelope["response"].get("items"), list)
+        ):
+            return False
         fetched_at = datetime.fromisoformat(envelope["fetched_at"])
         if fetched_at.tzinfo is None:
             fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) - fetched_at > timedelta(hours=ttl_hours):
-            return None
-        response = envelope["response"]
-        if not isinstance(response, dict):
-            return None
-        return response
+        return datetime.now(timezone.utc) - fetched_at <= timedelta(hours=ttl_hours)
     except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _read_cached_response(
+    url: str,
+    ttl_hours: int,
+    series_id: str,
+) -> dict[str, Any] | None:
+    cache_path = cache_path_for_key(cache_key_for_url(url))
+    if not cache_path.exists():
         return None
+
+    if cache_fresh(cache_path, ttl_hours):
+        try:
+            envelope = json.loads(cache_path.read_text(encoding="utf-8"))
+            return envelope["response"]
+        except (OSError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+
+    try:
+        envelope = json.loads(cache_path.read_text(encoding="utf-8"))
+        response = envelope.get("response") if isinstance(envelope, dict) else None
+        is_corrupt = not (
+            isinstance(envelope, dict)
+            and envelope.get("status") == 200
+            and isinstance(response, dict)
+            and isinstance(response.get("items"), list)
+        )
+    except (OSError, TypeError, json.JSONDecodeError):
+        is_corrupt = True
+
+    if is_corrupt:
+        print(
+            f"{series_id}: corrupt cache entry; refetching from network",
+            file=sys.stderr,
+        )
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"{series_id}: could not remove corrupt cache entry: {error}", file=sys.stderr)
+    return None
 
 
 def _parse_response(body: bytes, series: Mapping[str, Any]) -> list[SeriesRow]:
@@ -157,7 +199,7 @@ def _fetch_series(
     pace: list[float],
 ) -> tuple[list[SeriesRow], bool]:
     url = series_url(series["project"], series["article"], start_ymd, end_ymd)
-    cached = _read_cached_response(url, ttl_hours)
+    cached = _read_cached_response(url, ttl_hours, series["id"])
     if cached is not None:
         cache_hit = True
         payload_bytes = json.dumps(cached, ensure_ascii=False).encode("utf-8")
