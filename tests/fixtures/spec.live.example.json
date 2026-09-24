@@ -1,0 +1,27 @@
+{
+  "name": "warszawa_albert_einstein_live",
+  "request": "Порівняй інтерес до Варшави та Альберта Ейнштейна за останній рік.",
+  "language": "uk",
+  "window": { "start": "20250921", "end": "20260921", "granularity": "daily" },
+  "assumptions": [
+    "статті перевірені живим проб-запитом (обидві повернули HTTP 200)",
+    "слаги статей plain-ASCII, кодування не потрібне"
+  ],
+  "series": [
+    {
+      "id": "pl-warszawa",
+      "project": "pl.wikipedia",
+      "article": "Warszawa",
+      "label": "Польська: Варшава",
+      "language": "pl"
+    },
+    {
+      "id": "en-albert-einstein",
+      "project": "en.wikipedia",
+      "article": "Albert_Einstein",
+      "label": "Англійська: Альберт Ейнштейн",
+      "language": "en"
+    }
+  ],
+  "quality": { "fail_on_empty_series": true }
+}

@@ -1,0 +1,8 @@
+{
+  "detail": "The date(s) you used are valid, but we either do not have data for those date(s), or the project you asked for is not loaded yet. Please check documentation for more information",
+  "method": "get",
+  "status": 404,
+  "title": "Not Found",
+  "type": "about:blank",
+  "uri": "/metrics/pageviews/per-article/pl.wikipedia/all-access/user/Post_przerywany/daily/2026090100/2026092300"
+}

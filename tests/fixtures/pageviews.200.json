@@ -1,0 +1,13 @@
+{
+  "items": [
+    {
+      "project": "pl.wikipedia",
+      "article": "Warszawa",
+      "granularity": "daily",
+      "timestamp": "2026092300",
+      "access": "all-access",
+      "agent": "user",
+      "views": 1868
+    }
+  ]
+}
