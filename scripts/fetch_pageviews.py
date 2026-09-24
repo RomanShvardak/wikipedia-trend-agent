@@ -110,6 +110,33 @@ def _parse_ymd(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def chunk_ranges(start_ymd: str, end_ymd: str) -> list[tuple[str, str]]:
+    """Split an inclusive date window into contiguous <=365-day chunks.
+
+    The returned list is chronological: each chunk is at most 365 inclusive
+    days, the final chunk may be shorter, and adjacent chunks share no day and
+    leave no gap.
+    """
+    start = _parse_ymd(start_ymd)
+    end = _parse_ymd(end_ymd)
+    if start > end:
+        raise ValueError("window start after end")
+
+    ranges: list[tuple[str, str]] = []
+    chunk_start = start
+    while chunk_start <= end:
+        day_count = min(365, (end - chunk_start).days + 1)
+        chunk_end = chunk_start + timedelta(days=day_count - 1)
+        ranges.append((chunk_start.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")))
+        chunk_start = chunk_end + timedelta(days=1)
+    return ranges
+
+
+def effective_end(spec_end_ymd: str, yesterday_utc: date) -> str:
+    """Clamp a spec end to the last complete UTC day and return YYYYMMDD."""
+    return min(_parse_ymd(spec_end_ymd), yesterday_utc).strftime("%Y%m%d")
+
+
 def classify_404(window_end_ymd: str, yesterday_utc: date) -> str:
     """Classify a 404 using only its distance from the last complete UTC day."""
     gap = (yesterday_utc - _parse_ymd(window_end_ymd)).days
@@ -193,13 +220,15 @@ def _print_summary(
     cache_hits: int,
     rows: list[SeriesRow],
     output: Path | None,
+    request_count: int | None = None,
 ) -> None:
     date_values = [row["date"] for row in rows]
     date_range = f"{min(date_values)}..{max(date_values)}" if date_values else "empty"
     output_text = f"; output: {output}" if output is not None else ""
+    cache_denominator = series_count if request_count is None else request_count
     print(
         f"Fetched {len(rows)} row(s) for {series_count} series "
-        f"({date_range}; failures: {failures}; cache hits: {cache_hits}/{series_count}{output_text})"
+        f"({date_range}; failures: {failures}; cache hits: {cache_hits}/{cache_denominator}{output_text})"
     )
 
 
@@ -383,6 +412,7 @@ def main(
     *,
     transport: Transport | None = None,
     pace: list[float] | None = None,
+    today_utc: date | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", required=True, help="path to spec.json")
@@ -406,45 +436,59 @@ def main(
     rows: list[SeriesRow] = []
     cache_hits = 0
     failures = 0
-    outcomes: list[str] = []
-    yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days=1)
+    request_count = 0
+    today = today_utc or datetime.now(timezone.utc).date()
+    yesterday_utc = today - timedelta(days=1)
     fail_on_empty_series = bool(spec.get("quality", {}).get("fail_on_empty_series", False))
+    clamped_end = effective_end(window["end"], yesterday_utc)
 
     for series in spec["series"]:
         try:
-            series_rows, cache_hit, outcome = _fetch_series(
-                series=series,
-                start_ymd=window["start"],
-                end_ymd=window["end"],
-                ttl_hours=args.ttl_hours,
-                headers=headers,
-                transport=request_transport,
-                pace=fetch_pace,
-                yesterday_utc=yesterday_utc,
-                fail_on_empty_series=fail_on_empty_series,
-            )
+            if window["start"] > clamped_end:
+                _diagnostic(series["id"], "no fetchable days after UTC clamp")
+                _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
+                return 1
+
+            chunks = chunk_ranges(window["start"], clamped_end)
+            series_rows: list[SeriesRow] = []
+            series_failed = False
+            for chunk_start, chunk_end in chunks:
+                request_count += 1
+                chunk_rows, cache_hit, outcome = _fetch_series(
+                    series=series,
+                    start_ymd=chunk_start,
+                    end_ymd=chunk_end,
+                    ttl_hours=args.ttl_hours,
+                    headers=headers,
+                    transport=request_transport,
+                    pace=fetch_pace,
+                    yesterday_utc=yesterday_utc,
+                    fail_on_empty_series=fail_on_empty_series,
+                )
+                series_rows.extend(chunk_rows)
+                cache_hits += int(cache_hit)
+                if outcome == "fatal":
+                    _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
+                    return 1
+                if outcome == "failed":
+                    series_failed = True
         except SeriesFetchError:
-            _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None)
+            _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
             return 1
         except FetchError as error:
             _diagnostic(series["id"], str(error))
-            _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None)
+            _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
             return 1
 
-        outcomes.append(outcome)
-        failures += int(outcome in {"failed", "fatal"})
-        if outcome == "fatal":
-            _print_summary(len(spec["series"]), failures, cache_hits, rows, None)
-            return 1
+        failures += int(series_failed)
         rows.extend(series_rows)
-        cache_hits += int(cache_hit)
 
     if failures == len(spec["series"]):
-        _print_summary(len(spec["series"]), failures, cache_hits, rows, None)
+        _print_summary(len(spec["series"]), failures, cache_hits, rows, None, request_count)
         return 1
 
     output = _write_series_csv(args.out, rows)
-    _print_summary(len(spec["series"]), failures, cache_hits, rows, output)
+    _print_summary(len(spec["series"]), failures, cache_hits, rows, output, request_count)
     return 3 if failures else 0
 
 

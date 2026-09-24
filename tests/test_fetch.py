@@ -20,7 +20,14 @@ import pytest
 
 import common
 import fetch_pageviews
-from fetch_pageviews import classify_404, default_transport, main, series_url
+from fetch_pageviews import (
+    chunk_ranges,
+    classify_404,
+    default_transport,
+    effective_end,
+    main,
+    series_url,
+)
 
 DESCRIPTIVE_UA = "wikipedia-trend-agent/0.1.0 (maintainer@invalid.example.net) python-urllib"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -53,8 +60,9 @@ def _series_urls(spec_path: Path) -> list[str]:
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     window = spec["window"]
     return [
-        series_url(series["project"], series["article"], window["start"], window["end"])
+        series_url(series["project"], series["article"], chunk_start, chunk_end)
         for series in spec["series"]
+        for chunk_start, chunk_end in chunk_ranges(window["start"], window["end"])
     ]
 
 
@@ -76,7 +84,7 @@ def test_valid_spec_writes_exact_deterministic_csv(
     capsys,
 ):
     throttle_calls = _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
     out_dir = tmp_path / "out"
 
     assert main(_args(spec_example_path, out_dir), transport=stub) == 0
@@ -87,14 +95,16 @@ def test_valid_spec_writes_exact_deterministic_csv(
     assert rows[0] == ["date", "views", "series_id", "project", "article"]
     assert [row[2:] for row in rows[1:]] == [
         ["cs-pust-prerusovany", "cs.wikipedia", "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD"],
+        ["cs-pust-prerusovany", "cs.wikipedia", "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD"],
+        ["pl-post-przerywany", "pl.wikipedia", "Post_przerywany"],
         ["pl-post-przerywany", "pl.wikipedia", "Post_przerywany"],
     ]
-    assert [(row[0], row[1]) for row in rows[1:]] == [("2026-09-23", "1868")] * 2
-    assert len(stub.calls) == 2
-    assert len(throttle_calls) == 2
+    assert [(row[0], row[1]) for row in rows[1:]] == [("2026-09-23", "1868")] * 4
+    assert len(stub.calls) == 4
+    assert len(throttle_calls) == 4
     stdout = capsys.readouterr().out
     assert len(stdout.splitlines()) == 1
-    assert "Fetched 2 row(s) for 2 series" in stdout
+    assert "Fetched 4 row(s) for 2 series" in stdout
 
 
 def test_url_builder_uses_ten_digit_ten_hour_timestamps():
@@ -104,6 +114,157 @@ def test_url_builder_uses_ten_digit_ten_hour_timestamps():
     assert "/Warszawa/" in url
 
 
+@pytest.mark.parametrize(
+    ("start", "days", "expected"),
+    [
+        ("20240101", 1, [("20240101", "20240101")]),
+        ("20240101", 365, [("20240101", "20241230")]),
+        (
+            "20240101",
+            366,
+            [("20240101", "20241230"), ("20241231", "20241231")],
+        ),
+        (
+            "20240101",
+            800,
+            [
+                ("20240101", "20241230"),
+                ("20241231", "20251230"),
+                ("20251231", "20260310"),
+            ],
+        ),
+    ],
+)
+def test_chunk_ranges_splits_exact_inclusive_back_from_end(start, days, expected):
+    start_date = datetime.strptime(start, "%Y%m%d").date()
+    end_date = start_date + timedelta(days=days - 1)
+
+    assert chunk_ranges(start, end_date.strftime("%Y%m%d")) == expected
+
+
+@pytest.mark.parametrize("days", [1, 365, 366, 800, 801])
+def test_chunk_ranges_are_contiguous_and_cover_exact_window(days):
+    start = date(2024, 1, 1)
+    end = start + timedelta(days=days - 1)
+
+    ranges = chunk_ranges(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+    covered: list[date] = []
+    for index, (range_start, range_end) in enumerate(ranges):
+        current_start = datetime.strptime(range_start, "%Y%m%d").date()
+        current_end = datetime.strptime(range_end, "%Y%m%d").date()
+        assert (current_end - current_start).days + 1 <= 365
+        if index:
+            previous_end = datetime.strptime(ranges[index - 1][1], "%Y%m%d").date()
+            assert current_start == previous_end + timedelta(days=1)
+        covered.extend(
+            previous + timedelta(days=offset)
+            for offset in range((current_end - current_start).days + 1)
+            for previous in (current_start,)
+        )
+
+    assert covered == [start + timedelta(days=offset) for offset in range(days)]
+
+
+def test_chunk_ranges_rejects_reversed_window():
+    with pytest.raises(ValueError, match="window start after end"):
+        chunk_ranges("20240102", "20240101")
+
+
+def test_effective_end_clamps_today_to_yesterday_without_changing_yesterday():
+    today = date(2026, 9, 24)
+    yesterday = date(2026, 9, 23)
+
+    assert effective_end("20260924", yesterday) == "20260923"
+    assert effective_end("20260923", yesterday) == "20260923"
+    assert effective_end("20260922", yesterday) == "20260922"
+    assert today == date(2026, 9, 24)
+
+
+def test_main_uses_one_injected_utc_clock_for_clamp_and_404(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    spec = copy.deepcopy(json.loads(spec_example_path.read_text(encoding="utf-8")))
+    spec["window"]["start"] = "20260901"
+    spec["window"]["end"] = "20260924"
+    spec_path = tmp_path / "today-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+
+    assert main(
+        _args(spec_path, tmp_path / "out"),
+        transport=stub,
+        today_utc=date(2026, 9, 24),
+    ) == 0
+
+    assert all("daily/2026090100/2026092300" in call[0] for call in stub.calls)
+    assert classify_404("20260923", date(2026, 9, 24) - timedelta(days=1)) == "not_loaded"
+
+
+def test_200_response_holes_are_absent_from_series_csv(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    spec = copy.deepcopy(json.loads(spec_example_path.read_text(encoding="utf-8")))
+    spec["series"] = spec["series"][:1]
+    spec["window"]["start"] = "20240901"
+    spec["window"]["end"] = "20240903"
+    spec_path = tmp_path / "holes-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    response = {
+        "items": [
+            {"timestamp": "2024090100", "views": 11},
+            {"timestamp": "2024090300", "views": 13},
+        ]
+    }
+    body = json.dumps(response).encode("utf-8")
+    stub = transport_stub([(200, {}, body)])
+
+    assert main(_args(spec_path, tmp_path / "out"), transport=stub) == 0
+
+    with (tmp_path / "out" / "series.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["date"] for row in rows] == [
+        "2024-09-01",
+        "2024-09-03",
+    ]
+    assert "2024-09-02" not in {row["date"] for row in rows}
+    assert all(row["views"] != "0" for row in rows)
+
+
+def test_multi_chunk_run_uses_distinct_urls_and_cache_files(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    spec = copy.deepcopy(json.loads(spec_example_path.read_text(encoding="utf-8")))
+    spec["series"] = spec["series"][:1]
+    spec["window"]["start"] = "20240102"
+    spec["window"]["end"] = "20251231"
+    spec_path = tmp_path / "multi-chunk-spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+
+    assert main(
+        _args(spec_path, tmp_path / "out"),
+        transport=stub,
+        today_utc=date(2026, 9, 24),
+    ) == 0
+
+    assert len(stub.calls) == 2
+    assert stub.calls[0][0] != stub.calls[1][0]
+    assert stub.calls[0][0].split("/daily/")[1] != stub.calls[1][0].split("/daily/")[1]
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 2
+
+
 def test_main_builds_url_from_each_verbatim_series(
     spec_example_path,
     tmp_path,
@@ -111,14 +272,15 @@ def test_main_builds_url_from_each_verbatim_series(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
     urls = [call[0] for call in stub.calls]
-    assert all("daily/2024092300/2026092000" in url for url in urls)
-    assert "/Post_przerywany/" in urls[0]
-    assert "/P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD/" in urls[1]
+    assert any("daily/2024092300/2025092200" in url for url in urls)
+    assert any("daily/2025092300/2026092000" in url for url in urls)
+    assert all("/Post_przerywany/" in url for url in urls[0:2])
+    assert all("/P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD/" in url for url in urls[2:4])
 
 
 def test_request_carries_descriptive_user_agent(
@@ -128,7 +290,7 @@ def test_request_carries_descriptive_user_agent(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
@@ -187,7 +349,7 @@ def test_second_run_is_cache_hit_and_byte_deterministic(
 ):
     _configure(monkeypatch, tmp_path)
     out_dir = tmp_path / "out"
-    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
     assert main(_args(spec_example_path, out_dir), transport=first_stub) == 0
     first_bytes = (out_dir / "series.csv").read_bytes()
     first_stdout = capsys.readouterr().out
@@ -197,8 +359,8 @@ def test_second_run_is_cache_hit_and_byte_deterministic(
 
     assert second_stub.calls == []
     assert (out_dir / "series.csv").read_bytes() == first_bytes
-    assert "cache hits: 2/2" in capsys.readouterr().out
-    assert "cache hits: 0/2" in first_stdout
+    assert "cache hits: 4/4" in capsys.readouterr().out
+    assert "cache hits: 0/4" in first_stdout
 
 
 def test_distinct_series_urls_create_distinct_cache_files(
@@ -208,12 +370,12 @@ def test_distinct_series_urls_create_distinct_cache_files(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
     cache_files = list((tmp_path / "cache").glob("*.json"))
-    assert len(cache_files) == 2
+    assert len(cache_files) == 4
     envelopes = [json.loads(path.read_text(encoding="utf-8")) for path in cache_files]
     assert all(envelope["status"] == 200 for envelope in envelopes)
     assert all("fetched_at" in envelope for envelope in envelopes)
@@ -257,7 +419,7 @@ def test_stale_cache_envelope_refetches_and_is_rewritten(
     response = json.loads(_response_body("pageviews.200.json"))
     stale_at = datetime.now(timezone.utc) - timedelta(days=2)
     stale_path = _write_cache(spec_example_path, response, stale_at)
-    second_url = _series_urls(spec_example_path)[1]
+    second_url = _series_urls(spec_example_path)[2]
     second_path = common.cache_path_for_key(common.cache_key_for_url(second_url))
     common.dump_json(
         {
@@ -267,11 +429,11 @@ def test_stale_cache_envelope_refetches_and_is_rewritten(
         },
         second_path,
     )
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))])
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 3)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
-    assert len(stub.calls) == 1
+    assert len(stub.calls) == 3
     rewritten = json.loads(stale_path.read_text(encoding="utf-8"))
     assert datetime.fromisoformat(rewritten["fetched_at"]) > stale_at
     assert rewritten["status"] == 200
@@ -285,14 +447,14 @@ def test_ttl_hours_zero_forces_cache_refetch(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
     assert main(_args(spec_example_path, tmp_path / "out"), transport=first_stub) == 0
-    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
     args = [*_args(spec_example_path, tmp_path / "out"), "--ttl-hours", "0"]
 
     assert main(args, transport=second_stub) == 0
 
-    assert len(second_stub.calls) == 2
+    assert len(second_stub.calls) == 4
 
 
 def test_ttl_hours_environment_default_forces_cache_refetch(
@@ -302,14 +464,14 @@ def test_ttl_hours_environment_default_forces_cache_refetch(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
     assert main(_args(spec_example_path, tmp_path / "out"), transport=first_stub) == 0
     monkeypatch.setenv("WTI_TTL_HOURS", "0")
-    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=second_stub) == 0
 
-    assert len(second_stub.calls) == 2
+    assert len(second_stub.calls) == 4
 
 
 @pytest.mark.parametrize("failure_status", [404, 503])
@@ -325,8 +487,8 @@ def test_non_200_never_writes_cache_and_later_200_refetches(
         first_stub = transport_stub([(404, {}, b"failure"), (200, {}, _response_body("pageviews.200.json")), (200, {}, _response_body("pageviews.200.json"))])
         expected_first_calls = 1
     else:
-        first_stub = transport_stub([(503, {}, b"failure")] * 6)
-        expected_first_calls = 6
+        first_stub = transport_stub([(503, {}, b"failure")] * 12)
+        expected_first_calls = 12
     out_dir = tmp_path / "out"
 
     assert main(_args(spec_example_path, out_dir), transport=first_stub) == 1
@@ -334,10 +496,10 @@ def test_non_200_never_writes_cache_and_later_200_refetches(
     assert list((tmp_path / "cache").glob("*.json")) == []
     assert not (out_dir / "series.csv").exists()
 
-    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
     assert main(_args(spec_example_path, out_dir), transport=second_stub) == 0
-    assert len(second_stub.calls) == 2
-    assert len(list((tmp_path / "cache").glob("*.json"))) == 2
+    assert len(second_stub.calls) == 4
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 4
 
 
 def test_corrupt_cache_warns_drops_entry_and_refetches(
@@ -353,13 +515,13 @@ def test_corrupt_cache_warns_drops_entry_and_refetches(
         {"unexpected": True},
         datetime.now(timezone.utc),
     )
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
     warning = "pl-post-przerywany: corrupt cache entry; refetching from network"
     assert warning in capsys.readouterr().err
-    assert len(stub.calls) == 2
+    assert len(stub.calls) == 4
     rewritten = json.loads(corrupt_path.read_text(encoding="utf-8"))
     assert isinstance(rewritten["response"]["items"], list)
 
@@ -547,12 +709,16 @@ def test_retry_after_integer_seconds_is_honored(
             (200, {}, _response_body("pageviews.200.json")),
             (429, {"Retry-After": "3"}, b"rate limited"),
             (200, {}, _response_body("pageviews.200.json")),
+            (429, {"Retry-After": "3"}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (429, {"Retry-After": "3"}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
         ]
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
-    assert sleeps == [3.0, 3.0]
-    assert len(stub.calls) == 4
+    assert sleeps == [3.0, 3.0, 3.0, 3.0]
+    assert len(stub.calls) == 8
 
 
 def test_retry_after_http_date_is_parsed(
@@ -571,11 +737,15 @@ def test_retry_after_http_date_is_parsed(
             (200, {}, _response_body("pageviews.200.json")),
             (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
             (200, {}, _response_body("pageviews.200.json")),
+            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
         ]
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
-    assert len(sleeps) == 2
+    assert len(sleeps) == 4
     assert all(seconds >= 5 for seconds in sleeps)
 
 
@@ -594,11 +764,15 @@ def test_retry_after_missing_uses_five_second_fallback(
             (200, {}, _response_body("pageviews.200.json")),
             (429, {}, b"rate limited"),
             (200, {}, _response_body("pageviews.200.json")),
+            (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
         ]
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
-    assert sleeps == [5.0, 5.0]
+    assert sleeps == [5.0, 5.0, 5.0, 5.0]
 
 
 def test_retry_cap_marks_series_failed_and_continues(
@@ -615,11 +789,13 @@ def test_retry_cap_marks_series_failed_and_continues(
             (429, {}, b"rate limited"),
             (429, {}, b"rate limited"),
             (200, {}, _response_body("pageviews.200.json")),
+            (200, {}, _response_body("pageviews.200.json")),
+            (200, {}, _response_body("pageviews.200.json")),
         ]
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 3
-    assert len(stub.calls) == 4
+    assert len(stub.calls) == 6
     assert (tmp_path / "out" / "series.csv").exists()
     assert list((tmp_path / "cache").glob("*.json"))
 
@@ -632,10 +808,10 @@ def test_all_series_fail_returns_one_without_cache(
 ):
     _configure(monkeypatch, tmp_path)
     monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
-    stub = transport_stub([(429, {}, b"rate limited")] * 6)
+    stub = transport_stub([(429, {}, b"rate limited")] * 12)
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 1
-    assert len(stub.calls) == 6
+    assert len(stub.calls) == 12
     assert not (tmp_path / "out" / "series.csv").exists()
     assert list((tmp_path / "cache").glob("*.json")) == []
 
@@ -674,6 +850,8 @@ def test_stream_contract_keeps_diagnostics_off_stdout(
             (429, {}, b"rate limited"),
             (429, {}, b"rate limited"),
             (429, {}, b"rate limited"),
+            (200, {}, _response_body("pageviews.200.json")),
+            (200, {}, _response_body("pageviews.200.json")),
             (200, {}, _response_body("pageviews.200.json")),
         ]
     )
