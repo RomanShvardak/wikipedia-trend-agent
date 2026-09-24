@@ -263,7 +263,18 @@ def compute_growth_for_days(
         raise ValueError("days must be positive")
     start = end_date - timedelta(days=days - 1)
     floor = math.ceil(COVERAGE_RATIO * days)
-    return _growth_result(observations, start, end_date, floor)
+    result = _growth_result(observations, start, end_date, floor)
+    previous_end = start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=days - 1)
+    result.update(
+        {
+            "start": start.isoformat(),
+            "end": end_date.isoformat(),
+            "previous_start": previous_start.isoformat(),
+            "previous_end": previous_end.isoformat(),
+        }
+    )
+    return result
 
 
 def _monthly_means(observations: Sequence[Observation], start: date, end: date) -> list[float]:
@@ -511,6 +522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         grouped = load_series_csv(out_dir / "series.csv", spec)
         document = build_metrics(spec, args.spec, grouped)
+        validate_finite_numbers(document)
         json.dumps(document, ensure_ascii=False, allow_nan=False)
         metrics_path = out_dir / "metrics.json"
         dump_json(document, metrics_path)
