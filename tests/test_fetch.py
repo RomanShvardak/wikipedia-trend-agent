@@ -37,6 +37,30 @@ def _response_body(name: str) -> bytes:
     return (FIXTURES_DIR / name).read_bytes()
 
 
+def _chunk_aware_body(url: str, body: bytes) -> bytes:
+    payload = json.loads(body.decode("utf-8"))
+    start_ymd = url.split("/daily/", 1)[1].split("/", 1)[0][:8]
+    for item in payload.get("items", []):
+        if isinstance(item, dict) and isinstance(item.get("timestamp"), str):
+            item["timestamp"] = f"{start_ymd}00"
+    return json.dumps(payload).encode("utf-8")
+
+
+def _chunk_aware_transport(transport):
+    def fetch(url, headers, timeout=30.0):
+        response = transport(url, headers, timeout)
+        if response.status != 200:
+            return response
+        return fetch_pageviews.TransportResponse(
+            status=response.status,
+            headers=response.headers,
+            body=_chunk_aware_body(url, response.body),
+        )
+
+    setattr(fetch, "calls", transport.calls)
+    return fetch
+
+
 def _configure(monkeypatch, tmp_path: Path) -> list[tuple[float, list[float]]]:
     """Set UA, cache, and no-wait throttle; return a throttle call log."""
     throttle_calls: list[tuple[float, list[float]]] = []
@@ -66,11 +90,24 @@ def _series_urls(spec_path: Path) -> list[str]:
     ]
 
 
-def _write_cache(spec_path: Path, response: object, fetched_at: datetime) -> Path:
+def _write_cache(
+    spec_path: Path,
+    response: object,
+    fetched_at: datetime,
+    *,
+    chunk_aware: bool = True,
+) -> Path:
     url = _series_urls(spec_path)[0]
     path = common.cache_path_for_key(common.cache_key_for_url(url))
+    cached_response: object = response
+    if chunk_aware:
+        cached_response = json.loads(
+            _chunk_aware_body(url, json.dumps(response).encode("utf-8")).decode(
+                "utf-8"
+            )
+        )
     common.dump_json(
-        {"fetched_at": fetched_at.isoformat(), "status": 200, "response": response},
+        {"fetched_at": fetched_at.isoformat(), "status": 200, "response": cached_response},
         path,
     )
     return path
@@ -84,7 +121,9 @@ def test_valid_spec_writes_exact_deterministic_csv(
     capsys,
 ):
     throttle_calls = _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
     out_dir = tmp_path / "out"
 
     assert main(_args(spec_example_path, out_dir), transport=stub) == 0
@@ -192,7 +231,9 @@ def test_main_uses_one_injected_utc_clock_for_clamp_and_404(
     spec["window"]["end"] = "20260924"
     spec_path = tmp_path / "today-spec.json"
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
 
     assert main(
         _args(spec_path, tmp_path / "out"),
@@ -251,7 +292,9 @@ def test_multi_chunk_run_uses_distinct_urls_and_cache_files(
     spec["window"]["end"] = "20251231"
     spec_path = tmp_path / "multi-chunk-spec.json"
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 2)
+    )
 
     assert main(
         _args(spec_path, tmp_path / "out"),
@@ -272,7 +315,9 @@ def test_main_builds_url_from_each_verbatim_series(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
@@ -290,7 +335,9 @@ def test_request_carries_descriptive_user_agent(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
@@ -349,7 +396,9 @@ def test_second_run_is_cache_hit_and_byte_deterministic(
 ):
     _configure(monkeypatch, tmp_path)
     out_dir = tmp_path / "out"
-    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    first_stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
     assert main(_args(spec_example_path, out_dir), transport=first_stub) == 0
     first_bytes = (out_dir / "series.csv").read_bytes()
     first_stdout = capsys.readouterr().out
@@ -370,7 +419,9 @@ def test_distinct_series_urls_create_distinct_cache_files(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
@@ -429,7 +480,9 @@ def test_stale_cache_envelope_refetches_and_is_rewritten(
         },
         second_path,
     )
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 3)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 3)
+    )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
@@ -447,9 +500,13 @@ def test_ttl_hours_zero_forces_cache_refetch(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    first_stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
     assert main(_args(spec_example_path, tmp_path / "out"), transport=first_stub) == 0
-    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    second_stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
     args = [*_args(spec_example_path, tmp_path / "out"), "--ttl-hours", "0"]
 
     assert main(args, transport=second_stub) == 0
@@ -464,10 +521,14 @@ def test_ttl_hours_environment_default_forces_cache_refetch(
     transport_stub,
 ):
     _configure(monkeypatch, tmp_path)
-    first_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    first_stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
     assert main(_args(spec_example_path, tmp_path / "out"), transport=first_stub) == 0
     monkeypatch.setenv("WTI_TTL_HOURS", "0")
-    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    second_stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=second_stub) == 0
 
@@ -484,13 +545,15 @@ def test_non_200_never_writes_cache_and_later_200_refetches(
 ):
     _configure(monkeypatch, tmp_path)
     if failure_status == 404:
-        first_stub = transport_stub(
-            [
-                (404, {}, b"failure"),
-                (200, {}, _response_body("pageviews.200.json")),
-                (404, {}, b"failure"),
-                (200, {}, _response_body("pageviews.200.json")),
-            ]
+        first_stub = _chunk_aware_transport(
+            transport_stub(
+                [
+                    (404, {}, b"failure"),
+                    (200, {}, _response_body("pageviews.200.json")),
+                    (404, {}, b"failure"),
+                    (200, {}, _response_body("pageviews.200.json")),
+                ]
+            )
         )
         expected_first_calls = 4
     else:
@@ -512,7 +575,9 @@ def test_non_200_never_writes_cache_and_later_200_refetches(
     else:
         assert list((tmp_path / "cache").glob("*.json")) == []
         assert not (out_dir / "series.csv").exists()
-        second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+        second_stub = _chunk_aware_transport(
+            transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+        )
         assert main(_args(spec_example_path, out_dir), transport=second_stub) == 0
         assert len(second_stub.calls) == 4
         assert len(list((tmp_path / "cache").glob("*.json"))) == 4
@@ -531,7 +596,9 @@ def test_corrupt_cache_warns_drops_entry_and_refetches(
         {"unexpected": True},
         datetime.now(timezone.utc),
     )
-    stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    stub = _chunk_aware_transport(
+        transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+    )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
 
@@ -560,35 +627,117 @@ def test_malformed_200_is_reported_and_not_cached(
     assert not (out_dir / "series.csv").exists()
 
 
-def test_cached_item_with_invalid_types_never_reaches_csv(
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timestamp", "2024092301"),
+        ("timestamp", "2024092200"),
+        ("timestamp", "2025092300"),
+        ("views", -1),
+    ],
+)
+def test_response_parser_rejects_invalid_daily_item(
     spec_example_path,
     tmp_path,
     monkeypatch,
+    transport_stub,
+    field,
+    value,
+):
+    _configure(monkeypatch, tmp_path)
+    spec_path = _single_series_spec(
+        spec_example_path,
+        tmp_path,
+        start="20240923",
+        end="20250922",
+    )
+    item = {"timestamp": "2024092300", "views": 21}
+    item[field] = value
+    body = json.dumps({"items": [item]}).encode("utf-8")
+    stub = transport_stub([(200, {}, body)])
+    out_dir = tmp_path / "out"
+
+    assert main(_args(spec_path, out_dir), transport=stub) == 1
+
+    assert not (out_dir / "series.csv").exists()
+    assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+def test_cached_item_with_invalid_data_is_deleted_refetched_and_replaced(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
     capsys,
 ):
     _configure(monkeypatch, tmp_path)
+    spec_path = _single_series_spec(
+        spec_example_path,
+        tmp_path,
+        start="20240923",
+        end="20250922",
+    )
     invalid_response = {
-        "items": [
-            {
-                "project": "pl.wikipedia",
-                "article": "Warszawa",
-                "granularity": "daily",
-                "timestamp": "20260923",
-                "access": "all-access",
-                "agent": "user",
-                "views": 1.5,
-            }
-        ]
+        "items": [{"timestamp": "2024092301", "views": 23}]
     }
-    _write_cache(spec_example_path, invalid_response, datetime.now(timezone.utc))
+    cache_path = _write_cache(
+        spec_path,
+        invalid_response,
+        datetime.now(timezone.utc),
+        chunk_aware=False,
+    )
+    valid_body = json.dumps(
+        {"items": [{"timestamp": "2024092300", "views": 24}]}
+    ).encode("utf-8")
+    stub = transport_stub([(200, {}, valid_body)])
     out_dir = tmp_path / "out"
 
-    def forbidden_transport(url, headers, timeout=30.0):
-        raise AssertionError("valid-looking cache should not reach transport")
+    assert main(_args(spec_path, out_dir), transport=stub) == 0
 
-    assert main(_args(spec_example_path, out_dir), transport=forbidden_transport) == 1
+    assert len(stub.calls) == 1
+    assert "invalid cache entry" in capsys.readouterr().err
+    replacement = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert replacement["status"] == 200
+    assert replacement["response"]["items"][0]["timestamp"] == "2024092300"
+    with (out_dir / "series.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(row["date"], row["views"]) for row in rows] == [("2024-09-23", "24")]
 
-    assert "invalid timestamp" in capsys.readouterr().err
+    def network_forbidden(url, headers, timeout=30.0):
+        raise AssertionError("valid replacement cache should not reach transport")
+
+    assert main(_args(spec_path, out_dir), transport=network_forbidden) == 0
+
+
+def test_invalid_cache_refetch_does_not_replace_after_invalid_200(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+):
+    _configure(monkeypatch, tmp_path)
+    spec_path = _single_series_spec(
+        spec_example_path,
+        tmp_path,
+        start="20240923",
+        end="20250922",
+    )
+    cache_path = _write_cache(
+        spec_path,
+        {"items": [{"timestamp": "2024092200", "views": 25}]},
+        datetime.now(timezone.utc),
+        chunk_aware=False,
+    )
+    invalid_body = json.dumps(
+        {"items": [{"timestamp": "2024092301", "views": 26}]}
+    ).encode("utf-8")
+    stub = transport_stub([(200, {}, invalid_body)])
+    out_dir = tmp_path / "out"
+
+    assert main(_args(spec_path, out_dir), transport=stub) == 1
+
+    assert len(stub.calls) == 1
+    assert not cache_path.exists()
     assert not (out_dir / "series.csv").exists()
 
 
@@ -727,11 +876,13 @@ def test_not_loaded_404_writes_nothing_and_continues(
         datetime.now(timezone.utc) - timedelta(days=1),
         fail_on_empty_series=False,
     )
-    stub = transport_stub(
-        [
-            (404, {}, _response_body("pageviews.404.json")),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
+    stub = _chunk_aware_transport(
+        transport_stub(
+            [
+                (404, {}, _response_body("pageviews.404.json")),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
     )
 
     assert main(_args(spec_path, tmp_path / "out"), transport=stub) == 0
@@ -810,17 +961,19 @@ def test_retry_after_integer_seconds_is_honored(
     _configure(monkeypatch, tmp_path)
     sleeps: list[float] = []
     monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
-    stub = transport_stub(
-        [
-            (429, {"Retry-After": "3"}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {"Retry-After": "3"}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {"Retry-After": "3"}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {"Retry-After": "3"}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
+    stub = _chunk_aware_transport(
+        transport_stub(
+            [
+                (429, {"Retry-After": "3"}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {"Retry-After": "3"}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {"Retry-After": "3"}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {"Retry-After": "3"}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
@@ -838,17 +991,19 @@ def test_retry_after_http_date_is_parsed(
     sleeps: list[float] = []
     monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
     retry_at = datetime.now(timezone.utc) + timedelta(seconds=8)
-    stub = transport_stub(
-        [
-            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
+    stub = _chunk_aware_transport(
+        transport_stub(
+            [
+                (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {"Retry-After": format_datetime(retry_at, usegmt=True)}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
@@ -865,17 +1020,19 @@ def test_retry_after_missing_uses_five_second_fallback(
     _configure(monkeypatch, tmp_path)
     sleeps: list[float] = []
     monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
-    stub = transport_stub(
-        [
-            (429, {}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (429, {}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
+    stub = _chunk_aware_transport(
+        transport_stub(
+            [
+                (429, {}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (429, {}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 0
@@ -890,15 +1047,17 @@ def test_retry_cap_marks_series_failed_and_continues(
 ):
     _configure(monkeypatch, tmp_path)
     monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
-    stub = transport_stub(
-        [
-            (429, {}, b"rate limited"),
-            (429, {}, b"rate limited"),
-            (429, {}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (200, {}, _response_body("pageviews.200.json")),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
+    stub = _chunk_aware_transport(
+        transport_stub(
+            [
+                (429, {}, b"rate limited"),
+                (429, {}, b"rate limited"),
+                (429, {}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (200, {}, _response_body("pageviews.200.json")),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 3
@@ -1033,15 +1192,17 @@ def test_stream_contract_keeps_diagnostics_off_stdout(
 ):
     _configure(monkeypatch, tmp_path)
     monkeypatch.setattr(fetch_pageviews, "sleep", lambda _seconds: None)
-    stub = transport_stub(
-        [
-            (429, {}, b"rate limited"),
-            (429, {}, b"rate limited"),
-            (429, {}, b"rate limited"),
-            (200, {}, _response_body("pageviews.200.json")),
-            (200, {}, _response_body("pageviews.200.json")),
-            (200, {}, _response_body("pageviews.200.json")),
-        ]
+    stub = _chunk_aware_transport(
+        transport_stub(
+            [
+                (429, {}, b"rate limited"),
+                (429, {}, b"rate limited"),
+                (429, {}, b"rate limited"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (200, {}, _response_body("pageviews.200.json")),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
     )
 
     assert main(_args(spec_example_path, tmp_path / "out"), transport=stub) == 3
