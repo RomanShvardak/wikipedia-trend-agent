@@ -677,7 +677,7 @@ def test_direction_gate_hierarchy_and_hypothesis_reason() -> None:
     assert analyze_trends.safe_direction(365, 10, 10, "high", 1_000) == "flat"
     assert analyze_trends.safe_direction(365, 10, 11, "high", 1_000) == "noise"
     assert analyze_trends.safe_direction(365, 11, 11, "high", 1_000) == "up"
-
+    assert analyze_trends.safe_direction(365, -11, -11, "high", 1_000) == "down"
 
 
 def test_empty_null_and_single_element_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -690,6 +690,13 @@ def test_empty_null_and_single_element_inputs(tmp_path: Path, monkeypatch: pytes
     empty_metrics.write_text("sentinel", encoding="utf-8")
     assert _run_analyzer(spec_path, empty_out) == 1
     assert empty_metrics.read_text(encoding="utf-8") == "sentinel"
+
+    invalid_utf8 = tmp_path / "invalid-utf8"
+    invalid_utf8.mkdir()
+    (invalid_utf8 / "series.csv").write_bytes(
+        ",".join(CSV_HEADER).encode("utf-8") + b"\n2024-01-01,\xff,en-example,en.wikipedia,Example_article\n"
+    )
+    assert _run_analyzer(spec_path, invalid_utf8) == 1
 
     invalid_rows = [
         ("null", "en-example", "en.wikipedia", "Example_article"),

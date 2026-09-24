@@ -88,6 +88,8 @@ def _as_spec_series(spec: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 
 def _parse_iso_date(value: str, row_number: int) -> date:
+    if len(value) != 10 or value[4] != "-" or value[7] != "-":
+        raise AnalysisError(f"row {row_number}: date must be YYYY-MM-DD")
     try:
         return date.fromisoformat(value)
     except ValueError as error:
@@ -108,54 +110,71 @@ def load_series_csv(
     if size > MAX_CSV_BYTES:
         raise AnalysisError(f"series CSV exceeds {MAX_CSV_BYTES} bytes")
 
-    try:
-        text = csv_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as error:
-        raise AnalysisError("series CSV must be valid UTF-8") from error
-    except OSError as error:
-        raise AnalysisError(f"could not read series CSV: {csv_path}") from error
-
-    reader = csv.reader(text.splitlines())
-    try:
-        header = next(reader)
-    except StopIteration as error:
-        raise AnalysisError("series CSV is empty") from error
-    if tuple(header) != CSV_HEADER:
-        raise AnalysisError(f"series CSV header must be exactly {','.join(CSV_HEADER)}")
-
     spec_series = _as_spec_series(spec)
     grouped: dict[str, list[Observation]] = {series_id: [] for series_id in spec_series}
     seen: set[tuple[str, date]] = set()
     row_count = 0
-    for row_number, row in enumerate(reader, start=2):
-        row_count += 1
-        if row_count > MAX_OBSERVATIONS:
-            raise AnalysisError(f"series CSV exceeds {MAX_OBSERVATIONS} observations")
-        if len(row) != len(CSV_HEADER):
-            raise AnalysisError(f"row {row_number}: expected {len(CSV_HEADER)} CSV fields")
-        date_text, views_text, series_id, project, article = row
-        if series_id not in spec_series:
-            raise AnalysisError(f"row {row_number}: series_id is not present in spec: {series_id}")
-        expected = spec_series[series_id]
-        if project != expected.get("project") or article != expected.get("article"):
-            raise AnalysisError(f"row {row_number}: project/article do not match spec for {series_id}")
-        if not views_text.isdigit():
-            raise AnalysisError(f"row {row_number}: views must be a non-negative integer")
-        views = int(views_text)
-        observed_date = _parse_iso_date(date_text, row_number)
-        identity = (series_id, observed_date)
-        if identity in seen:
-            raise AnalysisError(f"row {row_number}: duplicate date for series {series_id}")
-        seen.add(identity)
-        grouped[series_id].append(
-            Observation(
-                date=observed_date,
-                views=views,
-                series_id=series_id,
-                project=project,
-                article=article,
-            )
-        )
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle, strict=True)
+            try:
+                header = next(reader)
+            except StopIteration as error:
+                raise AnalysisError("series CSV is empty") from error
+            if tuple(header) != CSV_HEADER:
+                raise AnalysisError(
+                    f"series CSV header must be exactly {','.join(CSV_HEADER)}"
+                )
+            for row_number, row in enumerate(reader, start=2):
+                row_count += 1
+                if row_count > MAX_OBSERVATIONS:
+                    raise AnalysisError(
+                        f"series CSV exceeds {MAX_OBSERVATIONS} observations"
+                    )
+                if len(row) != len(CSV_HEADER):
+                    raise AnalysisError(
+                        f"row {row_number}: expected {len(CSV_HEADER)} CSV fields"
+                    )
+                date_text, views_text, series_id, project, article = row
+                if series_id not in spec_series:
+                    raise AnalysisError(
+                        f"row {row_number}: series_id is not present in spec: {series_id}"
+                    )
+                expected = spec_series[series_id]
+                if (
+                    project != expected.get("project")
+                    or article != expected.get("article")
+                ):
+                    raise AnalysisError(
+                        f"row {row_number}: project/article do not match spec for {series_id}"
+                    )
+                if not views_text.isascii() or not views_text.isdigit():
+                    raise AnalysisError(
+                        f"row {row_number}: views must be a non-negative integer"
+                    )
+                views = int(views_text)
+                observed_date = _parse_iso_date(date_text, row_number)
+                identity = (series_id, observed_date)
+                if identity in seen:
+                    raise AnalysisError(
+                        f"row {row_number}: duplicate date for series {series_id}"
+                    )
+                seen.add(identity)
+                grouped[series_id].append(
+                    Observation(
+                        date=observed_date,
+                        views=views,
+                        series_id=series_id,
+                        project=project,
+                        article=article,
+                    )
+                )
+    except csv.Error as error:
+        raise AnalysisError("series CSV is malformed") from error
+    except UnicodeDecodeError as error:
+        raise AnalysisError("series CSV must be valid UTF-8") from error
+    except OSError as error:
+        raise AnalysisError(f"could not read series CSV: {csv_path}") from error
 
     missing = [series_id for series_id, rows in grouped.items() if not rows]
     if missing:
@@ -575,7 +594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         grouped = load_series_csv(out_dir / "series.csv", spec)
         document = build_metrics(spec, args.spec, grouped)
         validate_finite_numbers(document)
-        json.dumps(document, ensure_ascii=False, allow_nan=False)
+        try:
+            json.dumps(document, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise AnalysisError("metrics document is not JSON serializable") from error
         metrics_path = out_dir / "metrics.json"
         dump_json(document, metrics_path)
     except AnalysisError as error:
