@@ -45,7 +45,7 @@ def _daily_rows(
     for index in range(days):
         current = start + timedelta(days=index)
         seasonal = (current.month % 4) * 5
-        views = 1000 + (index // 30) * 4 + seasonal
+        views = 1000 + (index // 30) * 4 + seasonal + (index % 7) * 2
         if index == 730:
             views *= 10
         rows.append(
@@ -112,7 +112,7 @@ def test_one_series_reaches_finite_metrics_end_to_end(tmp_path: Path) -> None:
     assert series["article"] == "Example_article"
     assert series["period"] == {"start": "2022-01-01", "end": "2025-12-30", "days": 1460}
     assert set(series["growth"]) == {"m3", "y1", "y2"}
-    assert any(anomaly["date"] == "2023-12-31" for anomaly in series["anomalies"])
+    assert any(anomaly["date"] == "2024-01-01" for anomaly in series["anomalies"])
     assert series["anomaly_share"] > 0.0
     assert series["trend_direction"] in {"up", "down", "flat", "noise", "inconclusive"}
     assert series["confidence"] in {"low", "medium", "high"}
