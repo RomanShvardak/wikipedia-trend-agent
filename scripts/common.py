@@ -37,6 +37,9 @@ _SERIES_FIELD_FIX = {
     "label": 'add "label" like "Польська: інтервальне голодування"',
     "language": 'add "language" like "pl"',
 }
+# Shared default throttle state: consecutive bare throttle() calls are spaced.
+# Callers may inject their own list for per-client pacing (Phase 2 fetch).
+_THROTTLE_LAST: list[float] = [0.0]
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -228,12 +231,12 @@ def cache_path_for_key(key: str) -> Path:
 def throttle(seconds: float = 1.0, last: list[float] | None = None) -> None:
     """Sleep so consecutive calls are at least `seconds` apart (~1 req/s policy).
 
-    The mutable state defaults to a fresh list when None (never a mutable
-    default argument).
+    The mutable state defaults to the module-level shared list when None
+    (never a mutable default argument); a caller may inject its own list for
+    per-client pacing.
     """
-    if last is None:
-        last = [0.0]
-    wait = seconds - (time.monotonic() - last[0])
+    state = last if last is not None else _THROTTLE_LAST
+    wait = seconds - (time.monotonic() - state[0])
     if wait > 0:
         time.sleep(wait)
-    last[0] = time.monotonic()
+    state[0] = time.monotonic()
