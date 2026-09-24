@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -31,6 +31,7 @@ from common import (
 
 log = common.log
 CSV_HEADER = ("date", "views", "series_id", "project", "article")
+NOT_LOADED_GAP_DAYS = 2
 Transport = Callable[[str, dict[str, str], float], "TransportResponse"]
 
 
@@ -87,6 +88,51 @@ def series_url(project: str, article: str, start_ymd: str, end_ymd: str) -> str:
         "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/"
         f"{project}/all-access/user/{article}/daily/{start_ymd}00/{end_ymd}00"
     )
+
+
+def _parse_ymd(value: str) -> date:
+    """Parse the spec's YYYYMMDD or an ISO date used by direct helper tests."""
+    if len(value) == 8:
+        return datetime.strptime(value, "%Y%m%d").date()
+    return date.fromisoformat(value)
+
+
+def classify_404(window_end_ymd: str, yesterday_utc: date) -> str:
+    """Classify a 404 using only its distance from the last complete UTC day."""
+    gap = (yesterday_utc - _parse_ymd(window_end_ymd)).days
+    return "not_loaded" if gap <= NOT_LOADED_GAP_DAYS else "no_views"
+
+
+def _zero_rows(
+    series: Mapping[str, Any],
+    start_ymd: str,
+    end_ymd: str,
+) -> list[SeriesRow]:
+    """Create one truthful zero row for every day in the requested window."""
+    start = _parse_ymd(start_ymd)
+    end = _parse_ymd(end_ymd)
+    return [
+        {
+            "date": current.isoformat(),
+            "views": 0,
+            "series_id": series["id"],
+            "project": series["project"],
+            "article": series["article"],
+        }
+        for current in _date_range(start, end)
+    ]
+
+
+def _date_range(start: date, end: date):
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
+def _diagnostic(series_id: str, message: str) -> None:
+    """Write one grep-friendly per-series diagnostic to stderr."""
+    print(f"{series_id}: {message}", file=sys.stderr)
 
 
 def cache_fresh(path: Path, ttl_hours: int) -> bool:
@@ -197,7 +243,9 @@ def _fetch_series(
     headers: dict[str, str],
     transport: Transport,
     pace: list[float],
-) -> tuple[list[SeriesRow], bool]:
+    yesterday_utc: date,
+    fail_on_empty_series: bool = False,
+) -> tuple[list[SeriesRow], bool, str]:
     url = series_url(series["project"], series["article"], start_ymd, end_ymd)
     cached = _read_cached_response(url, ttl_hours, series["id"])
     if cached is not None:
@@ -207,6 +255,17 @@ def _fetch_series(
         common.throttle(1.0, pace)
         response = transport(url, headers, 30.0)
         cache_hit = False
+        if response.status == 404:
+            classification = classify_404(end_ymd, yesterday_utc)
+            if classification == "not_loaded":
+                _diagnostic(series["id"], "data not yet loaded — retry later")
+            else:
+                _diagnostic(series["id"], "no views for the requested window")
+            if fail_on_empty_series:
+                return [], False, "fatal"
+            if classification == "not_loaded":
+                return [], False, "not_loaded"
+            return _zero_rows(series, start_ymd, end_ymd), False, "no_views"
         if response.status != 200:
             raise FetchError(f"unexpected HTTP {response.status}")
         payload_bytes = response.body
@@ -223,7 +282,7 @@ def _fetch_series(
             },
             cache_path,
         )
-    return rows, cache_hit
+    return rows, cache_hit, "ok"
 
 
 def _write_series_csv(out_dir: str | Path, rows: list[SeriesRow]) -> Path:
@@ -266,10 +325,13 @@ def main(
     window = spec["window"]
     rows: list[SeriesRow] = []
     cache_hits = 0
+    yesterday_utc = datetime.now(timezone.utc).date() - timedelta(days=1)
+    fail_on_empty_series = bool(spec.get("quality", {}).get("fail_on_empty_series", False))
+    outcomes: list[str] = []
 
     try:
         for series in spec["series"]:
-            series_rows, cache_hit = _fetch_series(
+            series_rows, cache_hit, outcome = _fetch_series(
                 series=series,
                 start_ymd=window["start"],
                 end_ymd=window["end"],
@@ -277,12 +339,20 @@ def main(
                 headers=headers,
                 transport=request_transport,
                 pace=fetch_pace,
+                yesterday_utc=yesterday_utc,
+                fail_on_empty_series=fail_on_empty_series,
             )
+            outcomes.append(outcome)
+            if outcome == "fatal":
+                return 1
             rows.extend(series_rows)
             cache_hits += int(cache_hit)
             log.debug("%s: fetched %d item(s)", series["id"], len(series_rows))
     except FetchError as error:
         print(f"fetch_pageviews: {error}", file=sys.stderr)
+        return 1
+
+    if "fatal" in outcomes:
         return 1
 
     output = _write_series_csv(args.out, rows)

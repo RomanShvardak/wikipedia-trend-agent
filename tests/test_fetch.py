@@ -11,7 +11,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 
@@ -19,7 +19,7 @@ import pytest
 
 import common
 import fetch_pageviews
-from fetch_pageviews import default_transport, main, series_url
+from fetch_pageviews import classify_404, default_transport, main, series_url
 
 DESCRIPTIVE_UA = "wikipedia-trend-agent/0.1.0 (maintainer@invalid.example.net) python-urllib"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -409,3 +409,121 @@ def test_cached_item_with_invalid_types_never_reaches_csv(
 
     assert "invalid timestamp" in capsys.readouterr().err
     assert not (out_dir / "series.csv").exists()
+
+
+def _write_404_spec(
+    source_spec: Path,
+    tmp_path: Path,
+    end_date: date,
+    *,
+    fail_on_empty_series: bool,
+) -> Path:
+    spec = copy.deepcopy(json.loads(source_spec.read_text(encoding="utf-8")))
+    start_date = end_date - timedelta(days=2)
+    spec["window"]["start"] = start_date.strftime("%Y%m%d")
+    spec["window"]["end"] = end_date.strftime("%Y%m%d")
+    spec["quality"] = {"fail_on_empty_series": fail_on_empty_series}
+    spec_path = tmp_path / "spec-404.json"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    return spec_path
+
+
+@pytest.mark.parametrize(
+    ("days_ago", "expected"),
+    [(0, "not_loaded"), (2, "not_loaded"), (3, "no_views")],
+)
+def test_classify_404_uses_inclusive_utc_recency_gap(days_ago, expected):
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    window_end = yesterday - timedelta(days=days_ago)
+
+    assert classify_404(window_end.strftime("%Y%m%d"), yesterday) == expected
+    assert _response_body("pageviews.404.json")
+
+
+def test_not_loaded_404_writes_nothing_and_continues(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    spec_path = _write_404_spec(
+        spec_example_path,
+        tmp_path,
+        datetime.now(timezone.utc) - timedelta(days=1),
+        fail_on_empty_series=False,
+    )
+    stub = transport_stub(
+        [
+            (404, {}, _response_body("pageviews.404.json")),
+            (200, {}, _response_body("pageviews.200.json")),
+        ]
+    )
+
+    assert main(_args(spec_path, tmp_path / "out"), transport=stub) == 0
+
+    rows = list(csv.DictReader((tmp_path / "out" / "series.csv").open(encoding="utf-8")))
+    assert [row["series_id"] for row in rows] == ["cs-pust-prerusovany"]
+    assert "pl-post-przerywany: data not yet loaded — retry later" in capsys.readouterr().err
+
+
+def test_no_views_404_zero_fills_the_requested_window(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    end_date = datetime.now(timezone.utc).date() - timedelta(days=4)
+    spec_path = _write_404_spec(
+        spec_example_path,
+        tmp_path,
+        end_date,
+        fail_on_empty_series=False,
+    )
+    stub = transport_stub([(404, {}, _response_body("pageviews.404.json"))] * 2)
+
+    assert main(_args(spec_path, tmp_path / "out"), transport=stub) == 0
+
+    with (tmp_path / "out" / "series.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    expected_dates = [(end_date - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in (2, 1, 0)]
+    assert [row["date"] for row in rows] == expected_dates + expected_dates
+    assert {row["views"] for row in rows} == {"0"}
+    assert capsys.readouterr().err.count("no views for the requested window") == 2
+
+
+def test_fail_on_empty_series_controls_404_fatal_exit(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    end_date = datetime.now(timezone.utc).date() - timedelta(days=4)
+
+    fatal_spec = _write_404_spec(
+        spec_example_path,
+        tmp_path / "fatal",
+        end_date,
+        fail_on_empty_series=True,
+    )
+    fatal_stub = transport_stub([(404, {}, _response_body("pageviews.404.json"))] * 2)
+    assert main(_args(fatal_spec, tmp_path / "fatal" / "out"), transport=fatal_stub) == 1
+    assert "no views for the requested window" in capsys.readouterr().err
+    assert not (tmp_path / "fatal" / "out" / "series.csv").exists()
+
+    permissive_spec = _write_404_spec(
+        spec_example_path,
+        tmp_path / "permissive",
+        end_date,
+        fail_on_empty_series=False,
+    )
+    permissive_stub = transport_stub([(404, {}, _response_body("pageviews.404.json"))] * 2)
+    assert main(_args(permissive_spec, tmp_path / "permissive" / "out"), transport=permissive_stub) == 0
+    assert "no views for the requested window" in capsys.readouterr().err
+    assert (tmp_path / "permissive" / "out" / "series.csv").exists()
