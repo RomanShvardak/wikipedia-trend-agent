@@ -484,22 +484,38 @@ def test_non_200_never_writes_cache_and_later_200_refetches(
 ):
     _configure(monkeypatch, tmp_path)
     if failure_status == 404:
-        first_stub = transport_stub([(404, {}, b"failure"), (200, {}, _response_body("pageviews.200.json")), (200, {}, _response_body("pageviews.200.json"))])
-        expected_first_calls = 1
+        first_stub = transport_stub(
+            [
+                (404, {}, b"failure"),
+                (200, {}, _response_body("pageviews.200.json")),
+                (404, {}, b"failure"),
+                (200, {}, _response_body("pageviews.200.json")),
+            ]
+        )
+        expected_first_calls = 4
     else:
         first_stub = transport_stub([(503, {}, b"failure")] * 12)
         expected_first_calls = 12
     out_dir = tmp_path / "out"
 
-    assert main(_args(spec_example_path, out_dir), transport=first_stub) == 1
+    expected_first_exit = 0 if failure_status == 404 else 1
+    assert main(_args(spec_example_path, out_dir), transport=first_stub) == expected_first_exit
     assert len(first_stub.calls) == expected_first_calls
-    assert list((tmp_path / "cache").glob("*.json")) == []
-    assert not (out_dir / "series.csv").exists()
 
-    second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
-    assert main(_args(spec_example_path, out_dir), transport=second_stub) == 0
-    assert len(second_stub.calls) == 4
-    assert len(list((tmp_path / "cache").glob("*.json"))) == 4
+    if failure_status == 404:
+        assert len(list((tmp_path / "cache").glob("*.json"))) == 2
+        second_stub = transport_stub(
+            [(404, {}, b"failure"), (404, {}, b"failure")]
+        )
+        assert main(_args(spec_example_path, out_dir), transport=second_stub) == 0
+        assert len(second_stub.calls) == 2
+    else:
+        assert list((tmp_path / "cache").glob("*.json")) == []
+        assert not (out_dir / "series.csv").exists()
+        second_stub = transport_stub([(200, {}, _response_body("pageviews.200.json"))] * 4)
+        assert main(_args(spec_example_path, out_dir), transport=second_stub) == 0
+        assert len(second_stub.calls) == 4
+        assert len(list((tmp_path / "cache").glob("*.json"))) == 4
 
 
 def test_corrupt_cache_warns_drops_entry_and_refetches(

@@ -341,7 +341,6 @@ def _fetch_series(
     transport: Transport,
     pace: list[float],
     yesterday_utc: date,
-    fail_on_empty_series: bool = False,
 ) -> tuple[list[SeriesRow], bool, str]:
     url = series_url(series["project"], series["article"], start_ymd, end_ymd)
     cached = _read_cached_response(url, ttl_hours, series["id"])
@@ -364,8 +363,6 @@ def _fetch_series(
                     _diagnostic(series["id"], "data not yet loaded — retry later")
                 else:
                     _diagnostic(series["id"], "no views for the requested window")
-                if fail_on_empty_series:
-                    return [], False, "fatal"
                 if classification == "not_loaded":
                     return [], False, "not_loaded"
                 return _zero_rows(series, start_ymd, end_ymd), False, "no_views"
@@ -452,6 +449,8 @@ def main(
             chunks = chunk_ranges(window["start"], clamped_end)
             series_rows: list[SeriesRow] = []
             series_failed = False
+            successful_chunks = 0
+            not_found_chunks = 0
             for chunk_start, chunk_end in chunks:
                 request_count += 1
                 chunk_rows, cache_hit, outcome = _fetch_series(
@@ -463,15 +462,23 @@ def main(
                     transport=request_transport,
                     pace=fetch_pace,
                     yesterday_utc=yesterday_utc,
-                    fail_on_empty_series=fail_on_empty_series,
                 )
                 series_rows.extend(chunk_rows)
                 cache_hits += int(cache_hit)
-                if outcome == "fatal":
-                    _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
-                    return 1
-                if outcome == "failed":
+                if outcome == "ok":
+                    successful_chunks += 1
+                elif outcome in {"not_loaded", "no_views"}:
+                    not_found_chunks += 1
+                elif outcome == "failed":
                     series_failed = True
+
+            if (
+                fail_on_empty_series
+                and successful_chunks == 0
+                and not_found_chunks > 0
+            ):
+                _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
+                return 1
         except SeriesFetchError:
             _print_summary(len(spec["series"]), failures + 1, cache_hits, rows, None, request_count)
             return 1
