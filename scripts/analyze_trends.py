@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, cast
 
 import common
 from common import dump_json, load_and_validate_spec, setup_logging
@@ -54,7 +54,7 @@ SEASONALITY_AVAILABLE_NOTE = "months above the aligned half medians"
 @dataclass(frozen=True, slots=True)
 class Observation:
     date: date
-    views: int
+    views: int | float
     series_id: str
     project: str
     article: str
@@ -190,11 +190,12 @@ def replace_anomalies(
     observations: Sequence[Observation], anomalies: Sequence[Mapping[str, object]]
 ) -> list[Observation]:
     """Replace anomalous values with their detected local medians, preserving dates."""
-    replacements = {
-        str(anomaly["date"]): int(anomaly["median"])
-        for anomaly in anomalies
-        if isinstance(anomaly.get("date"), str) and isinstance(anomaly.get("median"), int)
-    }
+    replacements: dict[str, int | float] = {}
+    for anomaly in anomalies:
+        date_value = anomaly.get("date")
+        median_value = anomaly.get("median")
+        if isinstance(date_value, str) and isinstance(median_value, (int, float)):
+            replacements[date_value] = median_value
     return [
         Observation(
             date=observation.date,
@@ -209,7 +210,7 @@ def replace_anomalies(
 
 def _window_values(
     observations: Sequence[Observation], start: date, end: date
-) -> list[int]:
+) -> list[int | float]:
     return [observation.views for observation in observations if start <= observation.date <= end]
 
 
@@ -266,7 +267,7 @@ def compute_growth_for_days(
 
 
 def _monthly_means(observations: Sequence[Observation], start: date, end: date) -> list[float]:
-    values: dict[int, list[int]] = {month: [] for month in range(1, 13)}
+    values: dict[int, list[int | float]] = {month: [] for month in range(1, 13)}
     for observation in observations:
         if start <= observation.date <= end:
             values[observation.date.month].append(observation.views)
@@ -516,7 +517,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AnalysisError as error:
         print(f"analysis failed: {error}", file=sys.stderr)
         return 1
-    print(f"Analyzed {len(document['series'])} series; output: {metrics_path}")
+    series_count = len(cast(list[object], document["series"]))
+    print(f"Analyzed {series_count} series; output: {metrics_path}")
     return 0
 
 
