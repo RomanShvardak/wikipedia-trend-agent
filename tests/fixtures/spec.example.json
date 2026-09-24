@@ -1,0 +1,27 @@
+{
+  "name": "intermittent_fasting_pl_cs",
+  "request": "Порівняй зростання інтересу до інтервального голодування в польськомовній і чеськомовній Wikipedia за останні два роки.",
+  "language": "uk",
+  "window": { "start": "20240923", "end": "20260920", "granularity": "daily" },
+  "assumptions": [
+    "тема представлена однією статтею в кожному розділі",
+    "слаги статей перевірені через resolve_articles.py"
+  ],
+  "series": [
+    {
+      "id": "pl-post-przerywany",
+      "project": "pl.wikipedia",
+      "article": "Post_przerywany",
+      "label": "Польська: інтервальне голодування",
+      "language": "pl"
+    },
+    {
+      "id": "cs-pust-prerusovany",
+      "project": "cs.wikipedia",
+      "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
+      "label": "Чеська: інтервальне голодування",
+      "language": "cs"
+    }
+  ],
+  "quality": { "fail_on_empty_series": true }
+}
