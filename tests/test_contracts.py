@@ -112,17 +112,38 @@ def test_null_pct_has_reason(metrics) -> None:
                 _assert_pct_value(clean, f"{series['series_id']}.{name}.clean")
 
 
-def test_pct_never_zero_as_missing(metrics) -> None:
-    """A literal 0 must never mark 'not computable' (ANAL-06)."""
+def test_pct_null_or_zero_semantics() -> None:
+    """Numeric zero means unchanged; null requires a non-empty own reason."""
+    _assert_pct_value({"pct": 0.0, "abs": 0, "clean": {"pct": 0.0, "abs": 0}}, "zero")
+    with pytest.raises(AssertionError):
+        _assert_pct_value({"pct": None, "abs": None}, "missing_outer_reason")
+    with pytest.raises(AssertionError):
+        _assert_pct_value({"pct": None, "abs": None, "reason": "  "}, "blank_outer_reason")
+    with pytest.raises(AssertionError):
+        _assert_pct_value({"pct": None, "abs": None}, "missing_clean_reason")
+
+
+def test_numeric_y2_requires_executable_history(metrics) -> None:
+    """A numeric two-year comparison requires the inclusive 1460-day span."""
     for series in metrics["series"]:
-        for name in GROWTH_WINDOWS:
-            window = series["growth"][name]
-            assert window["pct"] != 0, (
-                f"growth.{name}.pct is 0 — a literal 0 never marks 'not computable' (ANAL-06)"
-            )
-            clean = window.get("clean")
-            if isinstance(clean, dict) and "pct" in clean:
-                assert clean["pct"] != 0, f"growth.{name}.clean.pct is 0 (ANAL-06)"
+        y2 = series["growth"]["y2"]
+        if y2["pct"] is not None:
+            assert series["period"]["days"] >= 1460
+            assert isinstance(y2["clean"], dict)
+            assert y2["clean"]["pct"] is not None
+
+
+def test_728_day_golden_y2_is_not_computable(metrics) -> None:
+    """The committed 728-day example cannot claim numeric two-year growth."""
+    for series in metrics["series"]:
+        if series["period"]["days"] < 1460:
+            y2 = series["growth"]["y2"]
+            assert y2["pct"] is None
+            assert y2["abs"] is None
+            assert y2["reason"] == "insufficient observations in one or both equal-length windows"
+            assert y2["clean"]["pct"] is None
+            assert y2["clean"]["abs"] is None
+            assert y2["clean"]["reason"] == y2["reason"]
 
 
 def test_enum_membership(metrics) -> None:
