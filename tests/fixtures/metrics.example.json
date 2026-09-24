@@ -1,0 +1,105 @@
+{
+  "spec_name": "intermittent_fasting_pl_cs",
+  "as_of": "2026-09-23",
+  "generated_from": "tests/fixtures/spec.example.json",
+  "series": [
+    {
+      "series_id": "pl-post-przerywany",
+      "project": "pl.wikipedia",
+      "article": "Post_przerywany",
+      "label": "Польська: інтервальне голодування",
+      "language": "pl",
+      "total_views": 1392124,
+      "avg_daily_views": 1912.3,
+      "period": { "start": "2024-09-23", "end": "2026-09-20", "days": 728 },
+      "growth": {
+        "m3": {
+          "pct": 6.2,
+          "abs": 96,
+          "start": "2026-06-21",
+          "end": "2026-09-20",
+          "clean": { "pct": 7.1, "abs": 110 }
+        },
+        "y1": {
+          "pct": 18.7,
+          "abs": 287,
+          "start": "2025-09-23",
+          "end": "2026-09-20",
+          "clean": { "pct": 17.9, "abs": 274 }
+        },
+        "y2": {
+          "pct": 34.2,
+          "abs": 487,
+          "start": "2024-09-23",
+          "end": "2026-09-20",
+          "clean": { "pct": 33.5, "abs": 478 }
+        }
+      },
+      "anomaly_share": 0.03,
+      "trend_direction": "up",
+      "confidence": "high",
+      "confidence_reasons": [
+        "період ≥ 2 роки",
+        "обсяг ≥ 1000 переглядів на місяць",
+        "частка аномалій низька"
+      ],
+      "seasonality": {
+        "months": [1, 2, 11, 12],
+        "note": "зимовий пік, та сама пора року"
+      },
+      "anomalies": [
+        { "date": "2025-12-25", "value": 31240, "median": 1870 }
+      ]
+    },
+    {
+      "series_id": "cs-pust-prerusovany",
+      "project": "cs.wikipedia",
+      "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
+      "label": "Чеська: інтервальне голодування",
+      "language": "cs",
+      "total_views": 41230,
+      "avg_daily_views": 56.6,
+      "period": { "start": "2024-09-23", "end": "2026-09-20", "days": 728 },
+      "growth": {
+        "m3": {
+          "pct": null,
+          "abs": null,
+          "start": "2026-06-21",
+          "end": "2026-09-20",
+          "reason": "недостатньо даних для двох вікон",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "недостатньо даних для двох вікон"
+          }
+        },
+        "y1": {
+          "pct": 12.5,
+          "abs": 6,
+          "start": "2025-09-23",
+          "end": "2026-09-20",
+          "clean": { "pct": 12.1, "abs": 6 }
+        },
+        "y2": {
+          "pct": 18.9,
+          "abs": 9,
+          "start": "2024-09-23",
+          "end": "2026-09-20",
+          "clean": { "pct": 18.2, "abs": 9 }
+        }
+      },
+      "anomaly_share": 0.0,
+      "trend_direction": "flat",
+      "confidence": "medium",
+      "confidence_reasons": [
+        "обсяг < 1000 переглядів на місяць",
+        "період ≥ 2 роки"
+      ],
+      "seasonality": {
+        "months": [],
+        "note": "недостатньо виражена сезонність"
+      },
+      "anomalies": []
+    }
+  ]
+}
