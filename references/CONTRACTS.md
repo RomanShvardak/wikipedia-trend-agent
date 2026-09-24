@@ -134,15 +134,35 @@ reorder these ids.
 
 | Code | Meaning | Agent action |
 |---|---|---|
-| 0 | ok | read `metrics.json` |
+| 0 | all series ok | read `series.csv` (and downstream `metrics.json`) |
 | 2 | spec problem (validation) | fix the spec; model-readable stderr lists all violations |
-| other | step crash | read stderr and report; do not rewrite pipeline code |
+| 1 | fatal: `fail_on_empty_series` or no fetchable chunks | read stderr; fix article slugs, window, or quality flag |
+| 3 | partial: at least one series failed and at least one succeeded | read `<series_id>: <message>` stderr lines and retry |
+
+### 4.1 `series.csv` (fetch output)
+
+`fetch_pageviews.py --out DIR` writes `DIR/series.csv` with the exact header
+`date,views,series_id,project,article`. Dates use `YYYY-MM-DD`; `views` is an
+integer; rows are sorted by `(series_id, date)`.
+
+Rows represent `(series, present-day)` observations from the 200 response. A
+day omitted by the AQS response is absent from the CSV and is never imputed,
+estimated, or zero-filled. A zero appears only from confirmed no-views 404
+classification for the requested chunk.
 
 ## 5. Golden fixtures
 
 - `tests/fixtures/spec.example.json` — the executable frozen `spec.json`
   (valid fixture, plan 01; pinned series ids `pl-post-przerywany` /
   `cs-pust-prerusovany`).
+- `tests/fixtures/pageviews.200.json` — captured AQS 200 `items` response for
+  response-shape and cache-envelope tests.
+- `tests/fixtures/pageviews.404.json` — captured AQS 404 response for network-free
+  404 taxonomy tests.
+- `tests/fixtures/pageviews.403.txt` — captured missing-User-Agent policy response
+  for 403 fail-fast tests.
+- `tests/fixtures/spec.live.example.json` — probe-valid live smoke spec for
+  `Warszawa` and `Albert_Einstein`.
 - `tests/fixtures/metrics.example.json` — the golden `metrics.json` mirror
   (plan 02): 2 series, one demonstrating `pct: null` with a reason, clean
   variants per window.
