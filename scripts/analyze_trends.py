@@ -47,8 +47,16 @@ LIMITED_ANOMALIES_REASON = "anomaly share within 5 percent"
 HIGH_ANOMALIES_REASON = "anomaly share above 5 percent"
 MISSING_CLEAN_Y1_REASON = "clean 1-year growth unavailable"
 METHODOLOGY_CROSSING_REASON = "comparison crosses 2015-05-01 methodology break"
-SEASONALITY_UNAVAILABLE_NOTE = "insufficient observations in one or both aligned 365-day halves"
-SEASONALITY_AVAILABLE_NOTE = "months above the aligned half medians"
+LOW_CONFIDENCE_HYPOTHESIS_REASON = (
+    "low confidence: treat the reading as a hypothesis"
+)
+SEASONALITY_UNAVAILABLE_NOTE = (
+    "fewer than two aligned 365-day halves are available"
+)
+SEASONALITY_NO_PEAKS_NOTE = "no recurring peak months identified"
+SEASONALITY_AVAILABLE_NOTE = (
+    "recurring peaks are above the monthly median in both aligned years"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +285,46 @@ def compute_growth_for_days(
     return result
 
 
-def _monthly_means(observations: Sequence[Observation], start: date, end: date) -> list[float]:
+def _aligned_year_windows(
+    observations: Sequence[Observation], end_date: date
+) -> tuple[tuple[date, date], tuple[date, date]]:
+    current_start = end_date - timedelta(days=365 - 1)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=365 - 1)
+    return (previous_start, previous_end), (current_start, end_date)
+
+
+def _comparison_is_available(
+    observations: Sequence[Observation], end_date: date, days: int
+) -> bool:
+    start = end_date - timedelta(days=days - 1)
+    previous_end = start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=days - 1)
+    floor = math.ceil(COVERAGE_RATIO * days)
+    current = _window_values(observations, start, end_date)
+    previous = _window_values(observations, previous_start, previous_end)
+    return (
+        len(current) >= floor
+        and len(previous) >= floor
+        and sum(previous) > 0
+    )
+
+
+def comparison_crosses_methodology_break(
+    observations: Sequence[Observation], end_date: date
+) -> bool:
+    """Return whether the computed y1 comparison spans both sides of the break."""
+    if not _comparison_is_available(observations, end_date, 365):
+        return False
+    start = end_date - timedelta(days=365 - 1)
+    previous_end = start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=365 - 1)
+    return previous_start < METHODOLOGY_BREAK < end_date
+
+
+def _monthly_means(
+    observations: Sequence[Observation], start: date, end: date
+) -> list[float]:
     values: dict[int, list[int | float]] = {month: [] for month in range(1, 13)}
     for observation in observations:
         if start <= observation.date <= end:
@@ -291,23 +338,23 @@ def _monthly_means(observations: Sequence[Observation], start: date, end: date) 
 def compute_seasonality(
     observations: Sequence[Observation], end_date: date
 ) -> dict[str, object]:
-    """Find months above the monthly median in both aligned 365-day halves."""
-    current_start = end_date - timedelta(days=2 * 365 - 1)
-    previous_end = current_start - timedelta(days=1)
-    previous_start = previous_end - timedelta(days=365 - 1)
-    current = _monthly_means(observations, current_start, end_date)
-    previous = _monthly_means(observations, previous_start, previous_end)
-    current_median = median(current)
-    previous_median = median(previous)
+    """Find recurring peaks across two complete aligned 365-day halves."""
+    previous, current = _aligned_year_windows(observations, end_date)
+    if not _comparison_is_available(observations, end_date, 365):
+        return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
+    previous_means = _monthly_means(observations, *previous)
+    current_means = _monthly_means(observations, *current)
+    previous_median = median(previous_means)
+    current_median = median(current_means)
     months = [
         month
-        for month, (current_mean, previous_mean) in enumerate(zip(current, previous), start=1)
-        if current_mean > current_median and previous_mean > previous_median
+        for month, (previous_mean, current_mean) in enumerate(
+            zip(previous_means, current_means), start=1
+        )
+        if previous_mean > previous_median and current_mean > current_median
     ]
-    return {
-        "months": months,
-        "note": SEASONALITY_AVAILABLE_NOTE if months else SEASONALITY_UNAVAILABLE_NOTE,
-    }
+    note = SEASONALITY_AVAILABLE_NOTE if months else SEASONALITY_NO_PEAKS_NOTE
+    return {"months": months, "note": note}
 
 
 def score_confidence(
@@ -355,6 +402,8 @@ def score_confidence(
             reasons.append(METHODOLOGY_CROSSING_REASON)
 
     level = "high" if score >= 4 else "medium" if score >= 2 else "low"
+    if level == "low":
+        reasons.append(LOW_CONFIDENCE_HYPOTHESIS_REASON)
     return level, reasons
 
 
@@ -461,14 +510,17 @@ def build_metrics(
         }
         clean_y1 = growth["y1"]["clean"]
         clean_y1_available = isinstance(clean_y1, dict) and clean_y1.get("pct") is not None
-        y1_current_start = end - timedelta(days=365 - 1)
-        y1_previous_start = y1_current_start - timedelta(days=365)
+        comparison_span = None
+        if comparison_crosses_methodology_break(observations, end):
+            y1_current_start = end - timedelta(days=365 - 1)
+            y1_previous_start = y1_current_start - timedelta(days=365)
+            comparison_span = (y1_previous_start, end)
         confidence, confidence_reasons = score_confidence(
             period_days,
             monthly_30d,
             anomaly_share,
             clean_y1_available,
-            (y1_previous_start, end),
+            comparison_span,
         )
         raw_y1 = growth["y1"].get("pct")
         clean_y1_pct = clean_y1.get("pct") if isinstance(clean_y1, dict) else None
