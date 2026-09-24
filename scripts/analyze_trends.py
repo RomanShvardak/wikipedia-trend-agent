@@ -442,7 +442,7 @@ def build_metrics(
         avg_daily_views = round(total_views / period_days, 1)
         monthly_30d = avg_daily_views * 30
         anomalies = detect_anomalies(observations)
-        anomaly_share = len(anomalies) / period_days
+        anomaly_share = len(anomalies) / len(observations)
         clean_observations = replace_anomalies(observations, anomalies)
         growth = {
             name: _growth_for_output(observations, clean_observations, end, days)
