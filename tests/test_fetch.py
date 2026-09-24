@@ -576,6 +576,97 @@ def test_cached_item_with_invalid_types_never_reaches_csv(
     assert not (out_dir / "series.csv").exists()
 
 
+def _single_series_spec(
+    source_spec: Path,
+    tmp_path: Path,
+    *,
+    start: str,
+    end: str,
+    fail_on_empty_series: bool = False,
+    name: str = "single-series.json",
+) -> Path:
+    spec = copy.deepcopy(json.loads(source_spec.read_text(encoding="utf-8")))
+    spec["series"] = spec["series"][:1]
+    spec["window"]["start"] = start
+    spec["window"]["end"] = end
+    spec["quality"] = {"fail_on_empty_series": fail_on_empty_series}
+    spec_path = tmp_path / name
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    return spec_path
+
+
+def test_multi_chunk_404_preserves_successful_chunks(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    spec_path = _single_series_spec(
+        spec_example_path,
+        tmp_path,
+        start="20240923",
+        end="20250923",
+        fail_on_empty_series=True,
+    )
+    first_chunk_body = json.dumps(
+        {"items": [{"timestamp": "2024092300", "views": 11}]}
+    ).encode("utf-8")
+    stub = transport_stub(
+        [
+            (200, {}, first_chunk_body),
+            (404, {}, _response_body("pageviews.404.json")),
+        ]
+    )
+    out_dir = tmp_path / "out"
+
+    assert main(
+        _args(spec_path, out_dir),
+        transport=stub,
+        today_utc=date(2025, 9, 24),
+    ) == 0
+
+    with (out_dir / "series.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(row["date"], row["views"]) for row in rows] == [("2024-09-23", "11")]
+    assert len(stub.calls) == 2
+    captured = capsys.readouterr()
+    assert "data not yet loaded — retry later" in captured.err
+    assert "failures: 0" in captured.out
+
+
+def test_multi_chunk_all_404_fail_on_empty_series_is_fatal_after_full_scan(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    spec_path = _single_series_spec(
+        spec_example_path,
+        tmp_path,
+        start="20240923",
+        end="20250923",
+        fail_on_empty_series=True,
+    )
+    stub = transport_stub(
+        [(404, {}, _response_body("pageviews.404.json"))] * 2
+    )
+    out_dir = tmp_path / "out"
+
+    assert main(
+        _args(spec_path, out_dir),
+        transport=stub,
+        today_utc=date(2025, 9, 24),
+    ) == 1
+
+    assert len(stub.calls) == 2
+    assert not (out_dir / "series.csv").exists()
+    assert capsys.readouterr().err.count("data not yet loaded — retry later") == 2
+
+
 def _write_404_spec(
     source_spec: Path,
     tmp_path: Path,
