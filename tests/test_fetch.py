@@ -923,6 +923,81 @@ def test_all_series_fail_returns_one_without_cache(
     assert list((tmp_path / "cache").glob("*.json")) == []
 
 
+def test_transport_exception_retries_then_preserves_successful_sibling(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
+    calls: list[tuple[str, dict[str, str]]] = []
+    valid_body = json.dumps(
+        {"items": [{"timestamp": "2024092300", "views": 17}]}
+    ).encode("utf-8")
+
+    def raising_transport(url, headers, timeout=30.0):
+        calls.append((url, dict(headers)))
+        if "/Post_przerywany/" in url:
+            raise fetch_pageviews.FetchTransportError("offline")
+        return fetch_pageviews.TransportResponse(status=200, headers={}, body=valid_body)
+
+    assert main(
+        _args(spec_example_path, tmp_path / "out"),
+        transport=raising_transport,
+        today_utc=date(2026, 9, 24),
+    ) == 3
+
+    assert len(calls) == 5
+    assert sleeps == [5.0, 5.0]
+    with (tmp_path / "out" / "series.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(row["series_id"], row["date"], row["views"]) for row in rows] == [
+        ("cs-pust-prerusovany", "2024-09-23", "17")
+    ]
+    captured = capsys.readouterr()
+    assert "pl-post-przerywany: request failed after 3 attempt(s) (transport error)" in captured.err
+    assert "offline" not in captured.err
+
+
+def test_transport_exception_recovers_on_next_attempt(
+    spec_example_path,
+    tmp_path,
+    monkeypatch,
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(fetch_pageviews, "sleep", sleeps.append)
+    calls: list[str] = []
+    valid_body = json.dumps(
+        {"items": [{"timestamp": "2024092300", "views": 19}]}
+    ).encode("utf-8")
+
+    def transient_transport(url, headers, timeout=30.0):
+        calls.append(url)
+        if len(calls) == 1:
+            raise fetch_pageviews.FetchTransportError("temporary offline")
+        return fetch_pageviews.TransportResponse(status=200, headers={}, body=valid_body)
+
+    spec_path = _single_series_spec(
+        spec_example_path,
+        tmp_path,
+        start="20240923",
+        end="20250922",
+    )
+
+    assert main(
+        _args(spec_path, tmp_path / "out"),
+        transport=transient_transport,
+        today_utc=date(2026, 9, 24),
+    ) == 0
+
+    assert len(calls) == 2
+    assert sleeps == [5.0]
+    assert (tmp_path / "out" / "series.csv").exists()
+
+
 def test_403_aborts_immediately_without_retry_or_cache(
     spec_example_path,
     tmp_path,
