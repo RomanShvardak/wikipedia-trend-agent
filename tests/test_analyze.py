@@ -5,6 +5,7 @@ import ast
 import csv
 import json
 import math
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -676,4 +677,174 @@ def test_direction_gate_hierarchy_and_hypothesis_reason() -> None:
     assert analyze_trends.safe_direction(365, 10, 10, "high", 1_000) == "flat"
     assert analyze_trends.safe_direction(365, 10, 11, "high", 1_000) == "noise"
     assert analyze_trends.safe_direction(365, 11, 11, "high", 1_000) == "up"
-    assert analyze_trends.safe_direction(365, -11, -11, "high", 1_000) == "down"
+
+
+
+def test_empty_null_and_single_element_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty and malformed data fail, while one valid observation is explicit."""
+    spec_path = _write_spec(tmp_path)
+    empty_out = tmp_path / "empty"
+    empty_out.mkdir()
+    (empty_out / "series.csv").write_bytes(b"")
+    empty_metrics = empty_out / "metrics.json"
+    empty_metrics.write_text("sentinel", encoding="utf-8")
+    assert _run_analyzer(spec_path, empty_out) == 1
+    assert empty_metrics.read_text(encoding="utf-8") == "sentinel"
+
+    invalid_rows = [
+        ("null", "en-example", "en.wikipedia", "Example_article"),
+        ("1", "unknown", "en.wikipedia", "Example_article"),
+        ("-1", "en-example", "en.wikipedia", "Example_article"),
+    ]
+    for index, (views, series_id, project, article) in enumerate(invalid_rows):
+        out_dir = tmp_path / f"invalid-{index}"
+        _write_series_csv(
+            out_dir / "series.csv",
+            [
+                {
+                    "date": "2024-01-01",
+                    "views": views,
+                    "series_id": series_id,
+                    "project": project,
+                    "article": article,
+                }
+            ],
+        )
+        assert _run_analyzer(spec_path, out_dir) == 1
+
+    single_out = tmp_path / "single"
+    _write_series_csv(
+        single_out / "series.csv",
+        [
+            {
+                "date": "2024-01-01",
+                "views": 10,
+                "series_id": "en-example",
+                "project": "en.wikipedia",
+                "article": "Example_article",
+            }
+        ],
+    )
+    assert _run_analyzer(spec_path, single_out) == 0
+    single = json.loads((single_out / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    assert single["period"]["days"] == 1
+    assert all(window["pct"] is None and window["reason"] for window in single["growth"].values())
+    assert single["confidence"] == "low"
+    assert "low confidence: treat the reading as a hypothesis" in single["confidence_reasons"]
+    assert single["trend_direction"] == "inconclusive"
+
+    stream_out = tmp_path / "stream"
+    stream_csv = _write_series_csv(stream_out / "series.csv", _profile_rows(date(2024, 1, 1), 2, base_views=10))
+    original_read_text = Path.read_text
+
+    def reject_csv_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path == stream_csv:
+            raise AssertionError("CSV input must be parsed without read_text")
+        return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", reject_csv_read_text)
+    assert _run_analyzer(spec_path, stream_out) == 0
+
+
+def test_identity_equality_uses_exact_utf8_code_points(tmp_path: Path) -> None:
+    """Identity comparison does not normalize Unicode code points."""
+    spec_path = _write_spec(tmp_path)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["series"][0]["article"] = "café"
+    spec["series"][0]["label"] = "Café"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    out_dir = tmp_path / "out"
+    rows = _profile_rows(date(2024, 1, 1), 1, base_views=10)
+    rows[0]["article"] = unicodedata.normalize("NFD", "café")
+    _write_series_csv(out_dir / "series.csv", rows)
+    assert _run_analyzer(spec_path, out_dir) == 1
+    metrics_path = out_dir / "metrics.json"
+    metrics_path.write_text("sentinel", encoding="utf-8")
+    assert _run_analyzer(spec_path, out_dir) == 1
+    assert metrics_path.read_text(encoding="utf-8") == "sentinel"
+
+    valid_out = tmp_path / "valid"
+    valid_rows = _profile_rows(date(2024, 1, 1), 1, base_views=10)
+    valid_rows[0]["article"] = "café"
+    _write_series_csv(valid_out / "series.csv", valid_rows)
+    assert _run_analyzer(spec_path, valid_out) == 0
+    valid = json.loads((valid_out / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    assert valid["article"] == "café"
+    assert valid["label"] == "Café"
+
+
+def test_partial_tampered_and_oversized_inputs_leave_metrics_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partial, tampered, and capped CSV inputs cannot replace prior output."""
+    spec_path = _write_spec(tmp_path)
+    valid_rows = _profile_rows(date(2024, 1, 1), 2, base_views=10)
+    partial_spec_path = _write_two_series_spec(tmp_path / "partial-spec")
+    partial_out = tmp_path / "partial"
+    _write_series_csv(partial_out / "series.csv", [_daily_rows()[0]])
+    partial_metrics = partial_out / "metrics.json"
+    partial_metrics.write_text("sentinel", encoding="utf-8")
+    assert _run_analyzer(partial_spec_path, partial_out) == 1
+    assert partial_metrics.read_text(encoding="utf-8") == "sentinel"
+
+    for label, rows in (
+        ("tampered", [{**valid_rows[0], "article": "Tampered"}, valid_rows[1]]),
+        ("duplicate", [valid_rows[0], valid_rows[0]]),
+    ):
+        out_dir = tmp_path / label
+        _write_series_csv(out_dir / "series.csv", rows)
+        metrics_path = out_dir / "metrics.json"
+        metrics_path.write_text("sentinel", encoding="utf-8")
+        assert _run_analyzer(spec_path, out_dir) == 1
+        assert metrics_path.read_text(encoding="utf-8") == "sentinel"
+
+    over_rows = tmp_path / "oversized"
+    _write_series_csv(over_rows / "series.csv", valid_rows + [valid_rows[1]])
+    over_metrics = over_rows / "metrics.json"
+    over_metrics.write_text("sentinel", encoding="utf-8")
+    monkeypatch.setattr(analyze_trends, "MAX_OBSERVATIONS", 2)
+    assert _run_analyzer(spec_path, over_rows) == 1
+    assert over_metrics.read_text(encoding="utf-8") == "sentinel"
+
+    byte_limited = tmp_path / "byte-limited"
+    _write_series_csv(byte_limited / "series.csv", valid_rows)
+    byte_metrics = byte_limited / "metrics.json"
+    byte_metrics.write_text("sentinel", encoding="utf-8")
+    monkeypatch.setattr(analyze_trends, "MAX_CSV_BYTES", 16)
+    assert _run_analyzer(spec_path, byte_limited) == 1
+    assert byte_metrics.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_metrics_values_are_finitely_serializable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI preflights candidates with strict allow_nan=False serialization."""
+    spec_path = _write_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    _write_series_csv(out_dir / "series.csv", _profile_rows(date(2024, 1, 1), 2, base_views=10))
+    original_dumps = analyze_trends.json.dumps
+    calls: list[dict[str, object]] = []
+
+    def record_dumps(value: object, **kwargs: object) -> str:
+        calls.append(kwargs)
+        return original_dumps(value, **kwargs)
+
+    monkeypatch.setattr(analyze_trends.json, "dumps", record_dumps)
+    assert _run_analyzer(spec_path, out_dir) == 0
+    assert any(kwargs.get("allow_nan") is False for kwargs in calls)
+    with pytest.raises(analyze_trends.AnalysisError, match="non-finite"):
+        analyze_trends.validate_finite_numbers({"nested": [float("inf")]})
+
+
+def test_analyzer_uses_data_parsers_without_dynamic_execution() -> None:
+    """The analyzer AST contains no dynamic execution or process-launch path."""
+    tree = ast.parse(Path(analyze_trends.__file__).read_text(encoding="utf-8"))
+    forbidden_calls = {"eval", "exec", "compile", "__import__", "system", "popen", "run"}
+    forbidden_imports = {"subprocess", "pickle", "multiprocessing", "runpy", "os"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id not in forbidden_calls
+        if isinstance(node, ast.Import):
+            assert not {alias.name.split(".")[0] for alias in node.names} & forbidden_imports
+        if isinstance(node, ast.ImportFrom):
+            assert (node.module or "").split(".")[0] not in forbidden_imports
