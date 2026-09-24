@@ -542,3 +542,138 @@ def test_threshold_fixture_summaries_remain_inside_calibrated_bands() -> None:
             item["confidence"],
             item["monthly_30d"],
         ) == item["direction"]
+    
+
+def _profile_rows(
+    start: date,
+    count: int,
+    *,
+    base_views: int,
+    seasonal_months: set[int] | None = None,
+) -> list[dict[str, object]]:
+    seasonal_months = seasonal_months or set()
+    rows: list[dict[str, object]] = []
+    for index in range(count):
+        current = start + timedelta(days=index)
+        views = base_views + (200 if current.month in seasonal_months else 0)
+        rows.append(
+            {
+                "date": current.isoformat(),
+                "views": views,
+                "series_id": "en-example",
+                "project": "en.wikipedia",
+                "article": "Example_article",
+            }
+        )
+    return rows
+
+
+def _profile_observations(rows: list[dict[str, object]]) -> list[analyze_trends.Observation]:
+    observations: list[analyze_trends.Observation] = []
+    for row in rows:
+        date_text = row["date"]
+        views = row["views"]
+        assert isinstance(date_text, str)
+        assert isinstance(views, int)
+        observations.append(
+            analyze_trends.Observation(
+                date=date.fromisoformat(date_text),
+                views=views,
+                series_id="s",
+                project="en.wikipedia",
+                article="S",
+            )
+        )
+    return observations
+
+
+def test_confidence_and_seasonality_profiles_emit_safe_truthful_metrics(
+    tmp_path: Path,
+) -> None:
+    """Evidence profiles keep seasonal context separate from safe direction."""
+    spec_path = _write_spec(tmp_path)
+    high_out = tmp_path / "high"
+    high_rows = _profile_rows(
+        date(2024, 1, 1), 730, base_views=10_000, seasonal_months={3, 9}
+    )
+    _write_series_csv(high_out / "series.csv", high_rows)
+    assert _run_analyzer(spec_path, high_out) == 0
+    high = json.loads((high_out / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    assert high["confidence"] == "high"
+    assert high["seasonality"]["months"] == [3, 9]
+    assert high["trend_direction"] != "inconclusive"
+
+    ninety_out = tmp_path / "ninety"
+    _write_series_csv(ninety_out / "series.csv", _profile_rows(date(2024, 1, 1), 90, base_views=10))
+    assert _run_analyzer(spec_path, ninety_out) == 0
+    ninety = json.loads((ninety_out / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    assert ninety["confidence"] == "low"
+    assert analyze_trends.PERIOD_BELOW_MINIMUM_REASON in ninety["confidence_reasons"]
+    assert "low confidence: treat the reading as a hypothesis" in ninety["confidence_reasons"]
+    assert ninety["trend_direction"] == "inconclusive"
+    assert ninety["seasonality"]["months"] == []
+
+    one_out = tmp_path / "one"
+    _write_series_csv(one_out / "series.csv", _profile_rows(date(2024, 1, 1), 1, base_views=10))
+    assert _run_analyzer(spec_path, one_out) == 0
+    one = json.loads((one_out / "metrics.json").read_text(encoding="utf-8"))["series"][0]
+    assert all(window["pct"] is None for window in one["growth"].values())
+    assert all(window["reason"] for window in one["growth"].values())
+    assert one["confidence"] == "low"
+    assert "low confidence: treat the reading as a hypothesis" in one["confidence_reasons"]
+    assert one["trend_direction"] == "inconclusive"
+    assert one["seasonality"]["months"] == []
+
+
+def test_seasonality_requires_two_aligned_halves_and_matches_repeating_months() -> None:
+    """Seasonality requires complete aligned halves and matches months in both."""
+    end = date(2025, 12, 30)
+    complete = _profile_rows(date(2024, 1, 1), 730, base_views=100, seasonal_months={4, 10})
+    assert analyze_trends.compute_seasonality(
+        _profile_observations(complete), end
+    )["months"] == [4, 10]
+    incomplete = _profile_observations(complete[:364])
+    result = analyze_trends.compute_seasonality(incomplete, date(2024, 12, 30))
+    assert result["months"] == []
+    assert result["note"] == analyze_trends.SEASONALITY_UNAVAILABLE_NOTE
+
+
+def test_minimum_period_and_confidence_score_boundaries() -> None:
+    """Confidence points and the 90/91 inclusive boundary follow the frozen rubric."""
+    level, reasons = analyze_trends.score_confidence(90, 0, 0, False, None)
+    assert level == "low"
+    assert analyze_trends.PERIOD_BELOW_MINIMUM_REASON in reasons
+    assert "low confidence: treat the reading as a hypothesis" in reasons
+    assert analyze_trends.score_confidence(91, 999, 0, False, None)[0] == "medium"
+    assert analyze_trends.score_confidence(730, 10_000, 0, True, None)[0] == "high"
+    assert analyze_trends.score_confidence(90, 10_000, 0.01, True, None)[0] == "medium"
+
+
+def test_methodology_penalty_applies_once_to_comparison_span() -> None:
+    """The methodology penalty follows the actual y1 comparison span."""
+    def observations(start: date, count: int) -> list[analyze_trends.Observation]:
+        return _constant_observations(start, count, views=100)
+
+    crossing = observations(date(2014, 5, 1), 730)
+    assert analyze_trends.comparison_crosses_methodology_break(crossing, date(2016, 4, 30))
+    after = observations(date(2016, 5, 1), 730)
+    assert not analyze_trends.comparison_crosses_methodology_break(after, date(2018, 4, 30))
+    before = observations(date(2012, 5, 1), 730)
+    assert not analyze_trends.comparison_crosses_methodology_break(before, date(2014, 4, 30))
+    level, reasons = analyze_trends.score_confidence(
+        730, 10_000, 0, True, (date(2014, 5, 1), date(2016, 4, 30))
+    )
+    assert level == "medium"
+    assert analyze_trends.METHODOLOGY_CROSSING_REASON in reasons
+    assert reasons.count(analyze_trends.METHODOLOGY_CROSSING_REASON) == 1
+
+
+def test_direction_gate_hierarchy_and_hypothesis_reason() -> None:
+    """Direction checks are ordered and never expose unsupported up/down."""
+    assert analyze_trends.safe_direction(90, 50, 50, "low", 10_000) == "inconclusive"
+    assert analyze_trends.safe_direction(365, 50, 50, "low", 10_000) == "noise"
+    assert analyze_trends.safe_direction(365, 50, 50, "high", 999) == "noise"
+    assert analyze_trends.safe_direction(365, 10, 10, "high", 1_000) == "flat"
+    assert analyze_trends.safe_direction(365, 10, 11, "high", 1_000) == "noise"
+    assert analyze_trends.safe_direction(365, 11, 11, "high", 1_000) == "up"
+    assert analyze_trends.safe_direction(365, -11, -11, "high", 1_000) == "down"
