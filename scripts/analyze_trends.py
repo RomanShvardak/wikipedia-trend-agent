@@ -635,7 +635,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (TypeError, ValueError) as error:
             raise AnalysisError("metrics document is not JSON serializable") from error
         metrics_path = out_dir / "metrics.json"
-        dump_json(document, metrics_path)
+        try:
+            dump_json(document, metrics_path)
+        except OSError as error:
+            raise AnalysisError(f"could not write metrics output: {metrics_path}") from error
     except AnalysisError as error:
         print(f"analysis failed: {error}", file=sys.stderr)
         return 1

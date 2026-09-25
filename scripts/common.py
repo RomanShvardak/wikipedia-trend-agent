@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -80,10 +81,27 @@ def load_spec(path: str | Path) -> dict[str, Any]:
 
 
 def dump_json(obj: Any, path: str | Path) -> None:
-    """Write UTF-8 JSON (ensure_ascii=False — model-inspectable), creating parents."""
+    """Atomically write inspectable UTF-8 JSON through a same-directory staging file."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=p.parent,
+            prefix=f".{p.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(json.dumps(obj, ensure_ascii=False, indent=2))
+            handle.flush()
+        os.replace(temporary_path, p)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _is_valid_date(value: Any) -> bool:
