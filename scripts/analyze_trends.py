@@ -36,6 +36,17 @@ MAX_CSV_BYTES = 16 * 1024 * 1024
 MAX_OBSERVATIONS = 50_000
 MAX_VIEWS_DIGITS = 20
 
+# Joint per-half quadratic trend plus shared calendar-effect model. Two complete
+# aligned 365-day halves each carry their own three-term daily trend, and all 12
+# calendar months share one zero-sum additive effect enforced through
+# s_12 = -(s_1 + ... + s_11). That is 2*3 + 11 = 17 free parameters, solved once.
+SEASONALITY_HALVES = 2
+TREND_TERMS = 3
+FREE_MONTH_EFFECTS = 11
+SEASONALITY_PARAMETERS = SEASONALITY_HALVES * TREND_TERMS + FREE_MONTH_EFFECTS
+MONTH_COLUMN_0 = SEASONALITY_HALVES * TREND_TERMS
+MONTH_STAT_KEYS = ("rows", "x", "x2", "x3", "x4", "y", "xy", "x2y")
+
 INSUFFICIENT_OBSERVATIONS_REASON = "insufficient observations in one or both equal-length windows"
 ZERO_PREVIOUS_MEAN_REASON = "previous equal-length window has zero mean"
 PERIOD_BELOW_MINIMUM_REASON = "period below 91 days"
@@ -57,7 +68,11 @@ SEASONALITY_UNAVAILABLE_NOTE = (
 )
 SEASONALITY_NO_PEAKS_NOTE = "no recurring peak months identified"
 SEASONALITY_AVAILABLE_NOTE = (
-    "recurring peaks have positive complete-half detrended residuals in both aligned years"
+    "recurring peaks have positive shared month effects and positive pre-season "
+    "residual means in both aligned halves; repeatability is measured before "
+    "subtracting the fitted shared effect, and month-scale monotonic curvature "
+    "outside the fitted linear/quadratic daily trend can still be confounded "
+    "with calendar effects across only two observed cycles"
 )
 
 
@@ -395,61 +410,259 @@ def comparison_crosses_methodology_break(
     return previous_start < METHODOLOGY_BREAK < end_date
 
 
+def _exact_value(value: int | float) -> Fraction:
+    """Convert an accepted observation value to an exact rational, never a float."""
+    if isinstance(value, int):
+        return Fraction(value)
+    return Fraction.from_float(value)
+
+
 def _monthly_means(
     observations: Sequence[Observation], start: date, end: date
-) -> dict[int, tuple[Fraction, Fraction]] | None:
-    values: dict[int, list[tuple[int, int]]] = {month: [] for month in range(1, 13)}
-    for observation in observations:
-        if start <= observation.date <= end:
-            values[observation.date.month].append(
-                (int(observation.views), (observation.date - start).days)
-            )
-    if any(not month_values for month_values in values.values()):
-        return None
-    return {
-        month: (
-            Fraction(sum(value for value, _ in month_values), len(month_values)),
-            Fraction(sum(offset for _, offset in month_values), len(month_values)),
-        )
-        for month, month_values in values.items()
+) -> dict[int, dict[str, Fraction]] | None:
+    """Accumulate exact per-month sufficient statistics; None when a month is absent.
+
+    The returned statistics gate the joint trend/calendar fit: a required calendar
+    month with no observation in this half makes the model unidentifiable, so the
+    caller must return the unavailable result instead of a partially identified fit.
+    """
+    statistics: dict[int, dict[str, Fraction]] = {
+        month: {key: Fraction(0) for key in MONTH_STAT_KEYS} for month in range(1, 13)
     }
+    for observation in observations:
+        if not start <= observation.date <= end:
+            continue
+        offset = (observation.date - start).days
+        views = _exact_value(observation.views)
+        entry = statistics[observation.date.month]
+        entry["rows"] += 1
+        entry["x"] += offset
+        entry["x2"] += offset * offset
+        entry["x3"] += offset**3
+        entry["x4"] += offset**4
+        entry["y"] += views
+        entry["xy"] += offset * views
+        entry["x2y"] += offset * offset * views
+    if any(entry["rows"] == 0 for entry in statistics.values()):
+        return None
+    return statistics
 
 
-def _detrended_monthly_means(
-    monthly_means: dict[int, tuple[Fraction, Fraction]],
-) -> dict[int, Fraction]:
-    chronological = sorted(
-        monthly_means.items(), key=lambda item: item[1][1]
-    )
-    _, (first_mean, first_offset) = chronological[0]
-    _, (last_mean, last_offset) = chronological[-1]
-    offset_span = last_offset - first_offset
-    residuals: dict[int, Fraction] = {}
-    for month, (monthly_mean, month_offset) in chronological:
-        baseline = first_mean + (last_mean - first_mean) * (
-            (month_offset - first_offset) / offset_span
+def _build_normal_equations(
+    halves: Sequence[Mapping[int, Mapping[str, Fraction]]],
+) -> tuple[list[list[Fraction]], list[Fraction]]:
+    """Build the exact 17-parameter normal equations of the joint seasonal model.
+
+    The design columns are the per-half ``1``, ``x``, and ``x*x`` trends plus, for
+    each free month 1-11, the contrast ``1[month == m] - 1[month == 12]`` that
+    encodes the zero-sum constraint. Every entry is a closed-form sum of the
+    per-half/per-month sufficient statistics, so no per-observation matrix is built.
+    """
+    size = len(halves) * TREND_TERMS + FREE_MONTH_EFFECTS
+    matrix = [[Fraction(0) for _ in range(size)] for _ in range(size)]
+    right_hand_side = [Fraction(0) for _ in range(size)]
+    month_totals = [
+        sum((half[month]["rows"] for half in halves), Fraction(0))
+        for month in range(1, 13)
+    ]
+    december_total = month_totals[11]
+    for half_index, half in enumerate(halves):
+        base = half_index * TREND_TERMS
+        totals = [
+            sum((half[month][key] for month in range(1, 13)), Fraction(0))
+            for key in MONTH_STAT_KEYS
+        ]
+        rows, x1, x2, x3, x4, y0, y1, y2 = totals
+        block = ((rows, x1, x2), (x1, x2, x3), (x2, x3, x4))
+        for row_index in range(TREND_TERMS):
+            matrix[base + row_index][base + row_index] = block[row_index][row_index]
+        for row_index, column_index in ((0, 1), (0, 2), (1, 2)):
+            matrix[base + row_index][base + column_index] = block[row_index][column_index]
+            matrix[base + column_index][base + row_index] = block[row_index][column_index]
+        right_hand_side[base] = y0
+        right_hand_side[base + 1] = y1
+        right_hand_side[base + 2] = y2
+        december = half[12]
+        for month in range(1, FREE_MONTH_EFFECTS + 1):
+            column = MONTH_COLUMN_0 + month - 1
+            entry = half[month]
+            against_december = (
+                entry["rows"] - december["rows"],
+                entry["x"] - december["x"],
+                entry["x2"] - december["x2"],
+            )
+            for row_index, value in enumerate(against_december):
+                matrix[base + row_index][column] = value
+                matrix[column][base + row_index] = value
+            right_hand_side[column] += entry["y"] - december["y"]
+    for month in range(1, FREE_MONTH_EFFECTS + 1):
+        column = MONTH_COLUMN_0 + month - 1
+        matrix[column][column] = month_totals[month - 1] + december_total
+        for other in range(1, FREE_MONTH_EFFECTS + 1):
+            if other == month:
+                continue
+            other_column = MONTH_COLUMN_0 + other - 1
+            matrix[column][other_column] = december_total
+            matrix[other_column][column] = december_total
+    return matrix, right_hand_side
+
+
+def _solve_exact_normal_equations(
+    matrix: Sequence[Sequence[Fraction]], rhs: Sequence[Fraction]
+) -> list[Fraction]:
+    """Solve a dense square system exactly by pivoted Gaussian elimination.
+
+    The fit never leaves exact rational arithmetic. A zero pivot means the
+    normal-equation system is singular or non-identifiable, so the solve raises
+    ``AnalysisError`` before any shared effect, pre-season residual, or selected
+    month can be read; no partial fit is ever returned.
+    """
+    size = len(matrix)
+    if size == 0:
+        raise AnalysisError(
+            "singular non-identifiable normal-equation system: no parameters to solve"
         )
-        residuals[month] = monthly_mean - baseline
-    return {month: residuals[month] for month in sorted(residuals)}
+    if any(len(row) != size for row in matrix) or len(rhs) != size:
+        raise AnalysisError(
+            "normal-equation matrix must be square and match its right-hand side"
+        )
+    rows = [[Fraction(value) for value in row] for row in matrix]
+    values = [Fraction(value) for value in rhs]
+    for column in range(size):
+        pivot_row = max(
+            range(column, size), key=lambda index: abs(rows[index][column])
+        )
+        if rows[pivot_row][column] == 0:
+            raise AnalysisError(
+                "singular non-identifiable normal-equation system: "
+                f"zero pivot at column {column}"
+            )
+        rows[column], rows[pivot_row] = rows[pivot_row], rows[column]
+        values[column], values[pivot_row] = values[pivot_row], values[column]
+        pivot = rows[column][column]
+        for index in range(column + 1, size):
+            factor = rows[index][column] / pivot
+            if factor == 0:
+                continue
+            rows[index][column] = Fraction(0)
+            for position in range(column + 1, size):
+                rows[index][position] -= factor * rows[column][position]
+            values[index] -= factor * values[column]
+    solution = [Fraction(0) for _ in range(size)]
+    for index in range(size - 1, -1, -1):
+        total = values[index]
+        for position in range(index + 1, size):
+            total -= rows[index][position] * solution[position]
+        solution[index] = total / rows[index][index]
+    return solution
+
+
+@dataclass(frozen=True, slots=True)
+class SharedMonthEffects:
+    """Exact joint fit of per-half quadratic trends and shared calendar effects.
+
+    ``shared_effects`` is ``s_m`` for every calendar month 1-12, including the
+    derived zero-sum month 12. ``pre_effect_residual[month][half]`` is the mean of
+    ``y - t_half(x)`` over that half's rows for the month, measured *before* the
+    fitted shared effect is subtracted, so an exact repeated effect is never
+    cancelled out of its own repeatability evidence.
+    """
+
+    shared_effects: dict[int, Fraction]
+    pre_effect_residual: dict[int, dict[int, Fraction]]
+    trend_coefficients: dict[int, tuple[Fraction, Fraction, Fraction]]
+
+
+def _shared_month_effects(
+    observations: Sequence[Observation], end_date: date
+) -> SharedMonthEffects | None:
+    """Fit per-half quadratic trends jointly with shared zero-sum month effects.
+
+    Returns ``None`` when the complete-month gate rejects either aligned half, so a
+    partially identified model is never attempted. January and December are ordinary
+    month columns: no month is used as a trend anchor, so boundary effects stay
+    estimable. This is an identifiable conservative separation for the documented
+    two-cycle contract, not a universal decomposition theorem - a monotonic trend
+    carrying month-scale structure outside the degree-2 daily trend family can
+    still alias into calendar effects.
+    """
+    previous, current = _aligned_year_windows(observations, end_date)
+    windows = (previous, current)
+    halves = [_monthly_means(observations, *window) for window in windows]
+    if any(half is None for half in halves):
+        return None
+    complete = cast("list[dict[int, dict[str, Fraction]]]", halves)
+    matrix, rhs = _build_normal_equations(complete)
+    solution = _solve_exact_normal_equations(matrix, rhs)
+    shared_effects: dict[int, Fraction] = {
+        month: solution[MONTH_COLUMN_0 + month - 1]
+        for month in range(1, FREE_MONTH_EFFECTS + 1)
+    }
+    shared_effects[12] = -sum(shared_effects.values(), Fraction(0))
+    trend_coefficients = {
+        half_index: (
+            solution[half_index * TREND_TERMS],
+            solution[half_index * TREND_TERMS + 1],
+            solution[half_index * TREND_TERMS + 2],
+        )
+        for half_index in range(SEASONALITY_HALVES)
+    }
+    residual_sums: dict[int, dict[int, Fraction]] = {
+        month: {half_index: Fraction(0) for half_index in range(SEASONALITY_HALVES)}
+        for month in range(1, 13)
+    }
+    residual_rows: dict[int, dict[int, int]] = {
+        month: {half_index: 0 for half_index in range(SEASONALITY_HALVES)}
+        for month in range(1, 13)
+    }
+    for half_index, (start, end) in enumerate(windows):
+        constant, linear, quadratic = trend_coefficients[half_index]
+        for observation in observations:
+            if not start <= observation.date <= end:
+                continue
+            offset = (observation.date - start).days
+            fitted = constant + linear * offset + quadratic * offset * offset
+            entry = residual_sums[observation.date.month]
+            entry[half_index] += _exact_value(observation.views) - fitted
+            residual_rows[observation.date.month][half_index] += 1
+    pre_effect_residual = {
+        month: {
+            half_index: residual_sums[month][half_index]
+            / residual_rows[month][half_index]
+            for half_index in range(SEASONALITY_HALVES)
+        }
+        for month in range(1, 13)
+    }
+    return SharedMonthEffects(
+        shared_effects=shared_effects,
+        pre_effect_residual=pre_effect_residual,
+        trend_coefficients=trend_coefficients,
+    )
 
 
 def compute_seasonality(
     observations: Sequence[Observation], end_date: date
 ) -> dict[str, object]:
-    """Find recurring peaks across two complete aligned 365-day halves."""
-    previous, current = _aligned_year_windows(observations, end_date)
+    """Find recurring peaks across two complete aligned 365-day halves.
+
+    A month is reported only when its shared effect is strictly positive *and* the
+    mean pre-season residual ``y - t_half(x)`` is strictly positive separately in
+    both aligned halves. Selecting on ``y - t_half(x) - s_m`` would instead force an
+    exact repeated effect to zero and wrongly reject it.
+    """
     if not _comparison_is_available(observations, end_date, 365):
         return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
-    previous_means = _monthly_means(observations, *previous)
-    current_means = _monthly_means(observations, *current)
-    if previous_means is None or current_means is None:
+    effects = _shared_month_effects(observations, end_date)
+    if effects is None:
         return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
-    previous_residuals = _detrended_monthly_means(previous_means)
-    current_residuals = _detrended_monthly_means(current_means)
     months = [
         month
         for month in range(1, 13)
-        if previous_residuals[month] > 0 and current_residuals[month] > 0
+        if effects.shared_effects[month] > 0
+        and all(
+            effects.pre_effect_residual[month][half_index] > 0
+            for half_index in range(SEASONALITY_HALVES)
+        )
     ]
     note = SEASONALITY_AVAILABLE_NOTE if months else SEASONALITY_NO_PEAKS_NOTE
     return {"months": months, "note": note}
