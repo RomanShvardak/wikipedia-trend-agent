@@ -17,6 +17,10 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +45,46 @@ _SERIES_FIELD_FIX = {
 # Shared default throttle state: consecutive bare throttle() calls are spaced.
 # Callers may inject their own list for per-client pacing (Phase 2 fetch).
 _THROTTLE_LAST: list[float] = [0.0]
+
+
+@dataclass
+class TransportResponse:
+    """A normalized HTTP exchange consumed by endpoint-specific clients."""
+
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+Transport = Callable[[str, dict[str, str], float], "TransportResponse"]
+
+
+class TransportError(RuntimeError):
+    """The transport could not complete an HTTP exchange."""
+
+
+def default_transport(
+    url: str,
+    headers: dict[str, str],
+    timeout: float = 30.0,
+) -> TransportResponse:
+    """Perform one urllib GET and normalize HTTP errors into responses."""
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return TransportResponse(
+                status=int(response.status),
+                headers=dict(response.headers),
+                body=response.read(),
+            )
+    except urllib.error.HTTPError as error:
+        return TransportResponse(
+            status=int(error.code),
+            headers=dict(error.headers) if error.headers is not None else {},
+            body=error.read(),
+        )
+    except OSError as error:
+        raise TransportError(str(error)) from error
 
 
 def setup_logging(verbose: bool = False) -> None:

@@ -12,10 +12,7 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -23,8 +20,12 @@ from typing import Any, TypedDict
 
 import common
 from common import (
+    Transport,
+    TransportError,
+    TransportResponse,
     cache_key_for_url,
     cache_path_for_key,
+    default_transport,
     dump_json,
     load_and_validate_spec,
     setup_logging,
@@ -37,7 +38,6 @@ NOT_LOADED_GAP_DAYS = 2
 MAX_FETCH_ATTEMPTS = 3
 RETRY_FALLBACK_SECONDS = 5.0
 sleep = time.sleep
-Transport = Callable[[str, dict[str, str], float], "TransportResponse"]
 
 
 class SeriesRow(TypedDict):
@@ -52,8 +52,7 @@ class FetchError(RuntimeError):
     """A model-readable fetch or response-validation failure."""
 
 
-class FetchTransportError(FetchError):
-    """The transport could not complete an HTTP exchange."""
+FetchTransportError = TransportError
 
 
 class SeriesFetchError(FetchError):
@@ -62,37 +61,6 @@ class SeriesFetchError(FetchError):
     def __init__(self, series_id: str, message: str) -> None:
         super().__init__(message)
         self.series_id = series_id
-
-
-@dataclass
-class TransportResponse:
-    status: int
-    headers: dict[str, str]
-    body: bytes
-
-
-def default_transport(
-    url: str,
-    headers: dict[str, str],
-    timeout: float = 30.0,
-) -> TransportResponse:
-    """Perform one urllib GET and normalize HTTP errors into responses."""
-    request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return TransportResponse(
-                status=int(response.status),
-                headers=dict(response.headers),
-                body=response.read(),
-            )
-    except urllib.error.HTTPError as error:
-        return TransportResponse(
-            status=int(error.code),
-            headers=dict(error.headers) if error.headers is not None else {},
-            body=error.read(),
-        )
-    except OSError as error:
-        raise FetchTransportError(str(error)) from error
 
 
 def series_url(project: str, article: str, start_ymd: str, end_ymd: str) -> str:
