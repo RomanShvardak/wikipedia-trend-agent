@@ -1098,6 +1098,437 @@ def discover(
     return document, exit_code
 
 
+# Atomic publication prevents partial manifest files. Requests are serial
+# within one process. Two independent processes targeting the same --out are
+# NOT serialized here: the caller must serialize them externally, otherwise the
+# last completed atomic replace wins.
+CONCURRENCY_NOTE = (
+    "atomic per-write publication; requests serial in-process; "
+    "same --out processes must be caller-serialized (last replace wins)"
+)
+
+_TOP_LEVEL_KEYS = {
+    "contract_version",
+    "run_mode",
+    "status",
+    "topic",
+    "topic_overrides",
+    "generated_at",
+    "volume_window",
+    "projects",
+}
+_PROJECT_KEYS = {
+    "project",
+    "effective_query",
+    "query_source",
+    "status",
+    "recommendation",
+    "search_hits",
+    "candidates",
+    "selection",
+    "reason",
+    "error",
+}
+_SELECTABLE_KEYS = {
+    "status",
+    "article",
+    "title",
+    "namespace",
+    "input_titles",
+    "redirect_chain",
+    "search_rank",
+    "exact_title_match",
+    "disambiguation",
+    "volume",
+    "reason",
+}
+_UNRESOLVED_KEYS = _SELECTABLE_KEYS - {"volume"}
+_VOLUME_KEYS = {
+    "status",
+    "total_views",
+    "window",
+    "observed_days",
+    "last_observed_date",
+    "low_volume",
+    "reason",
+}
+_SELECTION_KEYS = {"article", "title", "reason", "source"}
+_SEARCH_HIT_KEYS = {"title", "rank"}
+_UNRESOLVED_REASONS = {
+    "redirect_cycle",
+    "redirect_too_deep",
+    "missing_target",
+    "non_article_namespace",
+    "disambiguation_page",
+}
+_TOP_STATUSES = {
+    "awaiting_confirmation",
+    "confirmed",
+    "unresolved",
+    "partial_error",
+    "error",
+}
+
+
+def _contract_error(message: str) -> ResolveInputError:
+    return ResolveInputError(message)
+
+
+def _contract_text(value: object, field: str, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise _contract_error(f"{field} must be a non-empty string")
+    if len(value) > MAX_DISPLAY_CODE_POINTS or any(
+        0 <= ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    ):
+        raise _contract_error(f"{field} must be bounded and control-free")
+    return value
+
+
+def _contract_keys(value: object, expected: set[str], field: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise _contract_error(f"{field} must be an object")
+    actual = set(cast(dict[str, object], value))
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise _contract_error(
+            f"{field} has an invalid key set (missing={missing}, extra={extra})"
+        )
+    return cast(dict[str, object], value)
+
+
+def _contract_date(value: object, field: str) -> date:
+    text = _contract_text(value, field)
+    assert text is not None
+    try:
+        return date.fromisoformat(text)
+    except ValueError as error:
+        raise _contract_error(f"{field} must be YYYY-MM-DD") from error
+
+
+def _validate_volume(
+    volume: object, *, field: str, expected_window: Mapping[str, object]
+) -> None:
+    evidence = _contract_keys(volume, _VOLUME_KEYS, field)
+    expected_range = {
+        "start": expected_window["start"],
+        "end": expected_window["end"],
+    }
+    if evidence.get("window") != expected_range:
+        raise _contract_error(f"{field}.window must match volume_window")
+    status = evidence.get("status")
+    if status == "available":
+        total = evidence.get("total_views")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            raise _contract_error(f"{field}.total_views must be a non-negative integer")
+        observed = evidence.get("observed_days")
+        if isinstance(observed, bool) or not isinstance(observed, int) or not 0 <= observed <= VOLUME_DAYS:
+            raise _contract_error(f"{field}.observed_days must be between 0 and 30")
+        low = evidence.get("low_volume")
+        if not isinstance(low, bool) or low != (total < 1000):
+            raise _contract_error(f"{field}.low_volume must equal total_views < 1000")
+        if evidence.get("reason") is not None:
+            raise _contract_error(f"{field}.reason must be null when available")
+        last = evidence.get("last_observed_date")
+        if last is not None:
+            observed_date = _contract_date(last, f"{field}.last_observed_date")
+            start = _contract_date(expected_window["start"], "volume_window.start")
+            end = _contract_date(expected_window["end"], "volume_window.end")
+            if not start <= observed_date <= end:
+                raise _contract_error(f"{field}.last_observed_date is outside the window")
+        return
+    if status == "unavailable":
+        if any(
+            evidence.get(key) is not None
+            for key in ("total_views", "observed_days", "last_observed_date", "low_volume")
+        ):
+            raise _contract_error(
+                f"{field} unavailable evidence must use null, never numeric zero"
+            )
+        if evidence.get("reason") != "aqs_404_zero_or_not_loaded":
+            raise _contract_error(f"{field}.reason must name the AQS 404 state")
+        return
+    raise _contract_error(f"{field}.status must be available or unavailable")
+
+
+def _validate_search_hits(
+    value: object, *, field: str, project_status: str
+) -> None:
+    if value is None:
+        if project_status != "error":
+            raise _contract_error(f"{field} may be null only for a pre-search error")
+        return
+    if not isinstance(value, list):
+        raise _contract_error(f"{field} must be an ordered list or null")
+    if len(value) > MAX_SEARCH_RESULTS:
+        raise _contract_error(f"{field} exceeded the search result ceiling")
+    for index, raw_hit in enumerate(value):
+        hit = _contract_keys(raw_hit, _SEARCH_HIT_KEYS, f"{field}[{index}]")
+        _contract_text(hit.get("title"), f"{field}[{index}].title")
+        rank = hit.get("rank")
+        if isinstance(rank, bool) or rank != index + 1:
+            raise _contract_error(f"{field}[{index}].rank must equal its ordered position")
+
+
+def _validate_candidate(
+    value: object, *, field: str, expected_window: Mapping[str, object]
+) -> None:
+    if not isinstance(value, dict):
+        raise _contract_error(f"{field} must be an object")
+    status = value.get("status")
+    if status == "selectable":
+        candidate = _contract_keys(value, _SELECTABLE_KEYS, field)
+    elif status == "unresolved":
+        candidate = _contract_keys(value, _UNRESOLVED_KEYS, field)
+    else:
+        raise _contract_error(f"{field}.status must be selectable or unresolved")
+
+    _contract_text(candidate.get("article"), f"{field}.article", allow_none=status == "unresolved")
+    _contract_text(candidate.get("title"), f"{field}.title")
+    namespace = candidate.get("namespace")
+    if namespace is not None and (isinstance(namespace, bool) or not isinstance(namespace, int)):
+        raise _contract_error(f"{field}.namespace must be an integer or null")
+    if status == "selectable" and namespace != 0:
+        raise _contract_error(f"{field}.namespace must be 0")
+    input_titles = candidate.get("input_titles")
+    if (
+        not isinstance(input_titles, list)
+        or not input_titles
+        or len(input_titles) > MAX_SEARCH_RESULTS
+    ):
+        raise _contract_error(f"{field}.input_titles must be a bounded non-empty list")
+    for title_index, title in enumerate(input_titles):
+        _contract_text(title, f"{field}.input_titles[{title_index}]")
+    redirect_chain = candidate.get("redirect_chain")
+    if not isinstance(redirect_chain, list) or len(redirect_chain) > MAX_REDIRECT_HOPS + 1:
+        raise _contract_error(f"{field}.redirect_chain exceeds the bounded redirect contract")
+    for chain_index, title in enumerate(redirect_chain):
+        _contract_text(title, f"{field}.redirect_chain[{chain_index}]")
+    search_rank = candidate.get("search_rank")
+    if (
+        isinstance(search_rank, bool)
+        or not isinstance(search_rank, int)
+        or not 1 <= search_rank <= MAX_SEARCH_RESULTS
+    ):
+        raise _contract_error(f"{field}.search_rank must be 1..5")
+    for boolean_field in ("exact_title_match", "disambiguation"):
+        if not isinstance(candidate.get(boolean_field), bool):
+            raise _contract_error(f"{field}.{boolean_field} must be a boolean")
+    if status == "unresolved":
+        reason = candidate.get("reason")
+        if reason not in _UNRESOLVED_REASONS:
+            raise _contract_error(f"{field}.reason must preserve a D-08 reason code")
+        if candidate.get("article") is not None:
+            raise _contract_error(f"{field}.article must be null when unresolved")
+    else:
+        if candidate.get("reason") is not None:
+            raise _contract_error(f"{field}.reason must be null when selectable")
+        if candidate.get("disambiguation") is not False:
+            raise _contract_error(f"{field}.disambiguation must be false when selectable")
+        _validate_volume(
+            candidate.get("volume"),
+            field=f"{field}.volume",
+            expected_window=expected_window,
+        )
+
+
+def _validate_project(
+    value: object,
+    *,
+    index: int,
+    expected_project: str,
+    expected_query: str,
+    expected_source: str,
+    mode: str,
+    expected_window: Mapping[str, object],
+) -> None:
+    field = f"projects[{index}]"
+    project = _contract_keys(value, _PROJECT_KEYS, field)
+    if project.get("project") != expected_project:
+        raise _contract_error(f"{field}.project does not match the requested context")
+    if project.get("effective_query") != expected_query:
+        raise _contract_error(f"{field}.effective_query does not match the requested context")
+    if project.get("query_source") != expected_source:
+        raise _contract_error(f"{field}.query_source does not match the requested context")
+
+    status = project.get("status")
+    if status not in {"ready", "ambiguous", "unresolved", "error"}:
+        raise _contract_error(f"{field}.status is outside the resolved.v1 enum")
+    _validate_search_hits(project.get("search_hits"), field=f"{field}.search_hits", project_status=cast(str, status))
+
+    candidates = project.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) > MAX_SEARCH_RESULTS * MAX_REDIRECT_HOPS:
+        raise _contract_error(f"{field}.candidates must be a bounded list")
+    for candidate_index, candidate in enumerate(candidates):
+        _validate_candidate(
+            candidate,
+            field=f"{field}.candidates[{candidate_index}]",
+            expected_window=expected_window,
+        )
+    selectable = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("status") == "selectable"
+    ]
+    articles = [candidate.get("article") for candidate in selectable]
+    if any(not isinstance(article, str) for article in articles) or len(set(articles)) != len(articles):
+        raise _contract_error(f"{field}.candidates repeat a selectable article")
+
+    reason = project.get("reason")
+    error = project.get("error")
+    recommendation = project.get("recommendation")
+    if status == "ready":
+        if len(selectable) != 1 or _contract_text(recommendation, f"{field}.recommendation") is None:
+            raise _contract_error(f"{field} ready state requires one candidate and a recommendation")
+        if reason is not None or error is not None:
+            raise _contract_error(f"{field} ready state must not carry reason/error")
+    elif status == "ambiguous":
+        if not selectable or len(selectable) < 2 or recommendation is not None:
+            raise _contract_error(f"{field} ambiguous state requires multiple candidates and null recommendation")
+        if reason is not None or error is not None:
+            raise _contract_error(f"{field} ambiguous state must not carry reason/error")
+    elif status == "unresolved":
+        if error is not None or recommendation is not None:
+            raise _contract_error(f"{field} unresolved state must not carry error/recommendation")
+        if reason == "search_no_hits":
+            if candidates or project.get("search_hits") != []:
+                raise _contract_error(f"{field} search_no_hits requires empty candidates and search_hits")
+        elif reason == "no_selectable_candidates":
+            if not candidates or selectable:
+                raise _contract_error(
+                    f"{field} no_selectable_candidates requires retained unresolved provenance"
+                )
+        else:
+            raise _contract_error(f"{field}.reason must be a D-11/D-08 unresolved code")
+    else:
+        if reason is not None or recommendation is not None:
+            raise _contract_error(f"{field} error state must not carry reason/recommendation")
+        error_object = _contract_keys(error, {"code", "message"}, f"{field}.error")
+        _contract_text(error_object.get("code"), f"{field}.error.code")
+        _contract_text(error_object.get("message"), f"{field}.error.message")
+
+    selection = project.get("selection")
+    if mode == "discover":
+        if selection is not None:
+            raise _contract_error(f"{field}.selection must be null in discovery mode")
+    else:
+        selected = _contract_keys(selection, _SELECTION_KEYS, f"{field}.selection")
+        if selected.get("source") != "model_confirmation":
+            raise _contract_error(f"{field}.selection.source must be model_confirmation")
+        if status not in {"ready", "ambiguous"}:
+            raise _contract_error(f"{field} selection requires a ready or ambiguous project")
+        matches = [
+            candidate
+            for candidate in selectable
+            if candidate.get("article") == selected.get("article")
+        ]
+        if len(matches) != 1 or matches[0].get("title") != selected.get("title"):
+            raise _contract_error(f"{field}.selection must equal one exact selectable candidate")
+        selected_reason = selected.get("reason")
+        if selected_reason is not None:
+            _contract_text(selected_reason, f"{field}.selection.reason")
+        if status == "ambiguous" and selected_reason is None:
+            raise _contract_error(f"{field} ambiguous confirmation requires a reason")
+
+
+def validate_resolved_document(
+    document: object,
+    *,
+    expected_topic: str,
+    expected_projects: Sequence[str],
+    expected_overrides: Sequence[Mapping[str, object]],
+    mode: str,
+) -> None:
+    """Recursively validate one complete resolved.v1 document before publication."""
+    if mode not in {"discover", "confirm"}:
+        raise _contract_error("validation mode must be discover or confirm")
+    normalized_topic = _contract_text(expected_topic, "expected topic")
+    requested = list(expected_projects)
+    if not requested or any(not isinstance(project, str) or not project for project in requested):
+        raise _contract_error("expected projects must be a non-empty ordered string list")
+    if len(set(requested)) != len(requested):
+        raise _contract_error("expected projects contain duplicates")
+
+    normalized_overrides: list[dict[str, str]] = []
+    override_projects: set[str] = set()
+    for index, raw_override in enumerate(expected_overrides):
+        override = _contract_keys(raw_override, {"project", "query"}, f"expected override {index}")
+        project = _contract_text(override.get("project"), f"expected override {index} project")
+        query = _contract_text(override.get("query"), f"expected override {index} query")
+        assert project is not None and query is not None
+        if project not in requested:
+            raise _contract_error("expected override names an unrequested project")
+        if project in override_projects:
+            raise _contract_error("expected overrides contain a duplicate project")
+        override_projects.add(project)
+        normalized_overrides.append({"project": project, "query": query})
+
+    root = _contract_keys(document, _TOP_LEVEL_KEYS, "root")
+    if root.get("contract_version") != CONTRACT_VERSION:
+        raise _contract_error("root.contract_version must be resolved.v1")
+    expected_run_mode = "discover" if mode == "discover" else "confirm"
+    if root.get("run_mode") != expected_run_mode:
+        raise _contract_error(f"root.run_mode must be {expected_run_mode!r}")
+    top_status = root.get("status")
+    if top_status not in _TOP_STATUSES:
+        raise _contract_error("root.status is outside the resolved.v1 enum")
+    if mode == "confirm" and top_status != "confirmed":
+        raise _contract_error("confirmed validation requires root.status='confirmed'")
+    if root.get("topic") != normalized_topic:
+        raise _contract_error("root.topic does not match the requested context")
+    if root.get("topic_overrides") != normalized_overrides:
+        raise _contract_error("root.topic_overrides does not match the ordered requested context")
+    generated_at = _contract_text(root.get("generated_at"), "root.generated_at")
+    assert generated_at is not None
+    try:
+        parsed_generated_at = datetime.fromisoformat(generated_at)
+    except ValueError as error:
+        raise _contract_error("root.generated_at must be ISO-8601") from error
+    if parsed_generated_at.tzinfo is None:
+        raise _contract_error("root.generated_at must carry a timezone")
+
+    window = _contract_keys(
+        root.get("volume_window"),
+        {"start", "end", "days", "access", "agent", "granularity"},
+        "root.volume_window",
+    )
+    start = _contract_date(window.get("start"), "root.volume_window.start")
+    end = _contract_date(window.get("end"), "root.volume_window.end")
+    if (end - start).days + 1 != VOLUME_DAYS or window.get("days") != VOLUME_DAYS:
+        raise _contract_error("root.volume_window must contain exactly 30 complete days")
+    if (
+        window.get("access") != "all-access"
+        or window.get("agent") != "user"
+        or window.get("granularity") != "daily"
+    ):
+        raise _contract_error("root.volume_window must bind all-access/user/daily")
+
+    projects = root.get("projects")
+    if not isinstance(projects, list) or [record.get("project") for record in projects if isinstance(record, dict)] != requested:
+        raise _contract_error("root.projects must match the ordered requested project context")
+    override_map = {item["project"]: item["query"] for item in normalized_overrides}
+    for index, (record, project) in enumerate(zip(projects, requested, strict=True)):
+        _validate_project(
+            record,
+            index=index,
+            expected_project=project,
+            expected_query=override_map.get(project, normalized_topic or ""),
+            expected_source="project_override" if project in override_map else "shared",
+            mode=mode,
+            expected_window=window,
+        )
+
+    if mode == "discover":
+        derived_status, _ = aggregate_project_outcomes(
+            [cast(dict[str, object], record) for record in projects]
+        )
+        if top_status != derived_status:
+            raise _contract_error("root.status does not match project outcome precedence")
+
+
 def _confirmation_error(messages: Sequence[str]) -> tuple[None, int]:
     print("resolver confirmation failed:", file=sys.stderr)
     for message in messages:
@@ -1140,6 +1571,9 @@ def confirm(
         override_map[override_project] = query
     if set(override_map) - set(requested_projects):
         errors.append("confirmation override context contains an unrequested project")
+    expected_overrides = [
+        {"project": project, "query": query} for project, query in topic_overrides
+    ]
 
     try:
         decoded = json.loads(out.read_text(encoding="utf-8"))
@@ -1150,6 +1584,16 @@ def confirm(
     if not isinstance(decoded, dict):
         return _confirmation_error(["discovery manifest must be a JSON object"])
     document = cast(dict[str, object], decoded)
+    try:
+        validate_resolved_document(
+            document,
+            expected_topic=normalized_topic,
+            expected_projects=requested_projects,
+            expected_overrides=expected_overrides,
+            mode="discover",
+        )
+    except ResolveInputError as error:
+        return _confirmation_error([f"saved discovery manifest is invalid: {error}"])
     if document.get("contract_version") != CONTRACT_VERSION:
         errors.append("discovery manifest has the wrong contract_version")
     if document.get("run_mode") != "discover":
@@ -1158,9 +1602,6 @@ def confirm(
         errors.append("discovery manifest must have status='awaiting_confirmation'")
     if document.get("topic") != normalized_topic:
         errors.append("topic does not match the saved discovery context")
-    expected_overrides = [
-        {"project": project, "query": query} for project, query in topic_overrides
-    ]
     if document.get("topic_overrides") != expected_overrides:
         errors.append("ordered topic-for context does not match the saved discovery manifest")
 
@@ -1247,6 +1688,16 @@ def confirm(
             "reason": normalized_reason,
             "source": "model_confirmation",
         }
+    try:
+        validate_resolved_document(
+            confirmed,
+            expected_topic=normalized_topic,
+            expected_projects=requested_projects,
+            expected_overrides=expected_overrides,
+            mode="confirm",
+        )
+    except ResolveInputError as error:
+        return _confirmation_error([f"confirmed document is invalid: {error}"])
     return confirmed, 0
 
 
@@ -1276,6 +1727,16 @@ def _parser() -> argparse.ArgumentParser:
         help="logging-only debug diagnostics; adds no fields and changes no API behavior",
     )
     return parser
+
+
+def _publish(document: dict[str, object], out: str | Path) -> bool:
+    """Atomically publish or emit one stable, code-derived failure."""
+    try:
+        common.dump_json(document, out)
+    except OSError:
+        print("resolver publication failed: publication_error", file=sys.stderr)
+        return False
+    return True
 
 
 def main(
@@ -1324,7 +1785,8 @@ def main(
             print(f"resolver confirmation failed: {error}", file=sys.stderr)
             return 2
         if document is not None and exit_code == 0:
-            common.dump_json(document, args.out)
+            if not _publish(document, args.out):
+                return 1
             print(f"Resolver confirmed: {args.out}")
         return exit_code
 
@@ -1346,7 +1808,8 @@ def main(
         return 1
 
     if document is not None:
-        common.dump_json(document, args.out)
+        if not _publish(document, args.out):
+            return 1
         print(f"Resolver {document['status']}: {args.out}")
     return exit_code
 

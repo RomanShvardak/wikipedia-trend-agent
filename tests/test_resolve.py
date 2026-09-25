@@ -639,6 +639,11 @@ def test_confirm_requires_reason_for_ambiguous_saved_project(
     document = json.loads(out.read_text(encoding="utf-8"))
     document["projects"][0]["status"] = "ambiguous"
     document["projects"][0]["recommendation"] = None
+    second_candidate = copy.deepcopy(document["projects"][0]["candidates"][0])
+    second_candidate["article"] = "Other_fasting"
+    second_candidate["title"] = "Other fasting"
+    second_candidate["exact_title_match"] = False
+    document["projects"][0]["candidates"].append(second_candidate)
     common.dump_json(document, out)
     before = out.read_bytes()
     _forbid_confirmation_side_effects(monkeypatch)
