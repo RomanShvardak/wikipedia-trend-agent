@@ -1152,3 +1152,124 @@ def test_exact_growth_and_unrounded_volume_end_to_end(tmp_path: Path) -> None:
     assert exact_volume["trend_direction"] == expected_direction
     assert analyze_trends.VOLUME_MINIMUM_REASON in exact_volume["confidence_reasons"]
     assert analyze_trends.VOLUME_BELOW_MINIMUM_REASON not in exact_volume["confidence_reasons"]
+
+
+def _seasonality_control_rows(
+    start: date,
+    count: int,
+    base_views: int,
+    trend_step: int,
+    seasonal_months: set[int],
+    seasonal_amplitude: int = 200,
+) -> list[analyze_trends.Observation]:
+    rows: list[analyze_trends.Observation] = []
+    for index in range(count):
+        observed_date = start + timedelta(days=index)
+        seasonal_effect = (
+            seasonal_amplitude if observed_date.month in seasonal_months else 0
+        )
+        rows.append(
+            _observation(
+                observed_date,
+                base_views + index * trend_step + seasonal_effect,
+            )
+        )
+    return rows
+
+
+def test_seasonality_separates_monotonic_trend_from_repeating_month_effects() -> None:
+    """Endpoint detrending removes level changes but retains repeated calendar effects."""
+    start = date(2024, 1, 1)
+    end = date(2025, 12, 30)
+    previous_window, current_window = analyze_trends._aligned_year_windows([], end)
+    monotonic = _seasonality_control_rows(start, 730, 1_000, 1, set())
+
+    monotonic_result = analyze_trends.compute_seasonality(monotonic, end)
+    assert monotonic_result == {
+        "months": [],
+        "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+    }
+    assert hasattr(analyze_trends, "_detrended_monthly_means")
+    for window in (previous_window, current_window):
+        profiles = analyze_trends._monthly_means(monotonic, *window)
+        assert profiles is not None
+        residuals = analyze_trends._detrended_monthly_means(profiles)
+        assert set(residuals) == set(range(1, 13))
+        assert all(residual == 0 for residual in residuals.values())
+        assert residuals[1] == 0
+        assert residuals[12] == 0
+
+    repeating = _seasonality_control_rows(start, 730, 1_000, 1, {4, 10})
+    repeating_result = analyze_trends.compute_seasonality(repeating, end)
+    assert repeating_result == {
+        "months": [4, 10],
+        "note": analyze_trends.SEASONALITY_AVAILABLE_NOTE,
+    }
+    for window in (previous_window, current_window):
+        profiles = analyze_trends._monthly_means(repeating, *window)
+        assert profiles is not None
+        residuals = analyze_trends._detrended_monthly_means(profiles)
+        assert {
+            month: residual
+            for month, residual in residuals.items()
+            if residual != 0
+        } == {4: 200, 10: 200}
+        assert all(
+            residual == (200 if month in {4, 10} else 0)
+            for month, residual in residuals.items()
+        )
+
+    missing_month = [
+        observation
+        for observation in repeating
+        if not (
+            previous_window[0] <= observation.date <= previous_window[1]
+            and observation.date.month == 2
+        )
+    ]
+    assert analyze_trends.compute_seasonality(missing_month, end) == {
+        "months": [],
+        "note": analyze_trends.SEASONALITY_UNAVAILABLE_NOTE,
+    }
+
+
+def test_committed_monotonic_golden_has_no_recurring_peaks() -> None:
+    """The committed input is strictly monotonic and regenerates no-peak goldens."""
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    spec_path = fixtures / "spec.example.json"
+    series_path = fixtures / "series.example.csv"
+    golden_path = fixtures / "metrics.example.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    golden = json.loads(golden_path.read_text(encoding="utf-8"))
+
+    with series_path.open(newline="", encoding="utf-8") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    for series_id in (item["id"] for item in spec["series"]):
+        values = [int(row["views"]) for row in csv_rows if row["series_id"] == series_id]
+        assert values
+        assert all(current > previous for previous, current in zip(values, values[1:]))
+
+    grouped = analyze_trends.load_series_csv(series_path, spec)
+    actual = analyze_trends.build_metrics(
+        spec, "tests/fixtures/spec.example.json", grouped
+    )
+    assert actual == golden
+
+    end = date(2026, 9, 20)
+    previous_window, current_window = analyze_trends._aligned_year_windows([], end)
+    for observations in grouped.values():
+        assert analyze_trends.detect_anomalies(observations) == []
+        for window in (previous_window, current_window):
+            profiles = analyze_trends._monthly_means(observations, *window)
+            assert profiles is not None
+            assert hasattr(analyze_trends, "_detrended_monthly_means")
+            residuals = analyze_trends._detrended_monthly_means(profiles)
+            assert all(residual == 0 for residual in residuals.values())
+            assert residuals[1] == 0
+            assert residuals[12] == 0
+
+    for series in golden["series"]:
+        assert series["seasonality"] == {
+            "months": [],
+            "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+        }
