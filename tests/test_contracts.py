@@ -14,10 +14,12 @@ from pathlib import Path
 
 import pytest
 
+import resolve_articles
 from common import load_spec
 
 METRICS_EXAMPLE = Path(__file__).resolve().parent / "fixtures" / "metrics.example.json"
 CONTRACTS_DOC = Path(__file__).resolve().parents[1] / "references" / "CONTRACTS.md"
+SKILL_DOC = Path(__file__).resolve().parents[1] / "SKILL.md"
 
 GROWTH_WINDOWS = ("m3", "y1", "y2")
 TREND_DIRECTIONS = {"up", "down", "flat", "noise", "inconclusive"}
@@ -188,3 +190,96 @@ def test_contracts_doc_states_pct_rule() -> None:
     text = CONTRACTS_DOC.read_text(encoding="utf-8")
     assert "never 0" in text, "CONTRACTS.md must state the pct rule with the exact phrase 'never 0'"
     assert "must carry" in text, "CONTRACTS.md must name the null-requires-reason corollary"
+
+
+def test_resolver_help_publishes_every_flag_and_verbose_semantics() -> None:
+    help_text = resolve_articles._parser().format_help()
+
+    for flag in (
+        "--topic",
+        "--projects",
+        "--topic-for",
+        "--out",
+        "--select",
+        "--reason",
+        "--ttl-hours",
+        "--verbose",
+    ):
+        assert flag in help_text, f"resolver help must publish {flag}"
+    assert "logging-only" in help_text
+    assert "adds no fields" in help_text
+    assert "WTI_TTL_HOURS or 24.0" in help_text
+    assert "0 forces refetch" in help_text
+
+
+def test_resolver_ttl_executable_default_environment_and_precedence(
+    tmp_path, monkeypatch
+) -> None:
+    base = ["--topic", "topic", "--projects", "en.wikipedia", "--out", str(tmp_path / "r.json")]
+    monkeypatch.delenv("WTI_TTL_HOURS", raising=False)
+    assert resolve_articles._parser().parse_args(base).ttl_hours == 24.0
+    monkeypatch.setenv("WTI_TTL_HOURS", "8.5")
+    assert resolve_articles._parser().parse_args(base).ttl_hours == 8.5
+    assert (
+        resolve_articles._parser().parse_args([*base, "--ttl-hours", "0"]).ttl_hours
+        == 0.0
+    )
+
+
+def test_resolved_v1_contract_section_is_complete() -> None:
+    text = CONTRACTS_DOC.read_text(encoding="utf-8")
+
+    for marker in (
+        "resolved.v1",
+        "search_no_hits",
+        "no_selectable_candidates",
+        "ordered `search_hits`",
+        "MAX_PROJECTS=8",
+        "MAX_RESPONSE_BYTES=1_048_576",
+        "read(MAX_RESPONSE_BYTES + 1)",
+        "all-access",
+        "WTI_TTL_HOURS",
+        "logging-only",
+        "last completed atomic replace wins",
+        "caller-serialized",
+    ):
+        assert marker in text, f"resolved.v1 contract must document {marker!r}"
+
+
+def test_skill_publishes_two_run_resolver_workflow() -> None:
+    text = SKILL_DOC.read_text(encoding="utf-8")
+
+    for marker in (
+        "resolve_articles.py",
+        "--topic-for",
+        "--select",
+        "--ttl-hours",
+        "--verbose",
+        "logging-only",
+        'status="confirmed"',
+        "references/CONTRACTS.md",
+    ):
+        assert marker in text, f"SKILL.md must document {marker!r}"
+    assert text.index("--topic-for") < text.index('status="confirmed"')
+
+
+def test_frozen_spec_and_metrics_fixture_key_sets_remain_unchanged(
+    metrics, spec_example_path
+) -> None:
+    spec = load_spec(spec_example_path)
+
+    assert set(spec) == {
+        "name",
+        "request",
+        "language",
+        "window",
+        "series",
+        "assumptions",
+        "quality",
+    }
+    assert all(
+        set(series) == {"id", "project", "article", "label", "language"}
+        for series in spec["series"]
+    )
+    assert set(metrics) == {"spec_name", "as_of", "generated_from", "series"}
+    assert metrics["spec_name"] == spec["name"]
