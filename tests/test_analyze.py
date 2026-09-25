@@ -958,3 +958,37 @@ def test_missing_seasonality_month_is_unavailable_above_row_floor() -> None:
         "months": [],
         "note": analyze_trends.SEASONALITY_UNAVAILABLE_NOTE,
     }
+
+
+def test_metrics_output_is_atomic_and_preserves_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A replace failure cleans staging and preserves the prior metrics bytes."""
+    spec_path = _write_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    _write_series_csv(out_dir / "series.csv", _profile_rows(date(2024, 1, 1), 2, base_views=10))
+    metrics_path = out_dir / "metrics.json"
+    sentinel = b'{"sentinel":"preserve"}\n'
+    metrics_path.write_bytes(sentinel)
+    staged_paths: list[Path] = []
+
+    def fail_replace(source: object, destination: object) -> None:
+        source_path = Path(str(source))
+        staged_paths.append(source_path)
+        assert source_path.parent == metrics_path.parent
+        assert source_path.exists()
+        assert Path(str(destination)) == metrics_path
+        raise OSError("injected atomic replace failure")
+
+    monkeypatch.setattr(analyze_trends.common.os, "replace", fail_replace)
+
+    assert _run_analyzer(spec_path, out_dir) == 1
+    captured = capsys.readouterr()
+
+    assert staged_paths
+    assert "analysis failed:" in captured.err
+    assert "metrics output" in captured.err
+    assert metrics_path.read_bytes() == sentinel
+    assert {path.name for path in out_dir.iterdir()} == {"series.csv", "metrics.json"}
