@@ -5,6 +5,7 @@ code must never fall back to the network in this module.
 """
 from __future__ import annotations
 
+import copy
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -347,3 +348,270 @@ def test_bounded_transport_reads_only_limit_plus_one(monkeypatch):
         resolve_articles.bounded_transport("https://en.wikipedia.org/w/api.php", {})
 
     assert stream.read_sizes == [limit + 1]
+
+
+def _run_discovery(
+    out: Path,
+    tmp_path: Path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    *,
+    extra_args: list[str] | None = None,
+) -> None:
+    _configure(monkeypatch, tmp_path)
+    stub = transport_stub(
+        [
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _volume_body(resolve_fixture)),
+        ]
+    )
+    assert resolve_articles.main(
+        [*_args(out), *(extra_args or [])],
+        transport=stub,
+        today_utc=TODAY,
+    ) == 0
+    assert len(stub.calls) == 3
+
+
+def _forbid_confirmation_side_effects(monkeypatch) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("confirmation must remain offline")
+
+    monkeypatch.setattr(common, "user_agent", forbidden)
+    monkeypatch.setattr(common, "throttle", forbidden)
+    monkeypatch.setattr(common, "read_json_cache", forbidden)
+    monkeypatch.setattr(common, "write_json_cache", forbidden)
+
+
+def test_confirm_exact_saved_candidate_is_offline_and_atomic(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    assert hasattr(resolve_articles, "confirm"), "confirm state transition must be public"
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    discovery = json.loads(out.read_text(encoding="utf-8"))
+    _forbid_confirmation_side_effects(monkeypatch)
+    publications: list[Path] = []
+    real_dump_json = common.dump_json
+    monkeypatch.setattr(
+        common,
+        "dump_json",
+        lambda document, path: (
+            publications.append(Path(path)),
+            real_dump_json(document, path),
+        )[1],
+    )
+    args = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 0
+
+    confirmed = json.loads(out.read_text(encoding="utf-8"))
+    expected = copy.deepcopy(discovery)
+    expected["run_mode"] = "confirm"
+    expected["status"] = "confirmed"
+    expected["projects"][0]["selection"] = {
+        "article": "Intermittent_fasting",
+        "title": "Intermittent fasting",
+        "reason": None,
+        "source": "model_confirmation",
+    }
+    assert confirmed == expected
+    assert publications == [out]
+    assert sorted(path.name for path in out.parent.iterdir()) == ["resolved.json"]
+
+
+def test_confirm_rejects_slug_outside_saved_candidates_without_replacing_bytes(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [*_args(out), "--select", "en.wikipedia=Invented_Article"]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+
+def test_confirm_rejects_wrong_topic_without_replacing_bytes(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [
+        "--topic",
+        "different topic",
+        "--projects",
+        "en.wikipedia",
+        "--out",
+        str(out),
+        "--select",
+        "en.wikipedia=Intermittent_fasting",
+    ]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+
+def test_confirm_rejects_saved_project_context_mismatch_without_replacing_bytes(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    document = json.loads(out.read_text(encoding="utf-8"))
+    document["projects"][0]["project"] = "pl.wikipedia"
+    common.dump_json(document, out)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+
+def test_confirm_requires_replaying_project_override_context(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(
+        out,
+        tmp_path,
+        monkeypatch,
+        transport_stub,
+        resolve_fixture,
+        extra_args=["--topic-for", "en.wikipedia=fasting"],
+    )
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+
+def test_confirm_rejects_duplicate_selection_during_preflight(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [
+        *_args(out),
+        "--select",
+        "en.wikipedia=Intermittent_fasting",
+        "--select",
+        "en.wikipedia=Intermittent_fasting",
+    ]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+
+def test_confirm_direct_api_rejects_missing_selection_without_replacing_bytes(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+
+    document, exit_code = resolve_articles.confirm(
+        topic="intermittent fasting",
+        projects=["en.wikipedia"],
+        topic_overrides=[],
+        selections={},
+        reason=None,
+        out=out,
+    )
+
+    assert document is None
+    assert exit_code == 2
+    assert out.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("contract_version", "resolved.invalid"),
+        ("run_mode", "confirm"),
+        ("status", "confirmed"),
+    ],
+)
+def test_confirm_rejects_stale_manifest_state_without_replacing_bytes(
+    field,
+    value,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    document = json.loads(out.read_text(encoding="utf-8"))
+    document[field] = value
+    common.dump_json(document, out)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+
+def test_confirm_requires_reason_for_ambiguous_saved_project(
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    document = json.loads(out.read_text(encoding="utf-8"))
+    document["projects"][0]["status"] = "ambiguous"
+    document["projects"][0]["recommendation"] = None
+    common.dump_json(document, out)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    args = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
+
+    assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+
+    reason_args = [*args, "--reason", "Explicit semantic match"]
+    assert resolve_articles.main(reason_args, transport=forbidden_transport) == 0
+    confirmed = json.loads(out.read_text(encoding="utf-8"))
+    assert confirmed["projects"][0]["selection"]["reason"] == "Explicit semantic match"
