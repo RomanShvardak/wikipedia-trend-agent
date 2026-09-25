@@ -742,7 +742,7 @@ def test_redirect_eleventh_hop_is_unresolved_with_stable_reason():
         ),
     ],
 )
-def test_invalid_metadata_target_is_retained_as_unresolved(page, expected_reason):
+def test_missing_target_namespace_and_disambiguation_are_unresolved(page, expected_reason):
     assert hasattr(resolve_articles, "parse_metadata")
     body = _metadata_payload(
         redirects=(
@@ -762,6 +762,40 @@ def test_invalid_metadata_target_is_retained_as_unresolved(page, expected_reason
     assert len(candidates) == 1
     assert candidates[0]["status"] == "unresolved"
     assert candidates[0]["reason"] == expected_reason
+
+
+def test_redirect_cycle_candidate_is_unresolved():
+    body = _metadata_payload(
+        redirects=[{"from": "A", "to": "B"}, {"from": "B", "to": "A"}],
+        pages=[{"ns": 0, "title": "A", "pageprops": {}}],
+    )
+
+    candidates = resolve_articles.parse_metadata(
+        body, [{"title": "A", "rank": 1}], "A"
+    )
+
+    assert candidates[0]["status"] == "unresolved"
+    assert candidates[0]["reason"] == "redirect_cycle"
+    assert candidates[0]["article"] is None
+
+
+def test_redirect_too_deep_candidate_is_unresolved():
+    redirects = [
+        {"from": f"Title {index}", "to": f"Title {index + 1}"}
+        for index in range(11)
+    ]
+    body = _metadata_payload(
+        redirects=redirects,
+        pages=[{"ns": 0, "title": "Title 11", "pageprops": {}}],
+    )
+
+    candidates = resolve_articles.parse_metadata(
+        body, [{"title": "Title 0", "rank": 1}], "Title 0"
+    )
+
+    assert candidates[0]["status"] == "unresolved"
+    assert candidates[0]["reason"] == "redirect_too_deep"
+    assert candidates[0]["article"] is None
 
 
 def test_redirect_discovery_calls_aqs_only_for_final_canonical_target(
@@ -929,20 +963,23 @@ def test_volume_404_is_unavailable_not_numeric_zero(resolve_fixture):
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "test_id"),
+    ("field", "value"),
     [
-        ("project", "pl.wikipedia", "wrong_project"),
-        ("article", "Other_article", "wrong_article"),
-        ("access", "desktop", "wrong_access"),
-        ("agent", "spider", "wrong_agent"),
-        ("granularity", "monthly", "wrong_granularity"),
+        ("project", "pl.wikipedia"),
+        ("article", "Other_article"),
+        ("access", "desktop"),
+        ("agent", "spider"),
+        ("granularity", "monthly"),
     ],
-    ids=lambda value: value if isinstance(value, str) and value.startswith("wrong_") else None,
+    ids=[
+        "wrong_project",
+        "wrong_article",
+        "wrong_access",
+        "wrong_agent",
+        "wrong_granularity",
+    ],
 )
-def test_wrong_volume_identity_fails_before_candidate_mutation(
-    field, value, test_id, resolve_fixture
-):
-    del test_id
+def test_wrong_volume_identity_fails_before_candidate_mutation(field, value):
     assert hasattr(resolve_articles, "parse_volume_response")
     candidate = {"volume": {"status": "sentinel"}}
     items = [
@@ -960,13 +997,18 @@ def test_wrong_volume_identity_fails_before_candidate_mutation(
         )
 
     assert candidate["volume"] == {"status": "sentinel"}
-    assert resolve_fixture is not None
 
 
 @pytest.mark.parametrize(
     ("items", "message"),
     [
-        ([_volume_item(timestamp="2026082600"), _volume_item(timestamp="2026082600")], "duplicate"),
+        (
+            [
+                _volume_item(timestamp="2026082600"),
+                _volume_item(timestamp="2026082600"),
+            ],
+            "duplicate",
+        ),
         ([_volume_item(views=-1)], "views"),
         ([_volume_item(views=True)], "views"),
         ([_volume_item(timestamp="2026092500")], "outside"),
@@ -1003,6 +1045,56 @@ def test_volume_http_failures_are_errors_not_low_volume(status):
         )
 
 
+@pytest.mark.parametrize("body", [b"not-json", b"[]", b'{"items":{}}'])
+def test_malformed_volume_json_is_an_error(body):
+    with pytest.raises(resolve_articles.ResolveVolumeError, match="AQS"):
+        resolve_articles.parse_volume_response(
+            _volume_response(body),
+            expected_project="en.wikipedia",
+            expected_article="Intermittent_fasting",
+            start=VOLUME_START,
+            end=VOLUME_END,
+        )
+
+
+def test_volume_transport_failure_is_not_published_as_low_volume(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    stub = transport_stub(
+        [
+            (
+                200,
+                {},
+                _response_body(resolve_fixture, "resolve.search.en.wikipedia.json"),
+            ),
+            (
+                200,
+                {},
+                _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json"),
+            ),
+        ]
+    )
+
+    def fail_volume(url, headers, timeout):
+        stub.calls.append((url, dict(headers)))
+        raise common.TransportError("offline transport failure")
+
+    original_factory = stub
+
+    def scripted_then_fail(url, headers, timeout):
+        if url.startswith("https://wikimedia.org/api/rest_v1/"):
+            return fail_volume(url, headers, timeout)
+        return original_factory(url, headers, timeout)
+
+    out = tmp_path / "resolved.json"
+    assert resolve_articles.main(
+        _args(out), transport=scripted_then_fail, today_utc=TODAY
+    ) == 1
+    assert not out.exists()
+    assert len(original_factory.calls) == 3
+
+
 def test_low_volume_999_and_404_candidates_remain_selectable(
     tmp_path, monkeypatch, transport_stub, resolve_fixture
 ):
@@ -1010,7 +1102,11 @@ def test_low_volume_999_and_404_candidates_remain_selectable(
 
     for index, (response, expected_status, expected_total) in enumerate(
         [
-            (_volume_response({"items": [_volume_item(views=999)]}), "available", 999),
+            (
+                _volume_response({"items": [_volume_item(views=999)]}),
+                "available",
+                999,
+            ),
             (
                 _volume_response(
                     _response_body(resolve_fixture, "pageviews.404.json"),

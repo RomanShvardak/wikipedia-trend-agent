@@ -521,51 +521,132 @@ def parse_metadata(
     )
 
 
-def _parse_volume(
-    body: bytes,
+def volume_window(today_utc: date) -> tuple[date, date]:
+    """Return one shared inclusive window of 30 complete UTC calendar days."""
+    if not isinstance(today_utc, date):
+        raise ResolveInputError("today_utc must be a date")
+    end = today_utc - timedelta(days=1)
+    return end - timedelta(days=VOLUME_DAYS - 1), end
+
+
+def _validate_volume_window(start: date, end: date) -> None:
+    if (end - start).days + 1 != VOLUME_DAYS:
+        raise ResolveVolumeError(
+            "AQS validation window must contain exactly 30 days"
+        )
+
+
+def validate_volume_payload(
+    payload: dict[str, object],
     *,
-    project: str,
-    article: str,
+    expected_project: str,
+    expected_article: str,
+    expected_access: str = "all-access",
+    expected_agent: str = "user",
+    expected_granularity: str = "daily",
     start: date,
     end: date,
-) -> dict[str, object]:
-    try:
-        decoded = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ResolveVolumeError("AQS response is not valid UTF-8 JSON") from error
-    if not isinstance(decoded, dict) or not isinstance(decoded.get("items"), list):
+) -> None:
+    """Validate all AQS items before any total is accumulated or exposed."""
+    _validate_volume_window(start, end)
+    items = payload.get("items")
+    if not isinstance(items, list):
         raise ResolveVolumeError("AQS response must contain an items list")
-    items = cast(list[object], decoded["items"])
-    total = 0
-    observed: set[date] = set()
+    if len(items) > VOLUME_DAYS:
+        raise ResolveVolumeError("AQS response exceeded the 30-item window limit")
+
     expected_identity = {
-        "project": project,
-        "article": article,
-        "access": "all-access",
-        "agent": "user",
-        "granularity": "daily",
+        "project": expected_project,
+        "article": expected_article,
+        "access": expected_access,
+        "agent": expected_agent,
+        "granularity": expected_granularity,
     }
+    observed: set[date] = set()
     for index, raw_item in enumerate(items):
         if not isinstance(raw_item, dict):
             raise ResolveVolumeError(f"AQS item {index} must be an object")
         item = cast(dict[str, object], raw_item)
         for field, expected in expected_identity.items():
-            if field not in item or item[field] != expected:
+            actual = item.get(field)
+            if not isinstance(actual, str) or actual != expected:
                 raise ResolveVolumeError(f"AQS item {index} has an invalid {field}")
+
         timestamp = item.get("timestamp")
-        views = item.get("views")
-        if not isinstance(timestamp, str) or len(timestamp) != 10 or not timestamp.isdigit():
+        if (
+            not isinstance(timestamp, str)
+            or len(timestamp) != 10
+            or not timestamp.isdigit()
+            or timestamp[-2:] != "00"
+        ):
             raise ResolveVolumeError(f"AQS item {index} has an invalid timestamp")
-        if timestamp[-2:] != "00":
-            raise ResolveVolumeError(f"AQS item {index} has an invalid timestamp")
-        if isinstance(views, bool) or not isinstance(views, int) or views < 0:
-            raise ResolveVolumeError(f"AQS item {index} has invalid views")
         try:
             observed_date = datetime.strptime(timestamp[:8], "%Y%m%d").date()
         except ValueError as error:
             raise ResolveVolumeError(f"AQS item {index} has an invalid timestamp") from error
+        if observed_date in observed:
+            raise ResolveVolumeError(f"AQS item {index} has a duplicate date")
         if not start <= observed_date <= end:
             raise ResolveVolumeError(f"AQS item {index} is outside the requested window")
+        views = item.get("views")
+        if isinstance(views, bool) or not isinstance(views, int) or views < 0:
+            raise ResolveVolumeError(f"AQS item {index} has invalid views")
+        observed.add(observed_date)
+
+
+def parse_volume_response(
+    response: TransportResponse,
+    *,
+    expected_project: str,
+    expected_article: str,
+    expected_access: str = "all-access",
+    expected_agent: str = "user",
+    expected_granularity: str = "daily",
+    start: date,
+    end: date,
+) -> dict[str, object]:
+    """Return exact available or explicitly unavailable AQS evidence."""
+    _validate_volume_window(start, end)
+    if response.status == 404:
+        return {
+            "status": "unavailable",
+            "total_views": None,
+            "window": {"start": start.isoformat(), "end": end.isoformat()},
+            "observed_days": None,
+            "last_observed_date": None,
+            "low_volume": None,
+            "reason": "aqs_404_zero_or_not_loaded",
+        }
+    if response.status != 200:
+        raise ResolveVolumeError(f"AQS returned HTTP {response.status}")
+
+    try:
+        decoded = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ResolveVolumeError("AQS response is not valid UTF-8 JSON") from error
+    if not isinstance(decoded, dict):
+        raise ResolveVolumeError("AQS response must be a JSON object")
+    payload = cast(dict[str, object], decoded)
+    validate_volume_payload(
+        payload,
+        expected_project=expected_project,
+        expected_article=expected_article,
+        expected_access=expected_access,
+        expected_agent=expected_agent,
+        expected_granularity=expected_granularity,
+        start=start,
+        end=end,
+    )
+
+    items = cast(list[object], payload["items"])
+    total = 0
+    observed: set[date] = set()
+    for raw_item in items:
+        item = cast(dict[str, object], raw_item)
+        views = cast(int, item["views"])
+        observed_date = datetime.strptime(
+            cast(str, item["timestamp"]), "%Y%m%d%H"
+        ).date()
         total += views
         observed.add(observed_date)
     return {
@@ -621,8 +702,7 @@ def discover(
         raise ResolveInputError("WTI_USER_AGENT is too long")
     headers = {"User-Agent": ua, "Accept": "application/json"}
     override_map = dict(overrides)
-    end = today_utc - timedelta(days=1)
-    start = end - timedelta(days=VOLUME_DAYS - 1)
+    start, end = volume_window(today_utc)
     project_documents: list[dict[str, object]] = []
 
     for project in projects:
@@ -664,12 +744,10 @@ def discover(
             )
             common.throttle(1.0, pace)
             response = transport(url, headers, 30.0)
-            if response.status != 200:
-                raise ResolveVolumeError(f"AQS returned HTTP {response.status}")
-            candidate["volume"] = _parse_volume(
-                response.body,
-                project=project,
-                article=article,
+            candidate["volume"] = parse_volume_response(
+                response,
+                expected_project=project,
+                expected_article=article,
                 start=start,
                 end=end,
             )
