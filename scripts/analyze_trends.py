@@ -68,11 +68,12 @@ SEASONALITY_UNAVAILABLE_NOTE = (
 )
 SEASONALITY_NO_PEAKS_NOTE = "no recurring peak months identified"
 SEASONALITY_AVAILABLE_NOTE = (
-    "recurring peaks have positive shared month effects and positive pre-season "
-    "residual means in both aligned halves; repeatability is measured before "
-    "subtracting the fitted shared effect, and month-scale monotonic curvature "
-    "outside the fitted linear/quadratic daily trend can still be confounded "
-    "with calendar effects across only two observed cycles"
+    "recurring peaks have positive shared month effects whose post-subtraction "
+    "residual is non-negative in both aligned halves, so a month effect measured "
+    "in only one of the two observed years is not reported as recurring; "
+    "month-scale monotonic curvature outside the fitted linear/quadratic daily "
+    "trend can still be confounded with calendar effects across only two "
+    "observed cycles"
 )
 
 
@@ -564,8 +565,11 @@ class SharedMonthEffects:
     ``shared_effects`` is ``s_m`` for every calendar month 1-12, including the
     derived zero-sum month 12. ``pre_effect_residual[month][half]`` is the mean of
     ``y - t_half(x)`` over that half's rows for the month, measured *before* the
-    fitted shared effect is subtracted, so an exact repeated effect is never
-    cancelled out of its own repeatability evidence.
+    fitted shared effect is subtracted, so the caller can form the exact
+    post-subtraction support residual ``pre_effect_residual[month][half]
+    - shared_effects[month]``. That difference is exactly zero for an effect the
+    two halves share and is negative in the half that does not carry it, which is
+    what makes a one-half-only effect detectable without a tolerance.
     """
 
     shared_effects: dict[int, Fraction]
@@ -645,10 +649,18 @@ def compute_seasonality(
 ) -> dict[str, object]:
     """Find recurring peaks across two complete aligned 365-day halves.
 
-    A month is reported only when its shared effect is strictly positive *and* the
-    mean pre-season residual ``y - t_half(x)`` is strictly positive separately in
-    both aligned halves. Selecting on ``y - t_half(x) - s_m`` would instead force an
-    exact repeated effect to zero and wrongly reject it.
+    A month is reported only when its shared effect is strictly positive *and*
+    the post-subtraction residual ``y - t_half(x) - s_m`` is non-negative
+    separately in both aligned halves. Requiring non-negative support in both
+    halves is what a recurring effect must satisfy: an effect confined to one
+    half leaves that shared estimate unsupported in the other half, so a
+    one-year event is not reported as same-month year-over-year recurrence. An
+    exact repeated effect satisfies the shared estimate exactly, so its
+    post-subtraction residual is exactly zero in both halves and stays
+    selectable - a strict ``> 0`` rule would wrongly reject it. The comparison
+    is exact rational arithmetic with no threshold, tolerance, or amplitude
+    band, and the same rule is applied to every candidate month so a
+    one-sided effect cannot drag a neighbouring month along with it.
     """
     if not _comparison_is_available(observations, end_date, 365):
         return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
@@ -660,7 +672,9 @@ def compute_seasonality(
         for month in range(1, 13)
         if effects.shared_effects[month] > 0
         and all(
-            effects.pre_effect_residual[month][half_index] > 0
+            effects.pre_effect_residual[month][half_index]
+            - effects.shared_effects[month]
+            >= 0
             for half_index in range(SEASONALITY_HALVES)
         )
     ]
