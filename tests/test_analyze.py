@@ -1014,7 +1014,7 @@ def test_seasonality_cli_controls_cover_all_month_classes(tmp_path: Path) -> Non
 
 
 def test_shared_month_effect_fit_uses_pre_effect_repeatability() -> None:
-    """Selection evidence is the pre-effect residual, never y - trend - s_m."""
+    """The exact repeated effect is measured pre-subtraction and still supports selection."""
     for shape, effect_months, expected in SEASONALITY_CONTROL_MATRIX:
         label = f"{shape}-{'.'.join(str(month) for month in sorted(effect_months)) or 'none'}"
         observations = _control_observations(shape, effect_months)
@@ -1024,15 +1024,9 @@ def test_shared_month_effect_fit_uses_pre_effect_repeatability() -> None:
         assert fit is not None, label
         assert sorted(fit.shared_effects) == list(range(1, 13))
         assert sorted(fit.pre_effect_residual) == list(range(1, 13))
-        selected = sorted(
-            month
-            for month in range(1, 13)
-            if fit.shared_effects[month] > 0
-            and all(
-                fit.pre_effect_residual[month][half_index] > 0
-                for half_index in (0, 1)
-            )
-        )
+        # Selection is exactly `s_m > 0` and, in both aligned halves,
+        # `r_pre(h, m) - s_m >= 0` - no threshold, tolerance, or band.
+        selected = sorted(_supported_months(fit))
         assert selected == expected, label
         assert sorted(fit.shared_effects) == list(range(1, 13))
         if expected:
@@ -1041,9 +1035,11 @@ def test_shared_month_effect_fit_uses_pre_effect_repeatability() -> None:
                 for half_index in (0, 1):
                     evidence = fit.pre_effect_residual[month][half_index]
                     assert evidence > 0, (label, month, half_index)
-                    # The evidence is measured BEFORE subtracting the shared effect:
-                    # `y - t_h(x) - s_m` collapses to exactly zero here, which a
-                    # strict > 0 selector would wrongly reject.
+                    # The evidence is measured BEFORE subtracting the shared effect,
+                    # so an exact repeated effect satisfies the shared estimate
+                    # exactly and its post-subtraction residual is exactly zero -
+                    # which the non-negative rule admits and a strict > 0 rule
+                    # would wrongly reject.
                     assert evidence - fit.shared_effects[month] == 0, (
                         label,
                         month,
@@ -1598,3 +1594,194 @@ def test_solve_exact_normal_equations_rejects_singular_system() -> None:
         analyze_trends.AnalysisError, match="singular|non-identifiable"
     ):
         analyze_trends._solve_exact_normal_equations(matrix, right_hand_side)
+
+
+# ---------------------------------------------------------------------------
+# One-sided (single aligned half) month-effect controls.
+#
+# The verifier's probe series is `y_i = 5000 + 3 * i` over 730 days with exactly
+# +200 added on every row whose calendar month is the probe month and whose
+# aligned half is previous-only, current-only, or both. A month effect present
+# in only one aligned half is a one-off event, not same-month YoY recurrence, so
+# the production selector must emit no month at all - not even a neighbour
+# fabricated from the same one-sided signal.
+# ---------------------------------------------------------------------------
+SEASONALITY_PROBE_MONTHS = (1, 4, 7, 12)
+SEASONALITY_PROBE_HALF_LABELS = ("previous", "current")
+SEASONALITY_PROBE_BASE_VIEWS = 5_000
+SEASONALITY_PROBE_TREND_STEP = 3
+
+SEASONALITY_ONE_SIDED_CASES: tuple[tuple[int, str], ...] = tuple(
+    (month, label)
+    for month in SEASONALITY_PROBE_MONTHS
+    for label in SEASONALITY_PROBE_HALF_LABELS
+)
+
+
+def _probe_half_index(current: date) -> int:
+    """Return the aligned-half index (0 = previous, 1 = current) of one probe day."""
+    previous, current_window = analyze_trends._aligned_year_windows(
+        [], SEASONALITY_CONTROL_END
+    )
+    if previous[0] <= current <= previous[1]:
+        return 0
+    if current_window[0] <= current <= current_window[1]:
+        return 1
+    raise AssertionError(f"probe day falls outside both aligned halves: {current}")
+
+
+def _probe_half_label(half_index: int) -> str:
+    return "previous" if half_index == 0 else "current"
+
+
+def _probe_daily_values(
+    effect_month: int, effect_halves: frozenset[str]
+) -> list[tuple[date, int]]:
+    values: list[tuple[date, int]] = []
+    for index in range(SEASONALITY_CONTROL_DAYS):
+        current = SEASONALITY_CONTROL_START + timedelta(days=index)
+        bumped = (
+            current.month == effect_month
+            and _probe_half_label(_probe_half_index(current)) in effect_halves
+        )
+        views = SEASONALITY_PROBE_BASE_VIEWS + SEASONALITY_PROBE_TREND_STEP * index
+        if bumped:
+            views += SEASONALITY_CONTROL_AMPLITUDE
+        values.append((current, views))
+    return values
+
+
+def _probe_rows(
+    effect_month: int, effect_halves: frozenset[str]
+) -> list[dict[str, object]]:
+    return [
+        {
+            "date": current.isoformat(),
+            "views": views,
+            "series_id": "control-series",
+            "project": "en.wikipedia",
+            "article": "Control_series",
+        }
+        for current, views in _probe_daily_values(effect_month, effect_halves)
+    ]
+
+
+def _probe_observations(
+    effect_month: int, effect_halves: frozenset[str]
+) -> list[analyze_trends.Observation]:
+    return [
+        analyze_trends.Observation(
+            date=current,
+            views=views,
+            series_id="control-series",
+            project="en.wikipedia",
+            article="Control_series",
+        )
+        for current, views in _probe_daily_values(effect_month, effect_halves)
+    ]
+
+
+def _supported_months(fit: analyze_trends.SharedMonthEffects) -> list[int]:
+    """Re-state the production support rule over the unchanged exact fitted values.
+
+    The rule is exactly `shared_effects[m] > 0` AND, for both aligned halves,
+    `pre_effect_residual[m][h] - shared_effects[m] >= 0`. There is no threshold,
+    tolerance, or amplitude band anywhere in the comparison.
+    """
+    return [
+        month
+        for month in range(1, 13)
+        if fit.shared_effects[month] > 0
+        and all(
+            fit.pre_effect_residual[month][half_index] - fit.shared_effects[month] >= 0
+            for half_index in (0, 1)
+        )
+    ]
+
+
+def test_seasonality_cli_rejects_all_previous_and_current_one_sided_month_effects_without_neighbors(
+    tmp_path: Path,
+) -> None:
+    """Every one-sided month effect emits exact [] through the production CLI."""
+    for index, (month, label) in enumerate(SEASONALITY_ONE_SIDED_CASES):
+        case_dir = tmp_path / f"case-{index}-month-{month}-{label}-only"
+        spec_path = _write_control_spec(
+            case_dir,
+            name=f"one-sided-month-{month}-{label}",
+            series=[_control_series_item("control-series", "Control_series")],
+        )
+        out_dir = case_dir / "out"
+        _write_series_csv(
+            out_dir / "series.csv",
+            _probe_rows(month, frozenset({label})),
+        )
+
+        assert _run_analyzer(spec_path, out_dir) == 0, (month, label)
+
+        document = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+        series = document["series"][0]
+        assert series["period"]["days"] == SEASONALITY_CONTROL_DAYS
+        # Complete-list equality: the injected month AND any neighbour the same
+        # one-sided signal would have dragged along must both be absent.
+        assert series["seasonality"] == {
+            "months": [],
+            "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+        }, (month, label)
+
+
+def test_shared_month_effect_support_requires_both_halves() -> None:
+    """One-sided effects fail the two-half support rule; repeated ones hold exactly."""
+    for month, label in SEASONALITY_ONE_SIDED_CASES:
+        observations = _probe_observations(month, frozenset({label}))
+        fit = analyze_trends._shared_month_effects(
+            observations, SEASONALITY_CONTROL_END
+        )
+        assert fit is not None, (month, label)
+        shared = fit.shared_effects[month]
+        assert shared > 0, (month, label, float(shared))
+        post = {
+            half_index: fit.pre_effect_residual[month][half_index] - shared
+            for half_index in (0, 1)
+        }
+        bumped_half = 0 if label == "previous" else 1
+        untouched_half = 1 - bumped_half
+        # Binding exact property: the two halves disagree in sign and one of them
+        # is negative, so "non-negative in BOTH halves" can never hold for an
+        # effect that exists in one half only. This is a property of the pair,
+        # not of any particular half label, and the selector does not require
+        # the bumped half to be positive.
+        assert (post[0] > 0) != (post[1] > 0), (month, label, post)
+        assert min(post[0], post[1]) < 0, (month, label, post)
+        # The exact joint fit's own sign convention: the half that carries the
+        # bump is positive after subtraction and the untouched half withholds
+        # the support. Recorded here so the algebra is falsifiable, not assumed.
+        assert post[bumped_half] > 0, (month, label, post)
+        assert post[untouched_half] < 0, (month, label, post)
+        assert _supported_months(fit) == [], (month, label, _supported_months(fit))
+        assert analyze_trends.compute_seasonality(
+            observations, SEASONALITY_CONTROL_END
+        )["months"] == [], (month, label)
+
+    for month in SEASONALITY_PROBE_MONTHS:
+        observations = _probe_observations(
+            month, frozenset(SEASONALITY_PROBE_HALF_LABELS)
+        )
+        fit = analyze_trends._shared_month_effects(
+            observations, SEASONALITY_CONTROL_END
+        )
+        assert fit is not None, month
+        shared = fit.shared_effects[month]
+        assert shared > 0, (month, float(shared))
+        for half_index in (0, 1):
+            # An exact repeated effect satisfies the shared estimate exactly, so
+            # the post-subtraction residual is exactly zero - which the
+            # non-negative rule admits, where a strict > 0 rule would not.
+            assert fit.pre_effect_residual[month][half_index] == shared, (month, half_index)
+            assert fit.pre_effect_residual[month][half_index] - shared == 0, (
+                month,
+                half_index,
+            )
+        assert _supported_months(fit) == [month], (month, _supported_months(fit))
+        assert analyze_trends.compute_seasonality(
+            observations, SEASONALITY_CONTROL_END
+        )["months"] == [month], month
