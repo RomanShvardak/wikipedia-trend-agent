@@ -8,6 +8,7 @@ transition before downstream spec authoring.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -526,7 +527,9 @@ def discover(
     for project in projects:
         effective_query = override_map.get(project, topic)
         query_source = "project_override" if project in override_map else "shared"
-        search_payload = _request_json(search_url(project, effective_query), headers, transport, pace)
+        search_payload = _request_json(
+            search_url(project, effective_query), headers, transport, pace
+        )
         search_hits = _search_hits(search_payload)
         if not search_hits:
             project_documents.append(
@@ -540,8 +543,12 @@ def discover(
                 )
             )
             continue
+        metadata_titles = [
+            effective_query,
+            *[cast(str, hit["title"]) for hit in search_hits],
+        ]
         metadata_payload = _request_json(
-            metadata_url(project, [effective_query, *[cast(str, hit["title"]) for hit in search_hits]]),
+            metadata_url(project, metadata_titles),
             headers,
             transport,
             pace,
@@ -607,6 +614,153 @@ def discover(
     return document, 2 if unresolved else 0
 
 
+def _confirmation_error(messages: Sequence[str]) -> tuple[None, int]:
+    print("resolver confirmation failed:", file=sys.stderr)
+    for message in messages:
+        print(f"- {message}", file=sys.stderr)
+    return None, 2
+
+
+def confirm(
+    *,
+    topic: str,
+    projects: Sequence[str],
+    topic_overrides: Sequence[tuple[str, str]],
+    selections: Mapping[str, str],
+    reason: str | None,
+    out: Path,
+) -> tuple[dict[str, object] | None, int]:
+    """Validate and transform the saved discovery manifest without network access."""
+    errors: list[str] = []
+    normalized_topic = topic.strip() if isinstance(topic, str) else ""
+    if not normalized_topic:
+        errors.append("topic must be a non-empty string")
+    requested_projects = list(projects)
+    if not requested_projects or any(
+        not isinstance(project, str) for project in requested_projects
+    ):
+        errors.append("confirmation requires the ordered project context")
+    if len(set(requested_projects)) != len(requested_projects):
+        errors.append("confirmation project context contains duplicates")
+
+    override_map: dict[str, str] = {}
+    for override_project, query in topic_overrides:
+        if override_project in override_map:
+            errors.append(
+                f"confirmation override context is duplicated for {override_project}"
+            )
+        if not isinstance(query, str) or not query:
+            errors.append(
+                f"confirmation override query is invalid for {override_project}"
+            )
+        override_map[override_project] = query
+    if set(override_map) - set(requested_projects):
+        errors.append("confirmation override context contains an unrequested project")
+
+    try:
+        decoded = json.loads(out.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _confirmation_error(["discovery manifest does not exist"])
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _confirmation_error(["discovery manifest is not valid UTF-8 JSON"])
+    if not isinstance(decoded, dict):
+        return _confirmation_error(["discovery manifest must be a JSON object"])
+    document = cast(dict[str, object], decoded)
+    if document.get("contract_version") != CONTRACT_VERSION:
+        errors.append("discovery manifest has the wrong contract_version")
+    if document.get("run_mode") != "discover":
+        errors.append("discovery manifest must have run_mode='discover'")
+    if document.get("status") != "awaiting_confirmation":
+        errors.append("discovery manifest must have status='awaiting_confirmation'")
+    if document.get("topic") != normalized_topic:
+        errors.append("topic does not match the saved discovery context")
+
+    saved_projects_value = document.get("projects")
+    if not isinstance(saved_projects_value, list):
+        return _confirmation_error([*errors, "discovery manifest projects must be a list"])
+    saved_projects: list[dict[str, object]] = []
+    for index, raw_project in enumerate(saved_projects_value):
+        if not isinstance(raw_project, dict):
+            errors.append(f"saved project {index} must be an object")
+            continue
+        saved_projects.append(cast(dict[str, object], raw_project))
+    saved_codes = [project.get("project") for project in saved_projects]
+    if saved_codes != requested_projects:
+        errors.append("ordered project context does not match the saved discovery manifest")
+
+    selection_projects = set(selections)
+    requested_set = set(requested_projects)
+    if selection_projects != requested_set:
+        missing = sorted(requested_set - selection_projects)
+        extra = sorted(selection_projects - requested_set)
+        if missing:
+            errors.append(f"missing selection for project: {', '.join(missing)}")
+        if extra:
+            errors.append(f"selection contains unrequested project: {', '.join(extra)}")
+
+    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
+    selected_candidates: dict[str, dict[str, object]] = {}
+    for saved_project in saved_projects:
+        code = saved_project.get("project")
+        if not isinstance(code, str) or code not in requested_set:
+            continue
+        expected_query = override_map.get(code, normalized_topic)
+        expected_source = "project_override" if code in override_map else "shared"
+        if saved_project.get("effective_query") != expected_query:
+            errors.append(f"effective_query does not match for project: {code}")
+        if saved_project.get("query_source") != expected_source:
+            errors.append(f"query_source does not match for project: {code}")
+        if saved_project.get("selection") is not None:
+            errors.append(f"saved project already has a selection: {code}")
+        status = saved_project.get("status")
+        if status not in {"ready", "ambiguous"}:
+            errors.append(f"saved project is not confirmable: {code}")
+        if status == "ambiguous" and normalized_reason is None:
+            errors.append(f"ambiguous project requires a reason: {code}")
+        selected_article = selections.get(code)
+        if not isinstance(selected_article, str) or not selected_article:
+            errors.append(f"selection article must be a non-empty string: {code}")
+            continue
+        candidates = saved_project.get("candidates")
+        if not isinstance(candidates, list):
+            errors.append(f"saved candidates must be a list: {code}")
+            continue
+        matches = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and candidate.get("status") == "selectable"
+            and candidate.get("article") == selected_article
+        ]
+        if len(matches) != 1:
+            errors.append(f"selection is not one exact saved candidate: {code}={selected_article}")
+            continue
+        candidate = cast(dict[str, object], matches[0])
+        title = candidate.get("title")
+        if not isinstance(title, str) or not title:
+            errors.append(f"selected candidate has an invalid title: {code}")
+            continue
+        selected_candidates[code] = candidate
+
+    if errors:
+        return _confirmation_error(errors)
+
+    confirmed = copy.deepcopy(document)
+    confirmed["run_mode"] = "confirm"
+    confirmed["status"] = "confirmed"
+    confirmed_projects = cast(list[dict[str, object]], confirmed["projects"])
+    for confirmed_project in confirmed_projects:
+        code = cast(str, confirmed_project["project"])
+        candidate = selected_candidates[code]
+        confirmed_project["selection"] = {
+            "article": candidate["article"],
+            "title": candidate["title"],
+            "reason": normalized_reason,
+            "source": "model_confirmation",
+        }
+    return confirmed, 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topic", required=True, help="shared natural-language topic")
@@ -646,9 +800,23 @@ def main(
         print(error, file=sys.stderr)
         return 2
 
-    if selections:
-        print("confirmation is not available in this build", file=sys.stderr)
-        return 2
+    if args.select:
+        try:
+            document, exit_code = confirm(
+                topic=args.topic,
+                projects=projects,
+                topic_overrides=overrides,
+                selections=selections,
+                reason=args.reason,
+                out=Path(args.out),
+            )
+        except (ResolveInputError, TypeError, ValueError) as error:
+            print(f"resolver confirmation failed: {error}", file=sys.stderr)
+            return 2
+        if document is not None and exit_code == 0:
+            common.dump_json(document, args.out)
+            print(f"Resolver confirmed: {args.out}")
+        return exit_code
 
     try:
         document, exit_code = discover(
