@@ -1913,3 +1913,30 @@ def test_publication_failure_preserves_bytes_and_removes_staging_file(
     assert list(out.parent.glob(".resolved.json.*.tmp")) == []
 
 
+def test_oversized_response_becomes_bounded_project_error_without_cache(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    stub = transport_stub(
+        [
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+        ]
+    )
+
+    def oversized(url, headers, timeout):
+        if url.startswith("https://wikimedia.org/api/rest_v1/"):
+            raise common.ResponseTooLarge("resolver response exceeds byte limit")
+        return stub(url, headers, timeout)
+
+    assert resolve_articles.main(_args(out), transport=oversized, today_utc=TODAY) == 1
+
+    project = json.loads(out.read_text(encoding="utf-8"))["projects"][0]
+    assert project["error"]["code"] == "response_too_large"
+    aqs_url = series_url(
+        "en.wikipedia", "Intermittent_fasting", "20260826", "20260924"
+    )
+    assert not common.cache_path_for_key(common.cache_key_for_url(aqs_url)).exists()
+
+

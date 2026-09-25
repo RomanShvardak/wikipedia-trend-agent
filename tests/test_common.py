@@ -63,8 +63,9 @@ def test_user_agent_rejects_controls_and_unreasonable_length(monkeypatch, value)
     # validator itself is exercised for every C0/C1 code point class.
     monkeypatch.setattr(common.os, "environ", {"WTI_USER_AGENT": value})
 
-    with pytest.raises(SystemExit, match="User-Agent"):
+    with pytest.raises(SystemExit, match="User-Agent") as raised:
         user_agent()
+    assert "invalid_ua" in str(raised.value)
 
 
 def test_cache_key_deterministic():
