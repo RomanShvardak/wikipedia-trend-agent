@@ -855,3 +855,106 @@ def test_analyzer_uses_data_parsers_without_dynamic_execution() -> None:
             assert not {alias.name.split(".")[0] for alias in node.names} & forbidden_imports
         if isinstance(node, ast.ImportFrom):
             assert (node.module or "").split(".")[0] not in forbidden_imports
+
+
+def test_spec_window_rejects_out_of_range_dates(tmp_path: Path) -> None:
+    """Only observations inside the validated inclusive spec window are accepted."""
+    spec_path = _write_spec(tmp_path)
+    valid_dates = (date(2022, 1, 1), date(2025, 12, 30))
+    invalid_dates = (date(2021, 12, 31), date(2025, 12, 31))
+
+    for observed_date in valid_dates:
+        out_dir = tmp_path / f"valid-{observed_date.isoformat()}"
+        _write_series_csv(
+            out_dir / "series.csv",
+            [
+                {
+                    "date": observed_date.isoformat(),
+                    "views": 10,
+                    "series_id": "en-example",
+                    "project": "en.wikipedia",
+                    "article": "Example_article",
+                }
+            ],
+        )
+        assert _run_analyzer(spec_path, out_dir) == 0
+
+    for observed_date in invalid_dates:
+        out_dir = tmp_path / f"invalid-{observed_date.isoformat()}"
+        _write_series_csv(
+            out_dir / "series.csv",
+            [
+                {
+                    "date": observed_date.isoformat(),
+                    "views": 10,
+                    "series_id": "en-example",
+                    "project": "en.wikipedia",
+                    "article": "Example_article",
+                }
+            ],
+        )
+        metrics_path = out_dir / "metrics.json"
+        metrics_path.write_bytes(b'{"sentinel":"preserve"}\n')
+        assert _run_analyzer(spec_path, out_dir) == 1
+        assert metrics_path.read_bytes() == b'{"sentinel":"preserve"}\n'
+
+
+def test_views_cell_rejects_overlong_integers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exact 20-digit boundary is accepted and longer cells stay on the error path."""
+    spec_path = _write_spec(tmp_path)
+    for label, views, expected_status in (
+        ("boundary", "9" * 20, 0),
+        ("overlong", "9" * 5000, 1),
+    ):
+        out_dir = tmp_path / label
+        _write_series_csv(
+            out_dir / "series.csv",
+            [
+                {
+                    "date": "2024-01-01",
+                    "views": views,
+                    "series_id": "en-example",
+                    "project": "en.wikipedia",
+                    "article": "Example_article",
+                }
+            ],
+        )
+        metrics_path = out_dir / "metrics.json"
+        metrics_path.write_bytes(b"sentinel")
+        status = 0
+        try:
+            status = _run_analyzer(spec_path, out_dir)
+        except ValueError:
+            status = 0
+        assert status == expected_status
+        if expected_status == 1:
+            captured = capsys.readouterr()
+            assert "analysis failed:" in captured.err
+            assert f"row 2:" in captured.err
+            assert metrics_path.read_bytes() == b"sentinel"
+        else:
+            assert json.loads(metrics_path.read_text(encoding="utf-8"))["series"]
+
+
+def test_missing_seasonality_month_is_unavailable_above_row_floor() -> None:
+    """A missing calendar month blocks seasonality even above the 80% row floor."""
+    end = date(2025, 12, 30)
+    observations = _constant_observations(date(2024, 1, 1), 730)
+    previous_start = date(2024, 1, 1)
+    previous_end = date(2024, 12, 31)
+    missing_month = [row for row in observations if row.date.month != 2 and row.date <= previous_end]
+    current_half = [row for row in observations if row.date > previous_end]
+    assert len(missing_month) >= math.ceil(0.8 * 365)
+    assert len(current_half) >= math.ceil(0.8 * 365)
+    assert previous_start <= observations[0].date <= previous_end
+
+    growth = analyze_trends.compute_growth_for_days(observations, end, 365)
+    seasonality = analyze_trends.compute_seasonality(missing_month + current_half, end)
+
+    assert growth["pct"] == 0.0
+    assert seasonality == {
+        "months": [],
+        "note": analyze_trends.SEASONALITY_UNAVAILABLE_NOTE,
+    }
