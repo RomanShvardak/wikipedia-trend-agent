@@ -57,7 +57,7 @@ SEASONALITY_UNAVAILABLE_NOTE = (
 )
 SEASONALITY_NO_PEAKS_NOTE = "no recurring peak months identified"
 SEASONALITY_AVAILABLE_NOTE = (
-    "recurring peaks are above the monthly median in both aligned years"
+    "recurring peaks have positive complete-half detrended residuals in both aligned years"
 )
 
 
@@ -397,14 +397,40 @@ def comparison_crosses_methodology_break(
 
 def _monthly_means(
     observations: Sequence[Observation], start: date, end: date
-) -> list[float] | None:
-    values: dict[int, list[int | float]] = {month: [] for month in range(1, 13)}
+) -> dict[int, tuple[Fraction, Fraction]] | None:
+    values: dict[int, list[tuple[int, int]]] = {month: [] for month in range(1, 13)}
     for observation in observations:
         if start <= observation.date <= end:
-            values[observation.date.month].append(observation.views)
+            values[observation.date.month].append(
+                (int(observation.views), (observation.date - start).days)
+            )
     if any(not month_values for month_values in values.values()):
         return None
-    return [sum(month_values) / len(month_values) for month_values in values.values()]
+    return {
+        month: (
+            Fraction(sum(value for value, _ in month_values), len(month_values)),
+            Fraction(sum(offset for _, offset in month_values), len(month_values)),
+        )
+        for month, month_values in values.items()
+    }
+
+
+def _detrended_monthly_means(
+    monthly_means: dict[int, tuple[Fraction, Fraction]],
+) -> dict[int, Fraction]:
+    chronological = sorted(
+        monthly_means.items(), key=lambda item: item[1][1]
+    )
+    _, (first_mean, first_offset) = chronological[0]
+    _, (last_mean, last_offset) = chronological[-1]
+    offset_span = last_offset - first_offset
+    residuals: dict[int, Fraction] = {}
+    for month, (monthly_mean, month_offset) in chronological:
+        baseline = first_mean + (last_mean - first_mean) * (
+            (month_offset - first_offset) / offset_span
+        )
+        residuals[month] = monthly_mean - baseline
+    return {month: residuals[month] for month in sorted(residuals)}
 
 
 def compute_seasonality(
@@ -418,14 +444,12 @@ def compute_seasonality(
     current_means = _monthly_means(observations, *current)
     if previous_means is None or current_means is None:
         return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
-    previous_median = median(previous_means)
-    current_median = median(current_means)
+    previous_residuals = _detrended_monthly_means(previous_means)
+    current_residuals = _detrended_monthly_means(current_means)
     months = [
         month
-        for month, (previous_mean, current_mean) in enumerate(
-            zip(previous_means, current_means), start=1
-        )
-        if previous_mean > previous_median and current_mean > current_median
+        for month in range(1, 13)
+        if previous_residuals[month] > 0 and current_residuals[month] > 0
     ]
     note = SEASONALITY_AVAILABLE_NOTE if months else SEASONALITY_NO_PEAKS_NOTE
     return {"months": months, "note": note}

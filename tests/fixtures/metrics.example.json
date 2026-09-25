@@ -9,8 +9,8 @@
       "article": "Post_przerywany",
       "label": "Польська: інтервальне голодування",
       "language": "pl",
-      "total_views": 833112,
-      "avg_daily_views": 1144.4,
+      "total_views": 1720628,
+      "avg_daily_views": 2363.5,
       "period": {
         "start": "2024-09-23",
         "end": "2026-09-20",
@@ -18,23 +18,23 @@
       },
       "growth": {
         "m3": {
-          "pct": 5.7,
-          "abs": 64,
+          "pct": 3.5,
+          "abs": 91,
           "start": "2026-06-22",
           "end": "2026-09-20",
           "clean": {
-            "pct": 5.7,
-            "abs": 64
+            "pct": 3.5,
+            "abs": 91
           }
         },
         "y1": {
-          "pct": 1.4,
-          "abs": 16,
+          "pct": 16.7,
+          "abs": 364,
           "start": "2025-09-21",
           "end": "2026-09-20",
           "clean": {
-            "pct": 1.4,
-            "abs": 16
+            "pct": 16.7,
+            "abs": 364
           }
         },
         "y2": {
@@ -51,7 +51,7 @@
         }
       },
       "anomaly_share": 0.0,
-      "trend_direction": "flat",
+      "trend_direction": "up",
       "confidence": "high",
       "confidence_reasons": [
         "period at least 91 days",
@@ -59,15 +59,8 @@
         "no anomalies detected"
       ],
       "seasonality": {
-        "months": [
-          7,
-          8,
-          9,
-          10,
-          11,
-          12
-        ],
-        "note": "recurring peaks are above the monthly median in both aligned years"
+        "months": [],
+        "note": "no recurring peak months identified"
       },
       "anomalies": []
     },
@@ -77,8 +70,8 @@
       "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
       "label": "Чеська: інтервальне голодування",
       "language": "cs",
-      "total_views": 1532286,
-      "avg_daily_views": 2104.8,
+      "total_views": 992628,
+      "avg_daily_views": 1363.5,
       "period": {
         "start": "2024-09-23",
         "end": "2026-09-20",
@@ -86,23 +79,23 @@
       },
       "growth": {
         "m3": {
-          "pct": 2.2,
-          "abs": 47,
+          "pct": 5.7,
+          "abs": 91,
           "start": "2026-06-22",
           "end": "2026-09-20",
           "clean": {
-            "pct": 2.2,
-            "abs": 47
+            "pct": 5.7,
+            "abs": 91
           }
         },
         "y1": {
-          "pct": 0.4,
-          "abs": 8,
+          "pct": 30.8,
+          "abs": 364,
           "start": "2025-09-21",
           "end": "2026-09-20",
           "clean": {
-            "pct": 0.4,
-            "abs": 8
+            "pct": 30.8,
+            "abs": 364
           }
         },
         "y2": {
@@ -119,7 +112,7 @@
         }
       },
       "anomaly_share": 0.0,
-      "trend_direction": "flat",
+      "trend_direction": "up",
       "confidence": "high",
       "confidence_reasons": [
         "period at least 91 days",
@@ -127,15 +120,8 @@
         "no anomalies detected"
       ],
       "seasonality": {
-        "months": [
-          7,
-          8,
-          9,
-          10,
-          11,
-          12
-        ],
-        "note": "recurring peaks are above the monthly median in both aligned years"
+        "months": [],
+        "note": "no recurring peak months identified"
       },
       "anomalies": []
     }
