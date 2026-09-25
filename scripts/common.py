@@ -198,9 +198,6 @@ def read_json_cache(
         _remove_cache_path(path)
         return None
 
-    if datetime.now(timezone.utc) - fetched_at > timedelta(hours=ttl_hours):
-        return None
-
     try:
         validated = validate(response)
     except (TypeError, ValueError, KeyError):
@@ -208,6 +205,8 @@ def read_json_cache(
         return None
     if validated is None:
         _remove_cache_path(path)
+        return None
+    if datetime.now(timezone.utc) - fetched_at > timedelta(hours=ttl_hours):
         return None
     return validated
 
