@@ -303,3 +303,16 @@ def test_json_cache_validator_rejection_removes_http_200_error_envelope(tmp_path
 
     assert common.read_json_cache(url, 24.0, _accept_items) is None
     assert not path.exists()
+
+
+def test_json_cache_removes_stale_validator_rejected_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(common, "CACHE_DIR", tmp_path / "cache")
+    url = "https://example.test/api?stale-error=1"
+    path = common.write_json_cache(
+        url,
+        {"errors": [{"code": "ratelimited", "text": "too many requests"}]},
+        fetched_at=datetime.now(timezone.utc) - timedelta(days=2),
+    )
+
+    assert common.read_json_cache(url, 1.0, _accept_items) is None
+    assert not path.exists()
