@@ -33,6 +33,7 @@ METHODOLOGY_BREAK = date(2015, 5, 1)
 DIRECTION_BAND_PCT = 10.0
 MAX_CSV_BYTES = 16 * 1024 * 1024
 MAX_OBSERVATIONS = 50_000
+MAX_VIEWS_DIGITS = 20
 
 INSUFFICIENT_OBSERVATIONS_REASON = "insufficient observations in one or both equal-length windows"
 ZERO_PREVIOUS_MEAN_REASON = "previous equal-length window has zero mean"
@@ -96,6 +97,39 @@ def _parse_iso_date(value: str, row_number: int) -> date:
         raise AnalysisError(f"row {row_number}: date must be YYYY-MM-DD") from error
 
 
+def _parse_views_cell(views_text: str, row_number: int) -> int:
+    if not views_text.isascii() or not views_text.isdigit():
+        raise AnalysisError(f"row {row_number}: views must be a non-negative integer")
+    if len(views_text) > MAX_VIEWS_DIGITS:
+        raise AnalysisError(
+            f"row {row_number}: views must contain at most {MAX_VIEWS_DIGITS} digits"
+        )
+    try:
+        return int(views_text)
+    except ValueError as error:
+        raise AnalysisError(f"row {row_number}: views must be a non-negative integer") from error
+
+
+def _spec_window_bounds(spec: Mapping[str, Any]) -> tuple[date, date]:
+    window = spec.get("window")
+    if not isinstance(window, Mapping):
+        raise AnalysisError("spec.window must be an object")
+    start_text = window.get("start")
+    end_text = window.get("end")
+    if not isinstance(start_text, str) or not isinstance(end_text, str):
+        raise AnalysisError("spec.window must contain string start and end bounds")
+    try:
+        start = date(
+            int(start_text[0:4]), int(start_text[4:6]), int(start_text[6:8])
+        )
+        end = date(int(end_text[0:4]), int(end_text[4:6]), int(end_text[6:8]))
+    except ValueError as error:
+        raise AnalysisError("spec.window bounds must be valid YYYYMMDD dates") from error
+    if end < start:
+        raise AnalysisError("spec.window end must not precede start")
+    return start, end
+
+
 def load_series_csv(
     path: str | Path, spec: Mapping[str, Any]
 ) -> dict[str, list[Observation]]:
@@ -111,6 +145,7 @@ def load_series_csv(
         raise AnalysisError(f"series CSV exceeds {MAX_CSV_BYTES} bytes")
 
     spec_series = _as_spec_series(spec)
+    window_start, window_end = _spec_window_bounds(spec)
     grouped: dict[str, list[Observation]] = {series_id: [] for series_id in spec_series}
     seen: set[tuple[str, date]] = set()
     row_count = 0
@@ -148,12 +183,12 @@ def load_series_csv(
                     raise AnalysisError(
                         f"row {row_number}: project/article do not match spec for {series_id}"
                     )
-                if not views_text.isascii() or not views_text.isdigit():
-                    raise AnalysisError(
-                        f"row {row_number}: views must be a non-negative integer"
-                    )
-                views = int(views_text)
+                views = _parse_views_cell(views_text, row_number)
                 observed_date = _parse_iso_date(date_text, row_number)
+                if not window_start <= observed_date <= window_end:
+                    raise AnalysisError(
+                        f"row {row_number}: date is outside the inclusive spec window"
+                    )
                 identity = (series_id, observed_date)
                 if identity in seen:
                     raise AnalysisError(
@@ -343,15 +378,14 @@ def comparison_crosses_methodology_break(
 
 def _monthly_means(
     observations: Sequence[Observation], start: date, end: date
-) -> list[float]:
+) -> list[float] | None:
     values: dict[int, list[int | float]] = {month: [] for month in range(1, 13)}
     for observation in observations:
         if start <= observation.date <= end:
             values[observation.date.month].append(observation.views)
-    return [
-        sum(month_values) / len(month_values) if month_values else 0.0
-        for month_values in values.values()
-    ]
+    if any(not month_values for month_values in values.values()):
+        return None
+    return [sum(month_values) / len(month_values) for month_values in values.values()]
 
 
 def compute_seasonality(
@@ -363,6 +397,8 @@ def compute_seasonality(
         return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
     previous_means = _monthly_means(observations, *previous)
     current_means = _monthly_means(observations, *current)
+    if previous_means is None or current_means is None:
+        return {"months": [], "note": SEASONALITY_UNAVAILABLE_NOTE}
     previous_median = median(previous_means)
     current_median = median(current_means)
     months = [
