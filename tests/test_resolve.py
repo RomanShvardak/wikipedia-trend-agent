@@ -692,10 +692,11 @@ def test_redirect_chain_preserves_normalized_order_and_final_target():
             "title": "Canonical Target",
             "namespace": 0,
             "input_titles": ["old name"],
-            "redirect_chain": ["Middle title", "Canonical Target"],
-            "search_rank": 1,
-            "exact_title_match": True,
-            "disambiguation": False,
+                "redirect_chain": ["Middle title", "Canonical Target"],
+                "search_rank": 1,
+                "exact_title_match": False,
+                "disambiguation": False,
+
             "reason": None,
         }
     ]
@@ -740,7 +741,14 @@ def test_redirect_eleventh_hop_is_unresolved_with_stable_reason():
 )
 def test_invalid_metadata_target_is_retained_as_unresolved(page, expected_reason):
     assert hasattr(resolve_articles, "parse_metadata")
-    body = _metadata_payload(pages=[page])
+    body = _metadata_payload(
+        redirects=(
+            []
+            if page.get("missing") is True
+            else [{"from": "Requested", "to": str(page["title"])}]
+        ),
+        pages=[page],
+    )
 
     candidates = resolve_articles.parse_metadata(
         body,

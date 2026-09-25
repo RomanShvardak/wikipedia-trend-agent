@@ -324,72 +324,165 @@ def _mapping_from_list(payload: dict[str, object], key: str) -> dict[str, str]:
     return mapping
 
 
-def _follow_title(
+def follow_redirects(
     start: str,
     normalized: Mapping[str, str],
     redirects: Mapping[str, str],
+    max_hops: int = MAX_REDIRECT_HOPS,
 ) -> tuple[str, list[str], str | None]:
+    """Reconstruct one normalized redirect chain with cycle and depth guards."""
+    if isinstance(max_hops, bool) or not isinstance(max_hops, int) or max_hops < 0:
+        raise ResolveInputError("max_hops must be a non-negative integer")
     title = normalized.get(start, start)
     chain: list[str] = []
     seen = {title}
-    for _hop in range(MAX_REDIRECT_HOPS + 1):
+    while True:
         target = redirects.get(title)
         if target is None:
             return title, chain, None
-        if target in seen:
-            return title, chain, "redirect_cycle"
         chain.append(target)
+        if target in seen:
+            return target, chain, "redirect_cycle"
+        if len(chain) > max_hops:
+            return target, chain, "redirect_too_deep"
         seen.add(target)
         title = target
-        if len(chain) > MAX_REDIRECT_HOPS:
-            return title, chain, "redirect_too_deep"
-    return title, chain, "redirect_too_deep"
 
 
-def _metadata_candidates(
-    payload: dict[str, object],
+def _unresolved_candidate(
     *,
+    input_title: str,
+    search_rank: int,
+    final_title: str,
+    redirect_chain: list[str],
+    reason: str,
+    namespace: int | None = None,
+    disambiguation: bool = False,
+    exact_title_match: bool = False,
+) -> dict[str, object]:
+    return {
+        "status": "unresolved",
+        "article": None,
+        "title": final_title,
+        "namespace": namespace,
+        "input_titles": [input_title],
+        "redirect_chain": redirect_chain,
+        "search_rank": search_rank,
+        "exact_title_match": exact_title_match,
+        "disambiguation": disambiguation,
+        "reason": reason,
+    }
+
+
+def parse_metadata(
+    body: bytes | Mapping[str, object],
+    search_titles: Sequence[Mapping[str, object]],
     effective_query: str,
-    search_hits: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
-    query = payload.get("query")
-    if not isinstance(query, dict):
-        raise ResolveResponseError("Action metadata response is missing query object")
-    pages = cast(dict[str, object], query).get("pages")
+    """Classify every search hit against its final redirect and page target."""
+    payload = (
+        parse_action_payload(body, "query")
+        if isinstance(body, bytes)
+        else dict(body)
+    )
+    if "query" not in payload:
+        raise ResolveResponseError("Action metadata response is missing 'query'")
+    query = cast(dict[str, object], payload["query"])
+    pages = query.get("pages")
     if not isinstance(pages, list):
         raise ResolveResponseError("Action metadata response is missing query.pages list")
+
     page_by_title: dict[str, dict[str, object]] = {}
     for index, raw_page in enumerate(pages):
         if not isinstance(raw_page, dict):
             raise ResolveResponseError(f"metadata page {index} must be an object")
         page_object = cast(dict[str, object], raw_page)
+        if page_object.get("missing") is True:
+            continue
         title = _clean_text(page_object.get("title"), f"metadata page {index} title")
+        if title in page_by_title:
+            raise ResolveResponseError(f"metadata response repeats page title: {title}")
         page_by_title[title] = page_object
 
     normalized = _mapping_from_list(payload, "normalized")
     redirects = _mapping_from_list(payload, "redirects")
     exact_normalized_query = normalized.get(effective_query, effective_query)
     grouped: dict[str, dict[str, object]] = {}
-    for raw_hit in search_hits:
-        raw_title = cast(str, raw_hit["title"])
-        rank = cast(int, raw_hit["rank"])
-        final_title, redirect_chain, redirect_error = _follow_title(
+    candidates: list[dict[str, object]] = []
+
+    for hit_index, raw_hit in enumerate(search_titles):
+        raw_title = _clean_text(raw_hit.get("title"), f"search title {hit_index}")
+        raw_rank = raw_hit.get("rank")
+        if isinstance(raw_rank, bool) or not isinstance(raw_rank, int) or raw_rank < 1:
+            raise ResolveResponseError(f"search title {hit_index} has an invalid rank")
+        final_title, redirect_chain, redirect_error = follow_redirects(
             raw_title, normalized, redirects
         )
         page = page_by_title.get(final_title)
-        if redirect_error is not None or page is None:
-            raise ResolveResponseError(
-                redirect_error or f"metadata target is missing for search hit {rank}"
+        if redirect_error is not None:
+            candidates.append(
+                _unresolved_candidate(
+                    input_title=raw_title,
+                    search_rank=raw_rank,
+                    final_title=final_title,
+                    redirect_chain=redirect_chain,
+                    reason=redirect_error,
+                    exact_title_match=exact_normalized_query == final_title
+                    and not redirect_chain,
+                )
             )
-        namespace = page.get("ns")
-        if isinstance(namespace, bool) or namespace != 0:
-            raise ResolveResponseError(f"metadata target for search hit {rank} is not namespace 0")
+            continue
+        if page is None:
+            candidates.append(
+                _unresolved_candidate(
+                    input_title=raw_title,
+                    search_rank=raw_rank,
+                    final_title=final_title,
+                    redirect_chain=redirect_chain,
+                    reason="missing_target",
+                )
+            )
+            continue
+
+        namespace_value = page.get("ns")
+        if isinstance(namespace_value, bool) or namespace_value != 0:
+            candidates.append(
+                _unresolved_candidate(
+                    input_title=raw_title,
+                    search_rank=raw_rank,
+                    final_title=final_title,
+                    redirect_chain=redirect_chain,
+                    reason="non_article_namespace",
+                    namespace=(
+                        namespace_value
+                        if isinstance(namespace_value, int)
+                        and not isinstance(namespace_value, bool)
+                        else None
+                    ),
+                )
+            )
+            continue
+
         page_props = page.get("pageprops")
         if page_props is not None and not isinstance(page_props, dict):
             raise ResolveResponseError("metadata pageprops must be an object")
-        if isinstance(page_props, dict) and "disambiguation" in page_props:
-            raise ResolveResponseError("metadata target is a disambiguation page")
+        is_disambiguation = isinstance(page_props, dict) and "disambiguation" in page_props
+        if is_disambiguation:
+            candidates.append(
+                _unresolved_candidate(
+                    input_title=raw_title,
+                    search_rank=raw_rank,
+                    final_title=final_title,
+                    redirect_chain=redirect_chain,
+                    reason="disambiguation_page",
+                    namespace=0,
+                    disambiguation=True,
+                )
+            )
+            continue
+
         article = canonical_article(final_title)
+        exact_title_match = exact_normalized_query == final_title and not redirect_chain
         existing = grouped.get(article)
         if existing is None:
             grouped[article] = {
@@ -399,9 +492,8 @@ def _metadata_candidates(
                 "namespace": 0,
                 "input_titles": [raw_title],
                 "redirect_chain": redirect_chain,
-                "search_rank": rank,
-                "exact_title_match": exact_normalized_query == final_title
-                and not redirect_chain,
+                "search_rank": raw_rank,
+                "exact_title_match": exact_title_match,
                 "disambiguation": False,
                 "reason": None,
             }
@@ -409,13 +501,18 @@ def _metadata_candidates(
             input_titles = cast(list[str], existing["input_titles"])
             if raw_title not in input_titles:
                 input_titles.append(raw_title)
-            existing["search_rank"] = min(cast(int, existing["search_rank"]), rank)
+            existing["search_rank"] = min(cast(int, existing["search_rank"]), raw_rank)
+            existing["exact_title_match"] = (
+                cast(bool, existing["exact_title_match"]) or exact_title_match
+            )
+
+    candidates.extend(grouped.values())
     return sorted(
-        grouped.values(),
+        candidates,
         key=lambda candidate: (
             cast(int, candidate["search_rank"]),
             not cast(bool, candidate["exact_title_match"]),
-            cast(str, candidate["article"]),
+            cast(str, candidate["article"] or ""),
         ),
     )
 
@@ -553,11 +650,7 @@ def discover(
             transport,
             pace,
         )
-        candidates = _metadata_candidates(
-            metadata_payload,
-            effective_query=effective_query,
-            search_hits=search_hits,
-        )
+        candidates = parse_metadata(metadata_payload, search_hits, effective_query)
         for candidate in candidates:
             article = cast(str, candidate["article"])
             url = fetch_pageviews.series_url(
@@ -575,9 +668,7 @@ def discover(
                 end=end,
             )
         selectable = [candidate for candidate in candidates if candidate["status"] == "selectable"]
-        if not selectable:
-            raise ResolveResponseError("no selectable canonical candidates")
-        status = "ready" if len(selectable) == 1 else "ambiguous"
+        status = "ready" if len(selectable) == 1 else "ambiguous" if selectable else "unresolved"
         recommendation = cast(str, selectable[0]["article"]) if len(selectable) == 1 else None
         project_documents.append(
             {
