@@ -239,7 +239,7 @@ def test_search_url_uses_exact_unicode_without_normalization():
     )
     assert parse_qs(parsed.query)["srsearch"] == [query]
     assert "srwhat" not in parse_qs(parsed.query)
-    assert resolve_articles.canonical_article("Cafe\u0301 東京") == "Cafe%CC%81%20%E6%9D%B1%E4%BA%AC"
+    assert resolve_articles.canonical_article("Cafe\u0301 東京") == "Cafe%CC%81_%E6%9D%B1%E4%BA%AC"
 
 
 def test_preflight_rejects_empty_topic_before_user_agent_and_transport(
