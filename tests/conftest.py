@@ -15,6 +15,36 @@ import pytest  # noqa: E402  (after the shim — deliberate)
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
+def _forbidden_transport(url: str, headers: dict[str, str], timeout: float = 30.0) -> None:
+    """Fail immediately if a zero-network test attempts an HTTP exchange."""
+    raise AssertionError("network access is forbidden in resolver tests")
+
+
+def _resolve_fixture(name: str) -> bytes:
+    """Read one committed fixture without allowing path or symlink escape."""
+    requested = Path(name)
+    fixture_root = FIXTURES_DIR.resolve()
+    assert not requested.is_absolute(), "fixture name must be relative"
+    assert requested.name == name, "fixture name must not contain directories"
+    assert requested.suffix == ".json", "fixture name must end in .json"
+    candidate = (fixture_root / requested).resolve()
+    assert candidate.parent == fixture_root, "fixture path escapes the fixture directory"
+    assert candidate.is_file(), f"fixture does not exist: {name}"
+    return candidate.read_bytes()
+
+
+@pytest.fixture
+def forbidden_transport():
+    """Return a transport callable that rejects its first invocation."""
+    return _forbidden_transport
+
+
+@pytest.fixture
+def resolve_fixture():
+    """Return the contained committed-fixture loader."""
+    return _resolve_fixture
+
+
 class StubResponse:
     """TransportResponse-like object served by the transport stub (status/headers/body).
 
