@@ -1938,5 +1938,3 @@ def test_oversized_response_becomes_bounded_project_error_without_cache(
         "en.wikipedia", "Intermittent_fasting", "20260826", "20260924"
     )
     assert not common.cache_path_for_key(common.cache_key_for_url(aqs_url)).exists()
-
-
