@@ -117,7 +117,7 @@ def test_single_project_tracer(
     stub = transport_stub(
         [
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, _volume_body(resolve_fixture)),
         ]
     )
@@ -155,7 +155,19 @@ def test_single_project_tracer(
     }
     metadata_params = parse_qs(urlparse(stub.calls[1][0]).query)
     assert metadata_params["redirects"] == ["1"]
-    assert metadata_params["titles"] == ["intermittent fasting|Intermittent fasting"]
+    # Derived from the committed search evidence so a refreshed capture cannot
+    # silently desync the batched metadata request: the raw topic first, then one
+    # entry per ordered ns=0 hit. The real `srlimit=5` response is captured
+    # separately as resolve.search.batched.en.wikipedia.json evidence.
+    search_fixture = json.loads(
+        _response_body(resolve_fixture, "resolve.search.en.wikipedia.json").decode("utf-8")
+    )
+    hit_titles = [hit["title"] for hit in search_fixture["query"]["search"]]
+    assert hit_titles == ["Intermittent fasting"]
+    assert all(hit["ns"] == 0 for hit in search_fixture["query"]["search"])
+    assert metadata_params["titles"] == [
+        "|".join(["intermittent fasting", *hit_titles])
+    ]
     assert metadata_params["prop"] == ["info|pageprops"]
     assert metadata_params["inprop"] == ["url"]
     assert metadata_params["ppprop"] == ["disambiguation"]
@@ -452,7 +464,7 @@ def _run_discovery(
     stub = transport_stub(
         [
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, _volume_body(resolve_fixture)),
         ]
     )
@@ -1145,7 +1157,7 @@ def test_volume_transport_failure_is_not_published_as_low_volume(
             (
                 200,
                 {},
-                _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json"),
+                _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json"),
             ),
         ]
     )
@@ -1206,7 +1218,7 @@ def test_low_volume_999_and_404_candidates_remain_selectable(
                 (
                     200,
                     {},
-                    _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json"),
+                    _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json"),
                 ),
                 (response.status, response.headers, response.body),
             ]
@@ -1302,10 +1314,10 @@ def test_multi_project_override_is_scoped_and_provenance_is_persisted(
     stub = transport_stub(
         [
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, _volume_body_for_project(resolve_fixture, "en.wikipedia", "Intermittent_fasting")),
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, _volume_body_for_project(resolve_fixture, "pl.wikipedia", "Intermittent_fasting")),
         ]
     )
@@ -1352,7 +1364,7 @@ def test_project_failures_are_aggregated_and_confirmation_rejects_partial_bytes(
     _configure(monkeypatch, tmp_path)
     out = tmp_path / "resolved.json"
     search = _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")
-    metadata = _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")
+    metadata = _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")
     stub = transport_stub(
         [
             (200, {}, search), (200, {}, metadata),
@@ -1479,7 +1491,7 @@ def test_all_error_and_unresolved_precedence_manifests_preserve_order(
     _configure(monkeypatch, tmp_path)
     out = tmp_path / "mixed.json"
     search = _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")
-    metadata = _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")
+    metadata = _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")
     api_error = b'{"error":{"code":"badrequest","info":"do not persist"}}'
     stub = transport_stub(
         [
@@ -1593,7 +1605,7 @@ def test_warm_validated_discovery_cache_makes_zero_transport_calls(
     cold = transport_stub(
         [
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, _volume_body(resolve_fixture)),
         ]
     )
@@ -1614,7 +1626,7 @@ def test_ttl_zero_bypasses_fresh_cache_and_rewrites_validated_entries(
     out = tmp_path / "resolved.json"
     responses = [
         (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-        (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+        (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
         (200, {}, _volume_body(resolve_fixture)),
     ]
     assert resolve_articles.main(
@@ -1647,7 +1659,7 @@ def test_retry_after_is_honored_with_three_attempt_ceiling(
             (429, {"Retry-After": "2"}, b"rate limited"),
             (429, {"Retry-After": "3"}, b"rate limited"),
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, _volume_body(resolve_fixture)),
         ]
     )
@@ -1716,7 +1728,7 @@ def test_wrong_aqs_identity_creates_no_aqs_cache_or_candidate_volume(
     stub = transport_stub(
         [
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
             (200, {}, json.dumps(payload).encode("utf-8")),
         ]
     )
@@ -1979,7 +1991,7 @@ def test_oversized_response_becomes_bounded_project_error_without_cache(
     stub = transport_stub(
         [
             (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
-            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.normalized.en.wikipedia.json")),
         ]
     )
 
@@ -1996,3 +2008,127 @@ def test_oversized_response_becomes_bounded_project_error_without_cache(
         "en.wikipedia", "Intermittent_fasting", "20260826", "20260924"
     )
     assert not common.cache_path_for_key(common.cache_key_for_url(aqs_url)).exists()
+
+# --- 04-07 live evidence: the real captures agree with the production parser --
+
+
+def test_live_redirect_chain_evidence_resolves_to_the_final_namespace_0_target(
+    resolve_fixture,
+):
+    """Real 2026-09-25 capture: `Barack obama` and `Obama` both forward to
+    `Barack Obama`, and only the final namespace-0 target reaches AQS."""
+    body = _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")
+    payload = json.loads(body.decode("utf-8"))
+    assert [(r["from"], r["to"]) for r in payload["query"]["redirects"]] == [
+        ("Barack obama", "Barack Obama"),
+        ("Obama", "Barack Obama"),
+    ]
+    assert all(p["ns"] == 0 for p in payload["query"]["pages"])
+
+    candidates = resolve_articles.parse_metadata(
+        body,
+        [{"title": "Barack obama", "rank": 1}],
+        "Barack obama",
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["status"] == "selectable"
+    assert candidate["article"] == "Barack_Obama"
+    assert candidate["title"] == "Barack Obama"
+    assert candidate["redirect_chain"] == ["Barack Obama"]
+    assert candidate["disambiguation"] is False
+
+
+def test_live_disambiguation_evidence_carries_the_pageprops_key(resolve_fixture):
+    """The key is present with an empty-string value, so presence must be tested
+    by membership, never by truthiness."""
+    body = _response_body(resolve_fixture, "resolve.disambiguation.en.wikipedia.json")
+    payload = json.loads(body.decode("utf-8"))
+    props = payload["query"]["pages"][0]["pageprops"]
+    assert "disambiguation" in props
+    assert props["disambiguation"] == ""
+
+    candidates = resolve_articles.parse_metadata(
+        body, [{"title": "Mercury", "rank": 1}], "Mercury"
+    )
+
+    assert candidates[0]["status"] == "unresolved"
+    assert candidates[0]["disambiguation"] is True
+    assert candidates[0]["reason"] == "disambiguation_page"
+
+
+def test_live_http_200_error_envelope_is_rejected_as_a_success_body(resolve_fixture):
+    body = _response_body(resolve_fixture, "resolve.api-error.en.wikipedia.json")
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["errors"][0]["code"] == "search-title-disabled"
+
+    with pytest.raises(resolve_articles.ResolveApiError, match="action_api_error"):
+        resolve_articles.parse_action_payload(body, "query")
+    with pytest.raises(resolve_articles.ResolveApiError, match="action_api_error"):
+        resolve_articles.parse_metadata(body, [{"title": "x", "rank": 1}], "x")
+
+
+def test_live_batched_evidence_yields_five_ordered_namespace_0_candidates(
+    resolve_fixture,
+):
+    """Real `srlimit=5` behavior: five distinct ns=0 pages come back.
+
+    The recommendation is still unambiguous, but only through the second clause
+    of the policy -- exactly one candidate is a direct exact-title match for the
+    effective query, while the other four are merely selectable.
+    """
+    search = json.loads(
+        _response_body(resolve_fixture, "resolve.search.batched.en.wikipedia.json")
+        .decode("utf-8")
+    )
+    hits = resolve_articles._search_hits(search)
+    assert len(hits) == resolve_articles.MAX_SEARCH_RESULTS
+    assert [h["rank"] for h in hits] == [1, 2, 3, 4, 5]
+    assert hits[0]["title"] == "Intermittent fasting"
+
+    metadata = _response_body(
+        resolve_fixture, "resolve.normalized.batched.en.wikipedia.json"
+    )
+    candidates = resolve_articles.parse_metadata(metadata, hits, "intermittent fasting")
+
+    assert [c["title"] for c in candidates] == [
+        "Intermittent fasting", "Fasting", "Michael Mosley", "Fastic", "Greg O'Gallagher",
+    ]
+    assert all(c["status"] == "selectable" for c in candidates)
+    exact = [c for c in candidates if c["exact_title_match"] is True]
+    assert [c["title"] for c in exact] == ["Intermittent fasting"]
+    # Five selectables is not a single recommendation; only the exact-title
+    # clause resolves it. With two exact matches the policy must decline.
+    assert resolve_articles.recommend_candidates(candidates) == "Intermittent_fasting"
+    assert resolve_articles.recommend_candidates([*candidates, dict(candidates[0])]) is None
+
+
+def test_live_30d_pageviews_evidence_validates_and_sums_exactly(resolve_fixture):
+    """The 2026-09-25 capture: 30 complete days, 413877 views, no zero-fill."""
+    body = _response_body(resolve_fixture, "resolve.pageviews.30d.en.wikipedia.json")
+    start, end = date(2026, 8, 26), date(2026, 9, 24)
+    assert (end - start).days + 1 == resolve_articles.VOLUME_DAYS
+
+    evidence = resolve_articles.parse_volume_response(
+        common.TransportResponse(status=200, headers={}, body=body),
+        expected_project="en.wikipedia",
+        expected_article="Barack_Obama",
+        start=start,
+        end=end,
+    )
+
+    assert evidence["status"] == "available"
+    assert evidence["total_views"] == 413877
+    assert evidence["observed_days"] == 30
+    assert evidence["last_observed_date"] == "2026-09-24"
+    assert evidence["low_volume"] is False
+    # The recorded total must be independently reproducible from the items, and
+    # no missing calendar day may be represented as a fabricated zero.
+    items = json.loads(body.decode("utf-8"))["items"]
+    assert len(items) == 30
+    assert sum(i["views"] for i in items) == evidence["total_views"]
+    assert {i["timestamp"][:8] for i in items} == {
+        f"{(start + timedelta(days=offset)):%Y%m%d}" for offset in range(30)
+    }
+    assert all(i["views"] > 0 for i in items)

@@ -1,0 +1,43 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "normalized": [
+      {
+        "from": "intermittent fasting",
+        "to": "Intermittent fasting"
+      }
+    ],
+    "pages": [
+      {
+        "pageid": 187886,
+        "ns": 0,
+        "title": "Fasting",
+        "pageprops": {}
+      },
+      {
+        "pageid": 20104879,
+        "ns": 0,
+        "title": "Intermittent fasting",
+        "pageprops": {}
+      },
+      {
+        "pageid": 23739220,
+        "ns": 0,
+        "title": "Michael Mosley",
+        "pageprops": {}
+      },
+      {
+        "pageid": 30486001,
+        "ns": 0,
+        "title": "Fastic",
+        "pageprops": {}
+      },
+      {
+        "pageid": 72675122,
+        "ns": 0,
+        "title": "Greg O'Gallagher",
+        "pageprops": {}
+      }
+    ]
+  }
+}

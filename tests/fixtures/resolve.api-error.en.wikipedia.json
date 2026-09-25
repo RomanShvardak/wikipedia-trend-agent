@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "code": "search-title-disabled",
+      "text": "\"title\" search is disabled.",
+      "module": "query+search"
+    }
+  ]
+}

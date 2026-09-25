@@ -2,17 +2,13 @@
   "batchcomplete": true,
   "query": {
     "searchinfo": {
-      "totalhits": 18342
+      "totalhits": 2870
     },
     "search": [
       {
         "ns": 0,
         "title": "Intermittent fasting",
-        "pageid": 1093952,
-        "size": 92734,
-        "wordcount": 14821,
-        "snippet": "Intermittent fasting is an eating pattern <span class=\"searchmatch\">intermittent fasting</span>.",
-        "timestamp": "2026-09-24T18:22:13Z"
+        "pageid": 20104879
       }
     ]
   }

@@ -1,0 +1,274 @@
+{
+  "items": [
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026082600",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13734
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026082700",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12585
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026082800",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12968
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026082900",
+      "access": "all-access",
+      "agent": "user",
+      "views": 11407
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026083000",
+      "access": "all-access",
+      "agent": "user",
+      "views": 11309
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026083100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12064
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 11920
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090200",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12392
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090300",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12485
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090400",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12821
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090500",
+      "access": "all-access",
+      "agent": "user",
+      "views": 11916
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090600",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12840
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090700",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12238
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090800",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12804
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026090900",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12506
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091000",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13231
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 19958
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091200",
+      "access": "all-access",
+      "agent": "user",
+      "views": 18399
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091300",
+      "access": "all-access",
+      "agent": "user",
+      "views": 18589
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091400",
+      "access": "all-access",
+      "agent": "user",
+      "views": 16297
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091500",
+      "access": "all-access",
+      "agent": "user",
+      "views": 15701
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091600",
+      "access": "all-access",
+      "agent": "user",
+      "views": 15617
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091700",
+      "access": "all-access",
+      "agent": "user",
+      "views": 14960
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091800",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13902
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026091900",
+      "access": "all-access",
+      "agent": "user",
+      "views": 12727
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026092000",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13713
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026092100",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13491
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026092200",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13549
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026092300",
+      "access": "all-access",
+      "agent": "user",
+      "views": 14327
+    },
+    {
+      "project": "en.wikipedia",
+      "article": "Barack_Obama",
+      "granularity": "daily",
+      "timestamp": "2026092400",
+      "access": "all-access",
+      "agent": "user",
+      "views": 13427
+    }
+  ]
+}

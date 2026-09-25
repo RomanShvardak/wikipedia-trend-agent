@@ -1,0 +1,35 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "searchinfo": {
+      "totalhits": 2870
+    },
+    "search": [
+      {
+        "ns": 0,
+        "title": "Intermittent fasting",
+        "pageid": 20104879
+      },
+      {
+        "ns": 0,
+        "title": "Fasting",
+        "pageid": 187886
+      },
+      {
+        "ns": 0,
+        "title": "Michael Mosley",
+        "pageid": 23739220
+      },
+      {
+        "ns": 0,
+        "title": "Fastic",
+        "pageid": 30486001
+      },
+      {
+        "ns": 0,
+        "title": "Greg O'Gallagher",
+        "pageid": 72675122
+      }
+    ]
+  }
+}

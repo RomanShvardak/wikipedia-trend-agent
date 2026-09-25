@@ -1,0 +1,19 @@
+{
+  "batchcomplete": true,
+  "query": {
+    "normalized": [
+      {
+        "from": "intermittent fasting",
+        "to": "Intermittent fasting"
+      }
+    ],
+    "pages": [
+      {
+        "pageid": 20104879,
+        "ns": 0,
+        "title": "Intermittent fasting",
+        "pageprops": {}
+      }
+    ]
+  }
+}

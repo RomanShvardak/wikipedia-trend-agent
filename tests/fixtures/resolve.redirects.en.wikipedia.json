@@ -1,17 +1,21 @@
 {
   "batchcomplete": true,
   "query": {
-    "normalized": [
+    "redirects": [
       {
-        "from": "intermittent fasting",
-        "to": "Intermittent fasting"
+        "from": "Barack obama",
+        "to": "Barack Obama"
+      },
+      {
+        "from": "Obama",
+        "to": "Barack Obama"
       }
     ],
     "pages": [
       {
-        "pageid": 1093952,
+        "pageid": 534366,
         "ns": 0,
-        "title": "Intermittent fasting",
+        "title": "Barack Obama",
         "pageprops": {}
       }
     ]
