@@ -257,9 +257,21 @@ def user_agent() -> str:
     ("contact" / "example.org") — so a non-descriptive identity never leaks.
     """
     ua = os.environ.get("WTI_USER_AGENT", DEFAULT_UA)
-    if not ua or ua.strip() == "" or "contact" in ua or "example.org" in ua:
+    has_control = any(
+        0 <= ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+        for character in ua
+    )
+    if (
+        not ua
+        or ua.strip() == ""
+        or "contact" in ua
+        or "example.org" in ua
+        or has_control
+        or len(ua) > 256
+    ):
         raise SystemExit(
-            "User-Agent is empty or uses placeholder; set WTI_USER_AGENT to a descriptive value "
+            "User-Agent is empty, non-descriptive, uses a placeholder, is over 256 code points, "
+            "or contains controls; set WTI_USER_AGENT to a descriptive value "
             "(e.g. 'wikipedia-trend-agent/0.1.0 (you@example.com) python-urllib')"
         )
     return ua

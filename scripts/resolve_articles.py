@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
+import os
 import sys
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -27,8 +30,11 @@ MAX_PROJECTS = 8
 MAX_SEARCH_RESULTS = 5
 MAX_REDIRECT_HOPS = 10
 MAX_DISPLAY_CODE_POINTS = 256
+MAX_REQUEST_ATTEMPTS = 3
 VOLUME_DAYS = 30
 PROJECTS_FILE = Path(__file__).resolve().parents[1] / "assets" / "wikipedia-projects.json"
+log = common.log
+sleep = time.sleep
 
 
 class ResolveInputError(ValueError):
@@ -45,6 +51,34 @@ class ResolveApiError(ResolveResponseError):
 
 class ResolveVolumeError(ResolveResponseError):
     """An AQS response was unavailable or structurally invalid."""
+
+
+PayloadValidator = Callable[[dict[str, object], str], object | None]
+
+
+def _validated_ttl(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise argparse.ArgumentTypeError("TTL hours must be a non-negative finite number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "TTL hours must be a non-negative finite number"
+        ) from error
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("TTL hours must be a non-negative finite number")
+    return result
+
+
+def _ttl_default(environ: Mapping[str, str] | None = None) -> float:
+    """Use a valid WTI_TTL_HOURS value, otherwise the documented 24-hour default."""
+    raw = (environ if environ is not None else os.environ).get("WTI_TTL_HOURS")
+    if raw is None:
+        return 24.0
+    try:
+        return _validated_ttl(float(raw))
+    except (TypeError, ValueError, argparse.ArgumentTypeError):
+        return 24.0
 
 
 def load_allowed_projects() -> frozenset[str]:
@@ -93,6 +127,13 @@ def _clean_text(value: object, field: str) -> str:
 def _required_text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ResolveInputError(f"{field} must be a non-empty string")
+    if len(value) > MAX_DISPLAY_CODE_POINTS or any(
+        0 <= ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    ):
+        raise ResolveInputError(
+            f"{field} must be at most 256 code points without C0/C1 controls"
+        )
     return value.strip()
 
 
@@ -107,11 +148,13 @@ def parse_assignment(value: object, flag_name: str) -> tuple[str, str]:
     expression = expression.strip()
     if not separator or not project or not expression:
         raise ResolveInputError(f"{flag_name} must use PROJECT=VALUE")
-    if any(
-        ord(character) < 0x20 or ord(character) == 0x7F
+    if len(project) + len(expression) > MAX_DISPLAY_CODE_POINTS or any(
+        0 <= ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
         for character in project + expression
     ):
-        raise ResolveInputError(f"{flag_name} must not contain control characters")
+        raise ResolveInputError(
+            f"{flag_name} must be bounded and contain no C0/C1 controls"
+        )
     return project, expression
 
 
@@ -257,15 +300,9 @@ def metadata_url(project: str, titles: Sequence[str]) -> str:
     )
 
 
-def parse_action_payload(body: bytes, expected: str) -> dict[str, object]:
-    """Decode strict UTF-8 and reject HTTP-200 Action error envelopes."""
-    try:
-        decoded = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ResolveResponseError("Action API response is not valid UTF-8 JSON") from error
-    if not isinstance(decoded, dict):
-        raise ResolveResponseError("Action API response is not a JSON object")
-    payload = cast(dict[str, object], decoded)
+def _validate_action_payload(
+    payload: dict[str, object], expected: str
+) -> dict[str, object]:
     if payload.get("error") is not None:
         raise ResolveApiError("action_api_error")
     errors = payload.get("errors")
@@ -276,6 +313,17 @@ def parse_action_payload(body: bytes, expected: str) -> dict[str, object]:
     return payload
 
 
+def parse_action_payload(body: bytes, expected: str) -> dict[str, object]:
+    """Decode strict UTF-8 and reject HTTP-200 Action error envelopes."""
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ResolveResponseError("Action API response is not valid UTF-8 JSON") from error
+    if not isinstance(decoded, dict):
+        raise ResolveResponseError("Action API response is not a JSON object")
+    return _validate_action_payload(cast(dict[str, object], decoded), expected)
+
+
 def canonical_article(title: str) -> str:
     """Return the exact UTF-8 AQS component without Unicode normalization."""
     if not isinstance(title, str) or not title:
@@ -283,17 +331,105 @@ def canonical_article(title: str) -> str:
     return quote(title.replace(" ", "_"), safe="")
 
 
-def _request_json(
+def _cache_safe_validator(
+    validator: PayloadValidator,
+    expected: str,
+) -> Callable[[dict[str, object]], object | None]:
+    """Adapt endpoint errors to the generic cache validator miss contract."""
+
+    def validate(payload: dict[str, object]) -> object | None:
+        try:
+            return validator(payload, expected)
+        except (ResolveResponseError, common.TransportError) as error:
+            raise ValueError("endpoint validator rejected cached payload") from error
+
+    return validate
+
+
+def get_json(
     url: str,
+    expected: str,
+    validator: PayloadValidator,
+    *,
+    ttl_hours: float,
     headers: dict[str, str],
     transport: Transport,
     pace: list[float],
-) -> dict[str, object]:
-    common.throttle(1.0, pace)
-    response = transport(url, headers, 30.0)
-    if response.status != 200:
-        raise ResolveResponseError(f"upstream returned HTTP {response.status}")
-    return parse_action_payload(response.body, "query")
+    allow_404: bool = False,
+) -> tuple[dict[str, object] | None, int]:
+    """Read validated cache first, then perform one bounded retry sequence."""
+    cached = common.read_json_cache(
+        url,
+        ttl_hours,
+        _cache_safe_validator(validator, expected),
+    )
+    if isinstance(cached, dict):
+        return cached, 200
+
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        common.throttle(1.0, pace)
+        try:
+            response = transport(url, headers, 30.0)
+        except common.ResponseTooLarge:
+            raise
+        except common.TransportError:
+            if attempt == MAX_REQUEST_ATTEMPTS:
+                raise
+            delay = common.retry_after_seconds({})
+            log.info(
+                "resolver retry %d/%d after %.1f seconds (transport error)",
+                attempt,
+                MAX_REQUEST_ATTEMPTS,
+                delay,
+            )
+            sleep(delay)
+            continue
+
+        declared = common.header_value(response.headers, "Content-Length")
+        if declared is not None:
+            try:
+                declared_length = int(declared)
+            except (TypeError, ValueError):
+                declared_length = -1
+            if declared_length > MAX_RESPONSE_BYTES:
+                raise common.ResponseTooLarge("resolver response exceeds byte limit")
+
+        if response.status == 403:
+            raise ResolveResponseError("upstream_forbidden")
+        if allow_404 and response.status == 404:
+            return None, 404
+        if common.is_retryable_status(response.status):
+            if attempt == MAX_REQUEST_ATTEMPTS:
+                raise ResolveResponseError(
+                    f"upstream returned HTTP {response.status}"
+                )
+            delay = common.retry_after_seconds(response.headers)
+            log.info(
+                "resolver retry %d/%d after %.1f seconds (HTTP %d)",
+                attempt,
+                MAX_REQUEST_ATTEMPTS,
+                delay,
+                response.status,
+            )
+            sleep(delay)
+            continue
+        if response.status != 200:
+            raise ResolveResponseError(f"upstream returned HTTP {response.status}")
+
+        try:
+            decoded = json.loads(response.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ResolveResponseError("response is not valid UTF-8 JSON") from error
+        if not isinstance(decoded, dict):
+            raise ResolveResponseError("response must be a JSON object")
+        payload = cast(dict[str, object], decoded)
+        validated = validator(payload, expected)
+        if not isinstance(validated, dict):
+            raise ResolveResponseError("endpoint validator rejected response")
+        common.write_json_cache(url, payload)
+        return payload, 200
+
+    raise ResolveResponseError("request attempts exhausted")
 
 
 def _search_hits(payload: dict[str, object]) -> list[dict[str, object]]:
@@ -320,6 +456,14 @@ def _search_hits(payload: dict[str, object]) -> list[dict[str, object]]:
             }
         )
     return normalized
+
+
+def _validate_search_payload(
+    payload: dict[str, object], expected: str
+) -> dict[str, object]:
+    validated = _validate_action_payload(payload, expected)
+    _search_hits(validated)
+    return validated
 
 
 def _mapping_from_list(payload: dict[str, object], key: str) -> dict[str, str]:
@@ -627,6 +771,32 @@ def validate_volume_payload(
         observed.add(observed_date)
 
 
+def _available_volume(
+    payload: dict[str, object], *, start: date, end: date
+) -> dict[str, object]:
+    """Build exact AQS evidence from a payload already validated in full."""
+    items = cast(list[object], payload["items"])
+    total = 0
+    observed: set[date] = set()
+    for raw_item in items:
+        item = cast(dict[str, object], raw_item)
+        views = cast(int, item["views"])
+        observed_date = datetime.strptime(
+            cast(str, item["timestamp"]), "%Y%m%d%H"
+        ).date()
+        total += views
+        observed.add(observed_date)
+    return {
+        "status": "available",
+        "total_views": total,
+        "window": {"start": start.isoformat(), "end": end.isoformat()},
+        "observed_days": len(observed),
+        "last_observed_date": max(observed).isoformat() if observed else None,
+        "low_volume": total < 1000,
+        "reason": None,
+    }
+
+
 def parse_volume_response(
     response: TransportResponse,
     *,
@@ -670,27 +840,7 @@ def parse_volume_response(
         start=start,
         end=end,
     )
-
-    items = cast(list[object], payload["items"])
-    total = 0
-    observed: set[date] = set()
-    for raw_item in items:
-        item = cast(dict[str, object], raw_item)
-        views = cast(int, item["views"])
-        observed_date = datetime.strptime(
-            cast(str, item["timestamp"]), "%Y%m%d%H"
-        ).date()
-        total += views
-        observed.add(observed_date)
-    return {
-        "status": "available",
-        "total_views": total,
-        "window": {"start": start.isoformat(), "end": end.isoformat()},
-        "observed_days": len(observed),
-        "last_observed_date": max(observed).isoformat() if observed else None,
-        "low_volume": total < 1000,
-        "reason": None,
-    }
+    return _available_volume(payload, start=start, end=end)
 
 
 def _error_record(error: BaseException) -> dict[str, str]:
@@ -784,6 +934,7 @@ def discover(
     today_utc: date,
     transport: Transport,
     pace: list[float],
+    ttl_hours: float = 24.0,
 ) -> tuple[dict[str, object] | None, int]:
     """Perform serial discovery and return one complete document without writing it."""
     del out
@@ -803,9 +954,17 @@ def discover(
         search_hits: list[dict[str, object]] | None = None
         candidates: list[dict[str, object]] = []
         try:
-            search_payload = _request_json(
-                search_url(project, effective_query), headers, transport, pace
+            search_payload, _ = get_json(
+                search_url(project, effective_query),
+                "query",
+                _validate_search_payload,
+                ttl_hours=ttl_hours,
+                headers=headers,
+                transport=transport,
+                pace=pace,
             )
+            if search_payload is None:
+                raise ResolveResponseError("search response is missing")
             search_hits = _search_hits(search_payload)
             if not search_hits:
                 project_documents.append(
@@ -819,17 +978,29 @@ def discover(
                     )
                 )
                 continue
+            validated_hits: list[dict[str, object]] = search_hits
             metadata_titles = [
                 effective_query,
-                *[cast(str, hit["title"]) for hit in search_hits],
+                *[cast(str, hit["title"]) for hit in validated_hits],
             ]
-            metadata_payload = _request_json(
+
+            def validate_metadata(payload: dict[str, object], expected: str) -> dict[str, object]:
+                validated = _validate_action_payload(payload, expected)
+                parse_metadata(validated, validated_hits, effective_query)
+                return validated
+
+            metadata_payload, _ = get_json(
                 metadata_url(project, metadata_titles),
-                headers,
-                transport,
-                pace,
+                "query",
+                validate_metadata,
+                ttl_hours=ttl_hours,
+                headers=headers,
+                transport=transport,
+                pace=pace,
             )
-            candidates = parse_metadata(metadata_payload, search_hits, effective_query)
+            if metadata_payload is None:
+                raise ResolveResponseError("metadata response is missing")
+            candidates = parse_metadata(metadata_payload, validated_hits, effective_query)
             for candidate in candidates:
                 if candidate["status"] != "selectable":
                     continue
@@ -837,15 +1008,43 @@ def discover(
                 url = fetch_pageviews.series_url(
                     project, article, start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
                 )
-                common.throttle(1.0, pace)
-                response = transport(url, headers, 30.0)
-                candidate["volume"] = parse_volume_response(
-                    response,
-                    expected_project=project,
-                    expected_article=article,
-                    start=start,
-                    end=end,
+
+                def validate_volume(payload: dict[str, object], _expected: str) -> dict[str, object]:
+                    validate_volume_payload(
+                        payload,
+                        expected_project=project,
+                        expected_article=article,
+                        start=start,
+                        end=end,
+                    )
+                    return payload
+
+                volume_payload, volume_status = get_json(
+                    url,
+                    "items",
+                    validate_volume,
+                    ttl_hours=ttl_hours,
+                    headers=headers,
+                    transport=transport,
+                    pace=pace,
+                    allow_404=True,
                 )
+                if volume_payload is None and volume_status == 404:
+                    candidate["volume"] = {
+                        "status": "unavailable",
+                        "total_views": None,
+                        "window": {"start": start.isoformat(), "end": end.isoformat()},
+                        "observed_days": None,
+                        "last_observed_date": None,
+                        "low_volume": None,
+                        "reason": "aqs_404_zero_or_not_loaded",
+                    }
+                elif volume_payload is not None:
+                    candidate["volume"] = _available_volume(
+                        volume_payload, start=start, end=end
+                    )
+                else:
+                    raise ResolveVolumeError("AQS response is missing")
         except (ResolveResponseError, common.TransportError, OSError) as error:
             project_documents.append(
                 _failed_project(
@@ -1065,7 +1264,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="out/resolved.json", help="resolved manifest path")
     parser.add_argument("--select", action="append", default=[], help="PROJECT=ARTICLE selection")
     parser.add_argument("--reason", help="optional confirmation reason")
-    parser.add_argument("--verbose", action="store_true", help="enable debug logging")
+    parser.add_argument(
+        "--ttl-hours",
+        type=_validated_ttl,
+        default=_ttl_default(),
+        help="cache TTL in hours as a non-negative finite float (default: WTI_TTL_HOURS or 24.0; 0 forces refetch)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="logging-only debug diagnostics; adds no fields and changes no API behavior",
+    )
     return parser
 
 
@@ -1079,6 +1288,11 @@ def main(
     """Run offline preflight and the explicit discovery state transition."""
     args = _parser().parse_args(argv)
     common.setup_logging(args.verbose)
+    try:
+        ttl_hours = _validated_ttl(args.ttl_hours)
+    except argparse.ArgumentTypeError as error:
+        print(f"resolver input validation failed: {error}", file=sys.stderr)
+        return 2
     try:
         requested_projects = [
             project
@@ -1123,6 +1337,7 @@ def main(
             today_utc=today_utc or datetime.now(timezone.utc).date(),
             transport=transport or bounded_transport,
             pace=pace if pace is not None else [0.0],
+            ttl_hours=ttl_hours,
         )
     except SystemExit:
         raise

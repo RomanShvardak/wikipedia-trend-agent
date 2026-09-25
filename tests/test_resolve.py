@@ -166,8 +166,8 @@ def test_single_project_tracer(
 
     raw = out.read_bytes()
     document = json.loads(raw.decode("utf-8"))
-    assert len(publications) == 1
-    assert publications[0][1] == out
+    manifest_publications = [path for _document, path in publications if path == out]
+    assert manifest_publications == [out]
     assert set(document) == {
         "contract_version",
         "run_mode",
@@ -226,7 +226,9 @@ def test_single_project_tracer(
         "reason": None,
         "error": None,
     }
-    assert sorted(path.name for path in out.parent.iterdir()) == ["resolved.json"]
+    assert sorted(
+        path.name for path in out.parent.iterdir() if path.is_file()
+    ) == ["resolved.json"]
 
 
 def test_search_url_uses_exact_unicode_without_normalization():
@@ -452,7 +454,9 @@ def test_confirm_exact_saved_candidate_is_offline_and_atomic(
     }
     assert confirmed == expected
     assert publications == [out]
-    assert sorted(path.name for path in out.parent.iterdir()) == ["resolved.json"]
+    assert sorted(
+        path.name for path in out.parent.iterdir() if path.is_file()
+    ) == ["resolved.json"]
 
 
 def test_confirm_rejects_slug_outside_saved_candidates_without_replacing_bytes(
@@ -1067,6 +1071,7 @@ def test_volume_transport_failure_is_not_published_as_low_volume(
     tmp_path, monkeypatch, transport_stub, resolve_fixture
 ):
     _configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(resolve_articles, "sleep", lambda _seconds: None, raising=False)
     stub = transport_stub(
         [
             (
@@ -1102,7 +1107,7 @@ def test_volume_transport_failure_is_not_published_as_low_volume(
     assert document["status"] == "error"
     assert document["projects"][0]["error"]["code"] == "transport_error"
     assert "offline transport failure" in document["projects"][0]["error"]["message"]
-    assert len(original_factory.calls) == 3
+    assert len(original_factory.calls) == 5
 
 
 def test_low_volume_999_and_404_candidates_remain_selectable(
@@ -1145,7 +1150,7 @@ def test_low_volume_999_and_404_candidates_remain_selectable(
         )
 
         assert resolve_articles.main(
-            _args(out), transport=stub, today_utc=TODAY
+            [*_args(out), "--ttl-hours", "0"], transport=stub, today_utc=TODAY
         ) == 0
 
         document = json.loads(out.read_text(encoding="utf-8"))
@@ -1444,7 +1449,9 @@ def test_all_error_and_unresolved_precedence_manifests_preserve_order(
         "--topic", "topic", "--projects", "en.wikipedia", "--projects", "pl.wikipedia",
         "--out", str(all_error),
     ]
-    assert resolve_articles.main(all_args, transport=stub, today_utc=TODAY) == 1
+    assert resolve_articles.main(
+        [*all_args, "--ttl-hours", "0"], transport=stub, today_utc=TODAY
+    ) == 1
     all_document = json.loads(all_error.read_text(encoding="utf-8"))
     assert all_document["status"] == "error"
     assert all(record["error"]["code"] == "action_api_error" for record in all_document["projects"])
@@ -1567,7 +1574,7 @@ def test_ttl_zero_bypasses_fresh_cache_and_rewrites_validated_entries(
 
 
 def test_retry_after_is_honored_with_three_attempt_ceiling(
-    tmp_path, monkeypatch, transport_stub, resolve_fixture, caplog
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, capsys
 ):
     _configure(monkeypatch, tmp_path)
     sleeps: list[float] = []
@@ -1582,13 +1589,13 @@ def test_retry_after_is_honored_with_three_attempt_ceiling(
         ]
     )
 
-    with caplog.at_level("INFO"):
-        assert resolve_articles.main(_args(tmp_path / "resolved.json"), transport=stub, today_utc=TODAY) == 0
+    assert resolve_articles.main(_args(tmp_path / "resolved.json"), transport=stub, today_utc=TODAY) == 0
 
+    diagnostics = capsys.readouterr().err
     assert len(stub.calls) == 5
     assert sleeps == [2.0, 3.0]
-    assert "retry 1/3 after 2.0 seconds" in caplog.text
-    assert "retry 2/3 after 3.0 seconds" in caplog.text
+    assert "retry 1/3 after 2.0 seconds" in diagnostics
+    assert "retry 2/3 after 3.0 seconds" in diagnostics
 
 
 def test_retryable_failure_exhausts_three_calls_without_cache(
