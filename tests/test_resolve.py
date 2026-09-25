@@ -350,6 +350,32 @@ def test_bounded_transport_reads_only_limit_plus_one(monkeypatch):
     assert stream.read_sizes == [limit + 1]
 
 
+def test_completed_zero_hit_search_publishes_empty_provenance(
+    tmp_path, monkeypatch, transport_stub
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    stub = transport_stub([(200, {}, b'{"query":{"search":[]}}')])
+
+    assert resolve_articles.main(_args(out), transport=stub, today_utc=TODAY) == 2
+
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert len(stub.calls) == 1
+    assert document["status"] == "unresolved"
+    project = document["projects"][0]
+    assert project["search_hits"] == []
+    assert project["candidates"] == []
+    assert project["status"] == "unresolved"
+    assert project["reason"] == "search_no_hits"
+
+
+def test_external_display_text_strips_c0_c1_and_caps_codepoints():
+    cleaned = resolve_articles._clean_text("A\x00B\x85" + "x" * 300, "title")
+
+    assert cleaned == "AB" + "x" * 254
+    assert len(cleaned) == 256
+
+
 def _run_discovery(
     out: Path,
     tmp_path: Path,
