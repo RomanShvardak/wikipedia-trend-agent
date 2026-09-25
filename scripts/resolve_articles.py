@@ -96,15 +96,27 @@ def _required_text(value: object, field: str) -> str:
     return value.strip()
 
 
-def _split_expression(value: object, field: str) -> tuple[str, str]:
+def parse_assignment(value: object, flag_name: str) -> tuple[str, str]:
+    """Parse one PROJECT=VALUE assignment without accepting URL-shaped values."""
     if not isinstance(value, str):
-        raise ResolveInputError(f"{field} must be a string")
+        raise ResolveInputError(f"{flag_name} must be a string")
+    if "://" in value:
+        raise ResolveInputError(f"{flag_name} must not contain a URL")
     project, separator, expression = value.partition("=")
     project = project.strip()
     expression = expression.strip()
     if not separator or not project or not expression:
-        raise ResolveInputError(f"{field} must use PROJECT=VALUE")
+        raise ResolveInputError(f"{flag_name} must use PROJECT=VALUE")
+    if any(
+        ord(character) < 0x20 or ord(character) == 0x7F
+        for character in project + expression
+    ):
+        raise ResolveInputError(f"{flag_name} must not contain control characters")
     return project, expression
+
+
+def _split_expression(value: object, field: str) -> tuple[str, str]:
+    return parse_assignment(value, field)
 
 
 def preflight_inputs(
@@ -112,14 +124,13 @@ def preflight_inputs(
     projects: Sequence[str],
     topic_overrides: Sequence[str],
     selections: Sequence[str],
+    *,
+    max_projects: int = MAX_PROJECTS,
 ) -> tuple[list[str], list[tuple[str, str]], dict[str, str]]:
-    """Validate all offline context and return normalized ordered collections."""
+    """Aggregate all input violations before any network or artifact side effect."""
     errors: list[str] = []
-    normalized_topic = ""
     if not isinstance(topic, str) or not topic.strip():
         errors.append("topic must be a non-empty string")
-    else:
-        normalized_topic = topic.strip()
 
     try:
         allowed = load_allowed_projects()
@@ -127,9 +138,26 @@ def preflight_inputs(
         allowed = frozenset()
         errors.append(str(error))
 
+    if isinstance(max_projects, bool) or not isinstance(max_projects, int) or max_projects < 1:
+        errors.append("max_projects must be a positive integer")
+        max_projects = 0
+
+    if isinstance(projects, Sequence) and not isinstance(projects, (str, bytes)):
+        project_values = list(projects)
+    else:
+        project_values = []
+        errors.append("projects must be a sequence of project codes")
+    if not project_values:
+        errors.append("at least one project is required")
+    # Check the raw requested entries before allowlist membership or host work.
+    if len(project_values) > max_projects:
+        errors.append(
+            f"at most {max_projects} requested projects are allowed (got {len(project_values)})"
+        )
+
     normalized_projects: list[str] = []
     seen_projects: set[str] = set()
-    for index, project in enumerate(projects):
+    for index, project in enumerate(project_values):
         if not isinstance(project, str):
             errors.append(f"projects[{index}] must be a string")
             continue
@@ -145,48 +173,36 @@ def preflight_inputs(
             errors.append(f"project is not in the committed allowlist: {candidate}")
             continue
         normalized_projects.append(candidate)
-    if not projects:
-        errors.append("at least one project is required")
-    if len(normalized_projects) > MAX_PROJECTS:
-        errors.append(f"at most {MAX_PROJECTS} projects are allowed")
 
-    normalized_overrides: list[tuple[str, str]] = []
-    seen_overrides: set[str] = set()
-    for index, expression in enumerate(topic_overrides):
-        try:
-            project, query = _split_expression(expression, f"topic-for[{index}]")
-        except ResolveInputError as error:
-            errors.append(str(error))
-            continue
-        if project not in seen_projects:
-            errors.append(f"topic-for project is not requested: {project}")
-            continue
-        if project not in allowed:
-            errors.append(f"topic-for project is not in the committed allowlist: {project}")
-            continue
-        if project in seen_overrides:
-            errors.append(f"duplicate topic-for project: {project}")
-            continue
-        seen_overrides.add(project)
-        normalized_overrides.append((project, query))
+    def parse_assignments(
+        values: Sequence[str], flag_name: str
+    ) -> tuple[list[tuple[str, str]], dict[str, str]]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            errors.append(f"{flag_name} must be a sequence of assignments")
+            return [], {}
+        parsed: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for index, expression in enumerate(values):
+            try:
+                project, value = _split_expression(expression, f"{flag_name}[{index}]")
+            except ResolveInputError as error:
+                errors.append(str(error))
+                continue
+            if project not in seen_projects:
+                errors.append(f"{flag_name} project is not requested: {project}")
+                continue
+            if project not in allowed:
+                errors.append(f"{flag_name} project is not in the committed allowlist: {project}")
+                continue
+            if project in seen:
+                errors.append(f"duplicate {flag_name} project: {project}")
+                continue
+            seen.add(project)
+            parsed.append((project, value))
+        return parsed, {project: value for project, value in parsed}
 
-    normalized_selections: dict[str, str] = {}
-    for index, expression in enumerate(selections):
-        try:
-            project, article = _split_expression(expression, f"select[{index}]")
-        except ResolveInputError as error:
-            errors.append(str(error))
-            continue
-        if project not in seen_projects:
-            errors.append(f"select project is not requested: {project}")
-            continue
-        if project not in allowed:
-            errors.append(f"select project is not in the committed allowlist: {project}")
-            continue
-        if project in normalized_selections:
-            errors.append(f"duplicate selection for project: {project}")
-            continue
-        normalized_selections[project] = article
+    normalized_overrides, _ = parse_assignments(topic_overrides, "topic-for")
+    _, normalized_selections = parse_assignments(selections, "select")
 
     if errors:
         raise ResolveInputError("\n".join(f"- {error}" for error in errors))
@@ -521,6 +537,23 @@ def parse_metadata(
     )
 
 
+def recommend_candidates(candidates: Sequence[Mapping[str, object]]) -> str | None:
+    """Recommend only one selectable target or one direct exact-title target."""
+    selectable = [
+        candidate
+        for candidate in candidates
+        if candidate.get("status") == "selectable" and isinstance(candidate.get("article"), str)
+    ]
+    if len(selectable) == 1:
+        return cast(str, selectable[0]["article"])
+    exact = [
+        candidate for candidate in selectable if candidate.get("exact_title_match") is True
+    ]
+    if len(exact) == 1:
+        return cast(str, exact[0]["article"])
+    return None
+
+
 def volume_window(today_utc: date) -> tuple[date, date]:
     """Return one shared inclusive window of 30 complete UTC calendar days."""
     if not isinstance(today_utc, date):
@@ -660,6 +693,42 @@ def parse_volume_response(
     }
 
 
+def _error_record(error: BaseException) -> dict[str, str]:
+    """Return a stable, bounded diagnostic without retaining an upstream body."""
+    if isinstance(error, ResolveApiError):
+        code = "action_api_error"
+    elif isinstance(error, ResolveVolumeError):
+        code = "aqs_error"
+    elif isinstance(error, common.TransportError):
+        code = "transport_error"
+    elif isinstance(error, ResolveResponseError):
+        code = "response_error"
+    else:
+        code = "io_error"
+    message = "".join(
+        character
+        for character in str(error)
+        if not (0 <= ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F)
+    )[:MAX_DISPLAY_CODE_POINTS]
+    return {"code": code, "message": message or code}
+
+
+def aggregate_project_outcomes(
+    project_records: Sequence[Mapping[str, object]],
+) -> tuple[str, int]:
+    """Derive the top outcome and exit code while preserving project records."""
+    statuses = [record.get("status") for record in project_records]
+    if statuses and all(status == "error" for status in statuses):
+        return "error", 1
+    if "unresolved" in statuses:
+        return "unresolved", 2
+    if "error" in statuses and any(
+        status in {"ready", "ambiguous"} for status in statuses
+    ):
+        return "partial_error", 3
+    return "awaiting_confirmation", 0
+
+
 def _empty_project(
     project: str,
     effective_query: str,
@@ -683,6 +752,29 @@ def _empty_project(
     }
 
 
+def _failed_project(
+    project: str,
+    effective_query: str,
+    query_source: str,
+    *,
+    search_hits: list[dict[str, object]] | None,
+    candidates: list[dict[str, object]],
+    error: BaseException,
+) -> dict[str, object]:
+    return {
+        "project": project,
+        "effective_query": effective_query,
+        "query_source": query_source,
+        "status": "error",
+        "recommendation": None,
+        "search_hits": search_hits,
+        "candidates": candidates,
+        "selection": None,
+        "reason": None,
+        "error": _error_record(error),
+    }
+
+
 def discover(
     *,
     topic: str,
@@ -693,7 +785,7 @@ def discover(
     transport: Transport,
     pace: list[float],
 ) -> tuple[dict[str, object] | None, int]:
-    """Perform serial discovery and return a complete document without writing it."""
+    """Perform serial discovery and return one complete document without writing it."""
     del out
     ua = common.user_agent()
     if any(ord(character) < 0x20 or ord(character) == 0x7F for character in ua):
@@ -708,65 +800,74 @@ def discover(
     for project in projects:
         effective_query = override_map.get(project, topic)
         query_source = "project_override" if project in override_map else "shared"
-        search_payload = _request_json(
-            search_url(project, effective_query), headers, transport, pace
-        )
-        search_hits = _search_hits(search_payload)
-        if not search_hits:
+        search_hits: list[dict[str, object]] | None = None
+        candidates: list[dict[str, object]] = []
+        try:
+            search_payload = _request_json(
+                search_url(project, effective_query), headers, transport, pace
+            )
+            search_hits = _search_hits(search_payload)
+            if not search_hits:
+                project_documents.append(
+                    _empty_project(
+                        project,
+                        effective_query,
+                        query_source,
+                        search_hits=[],
+                        status="unresolved",
+                        reason="search_no_hits",
+                    )
+                )
+                continue
+            metadata_titles = [
+                effective_query,
+                *[cast(str, hit["title"]) for hit in search_hits],
+            ]
+            metadata_payload = _request_json(
+                metadata_url(project, metadata_titles),
+                headers,
+                transport,
+                pace,
+            )
+            candidates = parse_metadata(metadata_payload, search_hits, effective_query)
+            for candidate in candidates:
+                if candidate["status"] != "selectable":
+                    continue
+                article = cast(str, candidate["article"])
+                url = fetch_pageviews.series_url(
+                    project, article, start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+                )
+                common.throttle(1.0, pace)
+                response = transport(url, headers, 30.0)
+                candidate["volume"] = parse_volume_response(
+                    response,
+                    expected_project=project,
+                    expected_article=article,
+                    start=start,
+                    end=end,
+                )
+        except (ResolveResponseError, common.TransportError, OSError) as error:
             project_documents.append(
-                _empty_project(
+                _failed_project(
                     project,
                     effective_query,
                     query_source,
-                    search_hits=[],
-                    status="unresolved",
-                    reason="search_no_hits",
+                    search_hits=search_hits,
+                    candidates=candidates,
+                    error=error,
                 )
             )
             continue
-        metadata_titles = [
-            effective_query,
-            *[cast(str, hit["title"]) for hit in search_hits],
-        ]
-        metadata_payload = _request_json(
-            metadata_url(project, metadata_titles),
-            headers,
-            transport,
-            pace,
-        )
-        candidates = parse_metadata(metadata_payload, search_hits, effective_query)
-        for candidate in candidates:
-            if candidate["status"] != "selectable":
-                continue
-            article = cast(str, candidate["article"])
-            url = fetch_pageviews.series_url(
-                project, article, start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-            )
-            common.throttle(1.0, pace)
-            response = transport(url, headers, 30.0)
-            candidate["volume"] = parse_volume_response(
-                response,
-                expected_project=project,
-                expected_article=article,
-                start=start,
-                end=end,
-            )
+
         selectable = [candidate for candidate in candidates if candidate["status"] == "selectable"]
-        status = (
-            "ready"
-            if len(selectable) == 1
-            else "ambiguous"
-            if selectable
-            else "unresolved"
-        )
-        recommendation = cast(str, selectable[0]["article"]) if len(selectable) == 1 else None
+        status = "ready" if len(selectable) == 1 else "ambiguous" if selectable else "unresolved"
         project_documents.append(
             {
                 "project": project,
                 "effective_query": effective_query,
                 "query_source": query_source,
                 "status": status,
-                "recommendation": recommendation,
+                "recommendation": recommend_candidates(selectable),
                 "search_hits": search_hits,
                 "candidates": candidates,
                 "selection": None,
@@ -775,12 +876,15 @@ def discover(
             }
         )
 
-    unresolved = any(project["status"] == "unresolved" for project in project_documents)
+    top_status, exit_code = aggregate_project_outcomes(project_documents)
     document: dict[str, object] = {
         "contract_version": CONTRACT_VERSION,
         "run_mode": "discover",
-        "status": "unresolved" if unresolved else "awaiting_confirmation",
+        "status": top_status,
         "topic": topic,
+        "topic_overrides": [
+            {"project": project, "query": query} for project, query in overrides
+        ],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "volume_window": {
             "start": start.isoformat(),
@@ -792,7 +896,7 @@ def discover(
         },
         "projects": project_documents,
     }
-    return document, 2 if unresolved else 0
+    return document, exit_code
 
 
 def _confirmation_error(messages: Sequence[str]) -> tuple[None, int]:
@@ -855,6 +959,11 @@ def confirm(
         errors.append("discovery manifest must have status='awaiting_confirmation'")
     if document.get("topic") != normalized_topic:
         errors.append("topic does not match the saved discovery context")
+    expected_overrides = [
+        {"project": project, "query": query} for project, query in topic_overrides
+    ]
+    if document.get("topic_overrides") != expected_overrides:
+        errors.append("ordered topic-for context does not match the saved discovery manifest")
 
     saved_projects_value = document.get("projects")
     if not isinstance(saved_projects_value, list):
@@ -948,8 +1057,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--projects",
         action="append",
+        nargs="+",
         required=True,
-        help="allowlisted Wikipedia project code; repeat for ordered project context",
+        help="one or more allowlisted Wikipedia project codes; repeat for ordered context",
     )
     parser.add_argument("--topic-for", action="append", default=[], help="PROJECT=QUERY override")
     parser.add_argument("--out", default="out/resolved.json", help="resolved manifest path")
@@ -970,9 +1080,14 @@ def main(
     args = _parser().parse_args(argv)
     common.setup_logging(args.verbose)
     try:
+        requested_projects = [
+            project
+            for project_group in args.projects
+            for project in project_group
+        ]
         projects, overrides, selections = preflight_inputs(
             args.topic,
-            args.projects,
+            requested_projects,
             args.topic_for,
             args.select,
         )

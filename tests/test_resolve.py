@@ -173,6 +173,7 @@ def test_single_project_tracer(
         "run_mode",
         "status",
         "topic",
+        "topic_overrides",
         "generated_at",
         "volume_window",
         "projects",
@@ -309,7 +310,7 @@ def test_preflight_rejects_host_shaped_and_unallowlisted_projects(
         b'{"errors":[{"code":"search-title-disabled","module":"cirrussearch"}]}',
     ],
 )
-def test_api_error_http_200_creates_no_manifest_or_cache(
+def test_api_error_http_200_creates_sanitized_error_manifest_or_cache(
     body, tmp_path, monkeypatch, transport_stub
 ):
     _configure(monkeypatch, tmp_path)
@@ -317,7 +318,9 @@ def test_api_error_http_200_creates_no_manifest_or_cache(
     out = tmp_path / "resolved.json"
 
     assert resolve_articles.main(_args(out), transport=stub, today_utc=TODAY) == 1
-    assert not out.exists()
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["status"] == "error"
+    assert document["projects"][0]["error"]["code"] == "action_api_error"
     assert list((tmp_path / "cache").glob("*.json")) == []
 
 
@@ -536,6 +539,9 @@ def test_confirm_requires_replaying_project_override_context(
     args = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
 
     assert resolve_articles.main(args, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+    changed_args = [*_args(out), "--topic-for", "en.wikipedia=changed", "--select", "en.wikipedia=Intermittent_fasting"]
+    assert resolve_articles.main(changed_args, transport=forbidden_transport) == 2
     assert out.read_bytes() == before
 
 
@@ -1091,7 +1097,11 @@ def test_volume_transport_failure_is_not_published_as_low_volume(
     assert resolve_articles.main(
         _args(out), transport=scripted_then_fail, today_utc=TODAY
     ) == 1
-    assert not out.exists()
+    assert out.exists()
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["status"] == "error"
+    assert document["projects"][0]["error"]["code"] == "transport_error"
+    assert "offline transport failure" in document["projects"][0]["error"]["message"]
     assert len(original_factory.calls) == 3
 
 
@@ -1331,4 +1341,137 @@ def test_zero_hit_and_all_structural_invalid_projects_remain_unresolved(
     assert document["projects"][1]["candidates"][0]["status"] == "unresolved"
     assert document["projects"][1]["candidates"][0]["reason"] == "non_article_namespace"
     assert document["projects"][1]["reason"] == "no_selectable_candidates"
+
+
+def test_preflight_reports_all_input_classes_in_one_error():
+    with pytest.raises(resolve_articles.ResolveInputError) as raised:
+        resolve_articles.preflight_inputs(
+            "",
+            ["en.wikipedia", "en.wikipedia", "unknown.example", None],  # type: ignore[list-item]
+            ["en.wikipedia", "en.wikipedia=one", "en.wikipedia=two", None, "pl.wikipedia=missing"],  # type: ignore[list-item]
+            ["en.wikipedia=Foo", "en.wikipedia=Bar", None],  # type: ignore[list-item]
+        )
+    message = str(raised.value)
+    for expected in (
+        "topic must be a non-empty string",
+        "duplicate project",
+        "committed allowlist",
+        "must be a string",
+        "must use PROJECT=VALUE",
+        "duplicate topic-for",
+        "not requested",
+    ):
+        assert expected in message
+
+
+def test_ambiguous_discovery_requires_reason_without_mutating_discovery(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, forbidden_transport
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    search = b'{"query":{"search":[{"ns":0,"title":"Meaning one"},{"ns":0,"title":"Meaning two"}]}}'
+    metadata = _metadata_payload(
+        pages=[
+            {"ns": 0, "title": "Meaning one", "pageprops": {}},
+            {"ns": 0, "title": "Meaning two", "pageprops": {}},
+        ]
+    )
+    stub = transport_stub(
+        [
+            (200, {}, search),
+            (200, {}, metadata),
+            (200, {}, _volume_body_for_project(resolve_fixture, "en.wikipedia", "Meaning_one")),
+            (200, {}, _volume_body_for_project(resolve_fixture, "en.wikipedia", "Meaning_two")),
+        ]
+    )
+    args = ["--topic", "topic", "--projects", "en.wikipedia", "--out", str(out)]
+    assert resolve_articles.main(args, transport=stub, today_utc=TODAY) == 0
+    discovery = json.loads(out.read_text(encoding="utf-8"))
+    assert discovery["status"] == "awaiting_confirmation"
+    assert discovery["projects"][0]["status"] == "ambiguous"
+    assert discovery["projects"][0]["recommendation"] is None
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    assert resolve_articles.main(
+        [*args, "--select", "en.wikipedia=Meaning_one"],
+        transport=forbidden_transport,
+    ) == 2
+    assert out.read_bytes() == before
+    assert resolve_articles.main(
+        [*args, "--select", "en.wikipedia=Meaning_one", "--reason", "exact user concept"],
+        transport=forbidden_transport,
+    ) == 0
+    confirmed = json.loads(out.read_text(encoding="utf-8"))
+    assert confirmed["projects"][0]["selection"]["reason"] == "exact user concept"
+
+
+def test_all_error_and_unresolved_precedence_manifests_preserve_order(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "mixed.json"
+    search = _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")
+    metadata = _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")
+    api_error = b'{"error":{"code":"badrequest","info":"do not persist"}}'
+    stub = transport_stub(
+        [
+            (200, {}, search), (200, {}, metadata),
+            (200, {}, _volume_body_for_project(resolve_fixture, "en.wikipedia", "Intermittent_fasting")),
+            (200, {}, b'{"query":{"search":[]}}'),
+            (200, {}, api_error),
+        ]
+    )
+    args = [
+        "--topic", "topic",
+        "--projects", "en.wikipedia", "--projects", "pl.wikipedia", "--projects", "de.wikipedia",
+        "--out", str(out),
+    ]
+    assert resolve_articles.main(args, transport=stub, today_utc=TODAY) == 2
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["status"] == "unresolved"
+    assert [record["project"] for record in document["projects"]] == [
+        "en.wikipedia", "pl.wikipedia", "de.wikipedia"
+    ]
+    assert [record["status"] for record in document["projects"]] == [
+        "ready", "unresolved", "error"
+    ]
+    assert document["projects"][1]["reason"] == "search_no_hits"
+    assert document["projects"][2]["error"]["code"] == "action_api_error"
+
+    all_error = tmp_path / "all-error.json"
+    stub = transport_stub([(200, {}, api_error), (200, {}, api_error)])
+    all_args = [
+        "--topic", "topic", "--projects", "en.wikipedia", "--projects", "pl.wikipedia",
+        "--out", str(all_error),
+    ]
+    assert resolve_articles.main(all_args, transport=stub, today_utc=TODAY) == 1
+    all_document = json.loads(all_error.read_text(encoding="utf-8"))
+    assert all_document["status"] == "error"
+    assert all(record["error"]["code"] == "action_api_error" for record in all_document["projects"])
+
+
+def test_confirmation_rejects_unresolved_and_error_manifests(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, forbidden_transport
+):
+    _configure(monkeypatch, tmp_path)
+    for status in ("unresolved", "partial_error", "error"):
+        out = tmp_path / f"{status}.json"
+        document = {
+            "contract_version": resolve_articles.CONTRACT_VERSION,
+            "run_mode": "discover",
+            "status": status,
+            "topic": "topic",
+            "projects": [],
+        }
+        common.dump_json(document, out)
+        before = out.read_bytes()
+        _forbid_confirmation_side_effects(monkeypatch)
+        assert resolve_articles.main(
+            [
+                "--topic", "topic", "--projects", "en.wikipedia", "--out", str(out),
+                "--select", "en.wikipedia=Target",
+            ],
+            transport=forbidden_transport,
+        ) == 2
+        assert out.read_bytes() == before
 
