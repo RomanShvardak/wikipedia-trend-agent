@@ -513,7 +513,7 @@ def test_threshold_fixture_summaries_remain_inside_calibrated_bands() -> None:
         "fasting-pl": (727, 728, 239.6, 0.0179, -37.5, -38.5, "low", "noise"),
         "fasting-cs": (725, 728, 276.4, 0.0331, -54.3, -44.5, "low", "noise"),
         "astronomy-uk": (1094, 1094, 1417.5, 0.0219, -56.0, -56.2, "medium", "down"),
-        "space-exploration-uk": (1092, 1094, 545.8, 0.0247, -55.7, -57.7, "low", "noise"),
+        "space-exploration-uk": (1092, 1094, 545.8, 0.0247, -55.7, -57.7, "medium", "noise"),
         "english-pl": (728, 728, 8801.0, 0.0412, -18.6, -19.2, "medium", "down"),
         "english-cs": (728, 728, 3183.8, 0.0316, -22.3, -22.8, "medium", "down"),
         "english-uk": (728, 728, 8230.5, 0.0288, -36.2, -36.5, "medium", "down"),

@@ -9,8 +9,8 @@
       "article": "Post_przerywany",
       "label": "Польська: інтервальне голодування",
       "language": "pl",
-      "total_views": 1487229,
-      "avg_daily_views": 2042.9,
+      "total_views": 833112,
+      "avg_daily_views": 1144.4,
       "period": {
         "start": "2024-09-23",
         "end": "2026-09-20",
@@ -18,23 +18,23 @@
       },
       "growth": {
         "m3": {
-          "pct": 0.5,
-          "abs": 10,
+          "pct": 5.7,
+          "abs": 64,
           "start": "2026-06-22",
           "end": "2026-09-20",
           "clean": {
-            "pct": 0.5,
-            "abs": 10
+            "pct": 5.7,
+            "abs": 64
           }
         },
         "y1": {
-          "pct": 1.8,
-          "abs": 36,
+          "pct": 1.4,
+          "abs": 16,
           "start": "2025-09-21",
           "end": "2026-09-20",
           "clean": {
-            "pct": 1.8,
-            "abs": 36
+            "pct": 1.4,
+            "abs": 16
           }
         },
         "y2": {
@@ -59,8 +59,15 @@
         "no anomalies detected"
       ],
       "seasonality": {
-        "months": [],
-        "note": "insufficient observations in one or both aligned 365-day halves"
+        "months": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "note": "recurring peaks are above the monthly median in both aligned years"
       },
       "anomalies": []
     },
@@ -70,8 +77,8 @@
       "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
       "label": "Чеська: інтервальне голодування",
       "language": "cs",
-      "total_views": 613629,
-      "avg_daily_views": 842.9,
+      "total_views": 1532286,
+      "avg_daily_views": 2104.8,
       "period": {
         "start": "2024-09-23",
         "end": "2026-09-20",
@@ -79,23 +86,23 @@
       },
       "growth": {
         "m3": {
-          "pct": 1.2,
-          "abs": 10,
+          "pct": 2.2,
+          "abs": 47,
           "start": "2026-06-22",
           "end": "2026-09-20",
           "clean": {
-            "pct": 1.2,
-            "abs": 10
+            "pct": 2.2,
+            "abs": 47
           }
         },
         "y1": {
-          "pct": 4.4,
-          "abs": 36,
+          "pct": 0.4,
+          "abs": 8,
           "start": "2025-09-21",
           "end": "2026-09-20",
           "clean": {
-            "pct": 4.4,
-            "abs": 36
+            "pct": 0.4,
+            "abs": 8
           }
         },
         "y2": {
@@ -120,8 +127,15 @@
         "no anomalies detected"
       ],
       "seasonality": {
-        "months": [],
-        "note": "insufficient observations in one or both aligned 365-day halves"
+        "months": [
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "note": "recurring peaks are above the monthly median in both aligned years"
       },
       "anomalies": []
     }

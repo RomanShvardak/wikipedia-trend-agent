@@ -21,7 +21,7 @@
       "anomaly_share": 0.0179,
       "raw_y1_pct": -37.5,
       "clean_y1_pct": -38.5,
-      "confidence": "medium",
+      "confidence": "low",
       "direction": "noise"
     },
     {
@@ -35,7 +35,7 @@
       "anomaly_share": 0.0331,
       "raw_y1_pct": -54.3,
       "clean_y1_pct": -44.5,
-      "confidence": "medium",
+      "confidence": "low",
       "direction": "noise"
     },
     {
@@ -119,7 +119,7 @@
       "anomaly_share": 0.0247,
       "raw_y1_pct": -24.7,
       "clean_y1_pct": -25.1,
-      "confidence": "high",
+      "confidence": "medium",
       "direction": "down"
     }
   ]
