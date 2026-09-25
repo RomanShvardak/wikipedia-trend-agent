@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypedDict
@@ -133,7 +133,7 @@ def _zero_rows(
     ]
 
 
-def _date_range(start: date, end: date):
+def _date_range(start: date, end: date) -> Iterator[date]:
     current = start
     while current <= end:
         yield current
@@ -357,8 +357,10 @@ def _write_series_csv(out_dir: str | Path, rows: list[SeriesRow]) -> Path:
         writer = csv.writer(handle)
         writer.writerow(CSV_HEADER)
         writer.writerows(
-            [row[column] for column in CSV_HEADER]
-            for row in sorted(rows, key=lambda row: (row["series_id"], row["date"]))
+            [
+                [row["date"], row["views"], row["series_id"], row["project"], row["article"]]
+                for row in sorted(rows, key=lambda row: (row["series_id"], row["date"]))
+            ]
         )
     return output
 

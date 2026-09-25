@@ -173,3 +173,159 @@ Pipeline stages must not emit fields absent from this document — the enclosing
 document is the D-04 contract freeze that later phases build against
 (Phase 3 `analyze_trends.py` emits into this exact schema; Phase 6
 `build_report.py` reads from it).
+
+## 6. `resolved.json` — `resolved.v1` (pre-stage, Phase 4)
+
+`resolved.json` is a **separate pre-stage contract**. It does not change any
+frozen `spec.json` or `metrics.json` field in §1–§4: the model authors
+`spec.json` only after `resolved.json` reaches `status="confirmed"`, and the
+confirmed `selection.article` becomes the exact `spec.series[].article` value.
+
+### 6.1 Top-level fields
+
+| Field | Type | Description |
+|---|---|---|
+| `contract_version` | `"resolved.v1"` | Exact version; anything else is rejected. |
+| `run_mode` | `"discover"` \| `"confirm"` | Network discovery or offline confirmation. |
+| `status` | enum below | Run-level outcome; drives the exit code. |
+| `topic` | string | The one shared natural-language topic (`--topic`). |
+| `topic_overrides` | array of `{project, query}` | Ordered `--topic-for` expressions exactly as supplied. |
+| `generated_at` | timezone-aware ISO-8601 string | Discovery publication time. |
+| `volume_window` | object | `{start, end, days: 30, access: "all-access", agent: "user", granularity: "daily"}`; one shared window of 30 complete UTC days ending yesterday. |
+| `projects` | ordered array | Exactly the ordered `--projects` context, one record each. |
+
+Enums: top `status` is `awaiting_confirmation | confirmed | unresolved |
+partial_error | error`; project `status` is `ready | ambiguous | unresolved |
+error`; candidate `status` is `selectable | unresolved`; volume `status` is
+`available | unavailable`; `query_source` is `shared | project_override`.
+
+### 6.2 Project record
+
+Each project record carries exactly `project`, `effective_query`,
+`query_source`, `status`, `recommendation`, ordered `search_hits`, `candidates`,
+`selection`, `reason`, and `error`.
+
+- **ordered `search_hits`** is a list of `{title, rank}` in API order with
+  `rank == position + 1`; it is `null` only when an error occurred before a
+  validated search list existed. A metadata/AQS error after a completed search
+  still keeps the ordered list.
+- `ready` has exactly one selectable candidate and a non-null recommendation;
+  `ambiguous` has multiple selectable candidates, `recommendation=null`, and
+  requires `--reason` on confirmation.
+- **D-11 zero hits** is exactly `reason="search_no_hits"`, `search_hits=[]`,
+  and `candidates=[]`.
+- **D-08 structural unresolved** is exactly `reason="no_selectable_candidates"`
+  with a non-empty `candidates` list whose records retain `status="unresolved"`,
+  `article=null`, redirect provenance, and a stable reason: `redirect_cycle`,
+  `redirect_too_deep`, `missing_target`, `non_article_namespace`, or
+  `disambiguation_page`. Flattening or deleting that provenance invalidates the
+  document.
+- **Any unresolved project takes precedence over `partial_error`**, and an
+  all-`error` run is `error`.
+
+### 6.3 Candidate, volume, and selection
+
+A selectable candidate carries exactly `status`, `article`, `title`,
+`namespace` (`0`), `input_titles`, `redirect_chain`, `search_rank`,
+`exact_title_match`, `disambiguation` (`false`), `volume`, and `reason`
+(`null`). An unresolved candidate carries the same provenance fields without
+`volume`, plus its stable `reason`.
+
+Volume is one shared 30-day AQS evidence object. Every item must match the
+expected project, the **encoded canonical article**, `all-access`, `user`,
+`daily`, the requested window, and non-negative integer views **before** any
+sum, cache write, or `candidate.volume` mutation. A valid 200 is `available`
+with the exact sum, observed days, and `low_volume=(total_views < 1000)`.
+AQS 404 is `unavailable` with `total_views=null`, `low_volume=null`, and reason
+`aqs_404_zero_or_not_loaded` — never numeric zero. Low-volume candidates remain
+selectable.
+
+`selection` is `null` in discovery. A valid confirmation sets it to exactly
+`{article, title, reason, source:"model_confirmation"}` for **exactly one
+selectable candidate per requested project**; the selection is candidate-bounded
+and the `article` is copied verbatim into `spec.series[].article`.
+
+### 6.4 Cache, retry, and resource contract
+
+Every search, metadata, and AQS request is cache-first. The JSON cache key is
+SHA-256 of the full URL; the envelope is exactly
+`{fetched_at, status: 200, response}`. An endpoint validator — including the
+expected AQS series identity — must pass before a cached value is trusted or a
+new body is written. HTTP-200 Action `error`/non-empty `errors` bodies, 403,
+exhausted 429/5xx, malformed bodies, and oversized bodies never create or trust
+a cache entry and never mutate candidate state.
+
+`--ttl-hours` is a non-negative finite float. Its parser default is a valid
+`WTI_TTL_HOURS` value when present, otherwise `24.0`; an explicit CLI value
+wins; `0` bypasses cache reads for the run while retaining the same validated
+write envelope and full-URL key. HTTP 403 is immediately fatal; 429, 5xx, and
+transport failures use at most three attempts and honor integer or HTTP-date
+`Retry-After` with a 5.0-second fallback.
+
+`MAX_PROJECTS=8` rejects over-fanout before `user_agent()`, host construction, or
+transport. `MAX_RESPONSE_BYTES=1_048_576` rejects a declared over-limit
+`Content-Length` before reading and otherwise performs exactly
+`read(MAX_RESPONSE_BYTES + 1)`; the bounded resolver transport raises
+`ResponseTooLarge` without an unbounded read.
+
+### 6.5 Confirmation, atomicity, and exit codes
+
+Confirmation is offline and candidate-bounded. It repeats `--topic`, the ordered
+`--projects`, and every `--topic-for` expression: an exact replay is accepted;
+a changed or omitted expression is rejected. The complete saved document is
+validated before any in-memory record changes, the confirmed document is
+validated again in `confirm` mode, and only then is it published with one
+atomic `os.replace`. Any invalid transition returns 2 with the prior discovery
+bytes unchanged; a publication failure returns 1, reports the stable
+`publication_error` code, and leaves no `.resolved.json.*.tmp` staging file.
+
+| Situation | Manifest | Exit |
+|---|---|---|
+| input preflight / invalid confirmation | prior bytes preserved | 2 |
+| all requested projects ready or ambiguous | `awaiting_confirmation` | 0 |
+| any unresolved project (including mixed with errors) | `unresolved` | 2 |
+| some error with a successful sibling | `partial_error` | 3 |
+| every project failed, or fatal 403/UA/runtime | `error` / none | 1 |
+| valid exactly-one-per-project confirmation | `confirmed` | 0 |
+
+`--verbose` is an optional logging-only diagnostic flag: it adds no manifest
+field, does not alter selection, and changes no API behavior.
+
+**Concurrency assumption:** atomic replacement prevents partial files and
+requests are serial within one process, but two independent processes targeting
+the same `--out` are not serialized by the resolver. They are
+**caller-serialized**: the caller must serialize them. Without that caller
+serialization, the **last completed atomic replace wins**.
+
+### 6.6 `resolved.v1` CLI contract
+
+```bash
+# run 1 — discovery
+python scripts/resolve_articles.py --topic "intermittent fasting" \
+  --projects en.wikipedia --projects pl.wikipedia \
+  --topic-for pl.wikipedia="Post przerywany" \
+  --out out/resolved.json --ttl-hours 24
+
+# run 2 — offline confirmation
+python scripts/resolve_articles.py --topic "intermittent fasting" \
+  --projects en.wikipedia --projects pl.wikipedia \
+  --topic-for pl.wikipedia="Post przerywany" \
+  --out out/resolved.json \
+  --select en.wikipedia=Intermittent_fasting \
+  --select pl.wikipedia=Post_przerywany
+```
+
+Flags: required `--topic`; ordered `--projects`; repeatable `--topic-for
+PROJECT=QUERY` and `--select PROJECT=ARTICLE`; `--out` (default
+`out/resolved.json`); `--reason`; `--ttl-hours`; and logging-only `--verbose`.
+
+### 6.7 Resolver fixtures
+
+- `tests/fixtures/resolve.search.*.json` — committed Action search responses.
+- `tests/fixtures/resolve.redirects.*.json` — redirect/pageprops metadata.
+- `tests/fixtures/resolve.api-error.*.json` — HTTP-200 Action error envelopes.
+- `tests/fixtures/pageviews.200.json` / `pageviews.404.json` — AQS volume
+  states used by the resolver evidence contract.
+- `assets/wikipedia-projects.json` — the versioned offline project allowlist.
+
+No test may reach the network; every transport is injected or forbidden.
