@@ -14,7 +14,6 @@ import sys
 import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -27,7 +26,10 @@ from common import (
     cache_path_for_key,
     default_transport,
     dump_json,
+    header_value,
+    is_retryable_status,
     load_and_validate_spec,
+    retry_after_seconds,
     setup_logging,
     user_agent,
 )
@@ -141,45 +143,6 @@ def _date_range(start: date, end: date):
 def _diagnostic(series_id: str, message: str) -> None:
     """Write one grep-friendly per-series diagnostic to stderr."""
     print(f"{series_id}: {message}", file=sys.stderr)
-
-
-def _header_value(headers: Mapping[str, Any], name: str) -> str | None:
-    """Read a response header case-insensitively without exposing its value."""
-    wanted = name.casefold()
-    for key, value in headers.items():
-        if str(key).casefold() == wanted and isinstance(value, str):
-            return value
-    return None
-
-
-def retry_after_seconds(
-    headers: Mapping[str, Any],
-    now: datetime | None = None,
-) -> float:
-    """Parse Retry-After seconds or an HTTP-date, with a safe 5-second fallback."""
-    raw = _header_value(headers, "Retry-After")
-    if raw is None:
-        return RETRY_FALLBACK_SECONDS
-
-    value = raw.strip()
-    if value.isdigit():
-        seconds = int(value)
-        return float(seconds) if seconds > 0 else RETRY_FALLBACK_SECONDS
-
-    try:
-        retry_at = parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError, OverflowError):
-        return RETRY_FALLBACK_SECONDS
-    if retry_at.tzinfo is None:
-        retry_at = retry_at.replace(tzinfo=timezone.utc)
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return max(0.0, (retry_at - current).total_seconds())
-
-
-def _is_retryable_status(status: int) -> bool:
-    return status == 429 or 500 <= status <= 599
 
 
 def _print_summary(
@@ -371,7 +334,7 @@ def _fetch_series(
                 if classification == "not_loaded":
                     return [], False, "not_loaded"
                 return _zero_rows(series, start_ymd, end_ymd), False, "no_views"
-            if _is_retryable_status(response.status) and attempt < MAX_FETCH_ATTEMPTS:
+            if is_retryable_status(response.status) and attempt < MAX_FETCH_ATTEMPTS:
                 sleep(retry_after_seconds(response.headers))
                 continue
             if response.status != 200:
@@ -383,15 +346,7 @@ def _fetch_series(
 
     rows = _parse_response(payload_bytes, series, start_ymd, end_ymd)
     parsed_payload = json.loads(payload_bytes.decode("utf-8"))
-    cache_path = cache_path_for_key(cache_key_for_url(url))
-    dump_json(
-        {
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "status": 200,
-            "response": parsed_payload,
-        },
-        cache_path,
-    )
+    common.write_json_cache(url, parsed_payload)
     return rows, False, "ok"
 
 

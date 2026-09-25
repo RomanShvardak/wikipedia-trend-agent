@@ -189,7 +189,7 @@ def test_bounded_transport_reads_limit_plus_one_for_normal_and_error(monkeypatch
             code=404,
             msg="Not Found",
             hdrs=Message(),
-            fp=ErrorStream(),
+            fp=ErrorStream(stream.body),
         )
         raise error
 

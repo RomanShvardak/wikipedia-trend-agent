@@ -19,14 +19,16 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 DEFAULT_UA = "wikipedia-trend-agent/0.1.0 (contact@example.org) python-urllib"
 CACHE_DIR = Path(os.environ.get("WTI_CACHE", ".cache"))
+RETRY_FALLBACK_SECONDS = 5.0
 log = logging.getLogger("wta")
 
 _DATE_RE = re.compile(r"^\d{8}$")
@@ -63,28 +65,180 @@ class TransportError(RuntimeError):
     """The transport could not complete an HTTP exchange."""
 
 
+class ResponseTooLarge(TransportError):
+    """The response exceeds the caller's explicit byte bound."""
+
+
+def _validated_max_bytes(max_bytes: int | None) -> int | None:
+    if max_bytes is None:
+        return None
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be a positive integer or None")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    return max_bytes
+
+
+def _read_response_body(stream: Any, max_bytes: int | None) -> bytes:
+    if max_bytes is None:
+        return stream.read()
+
+    declared = header_value(dict(getattr(stream, "headers", {}) or {}), "Content-Length")
+    if declared is not None:
+        try:
+            declared_length = int(declared)
+        except (TypeError, ValueError):
+            declared_length = -1
+        if declared_length > max_bytes:
+            raise ResponseTooLarge(
+                f"response Content-Length {declared_length} exceeds {max_bytes} bytes"
+            )
+
+    body = stream.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise ResponseTooLarge(f"response body exceeds {max_bytes} bytes")
+    return body
+
+
 def default_transport(
     url: str,
     headers: dict[str, str],
     timeout: float = 30.0,
+    *,
+    max_bytes: int | None = None,
 ) -> TransportResponse:
-    """Perform one urllib GET and normalize HTTP errors into responses."""
+    """Perform one urllib GET, optionally bounding response allocation."""
+    byte_limit = _validated_max_bytes(max_bytes)
     request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return TransportResponse(
                 status=int(response.status),
                 headers=dict(response.headers),
-                body=response.read(),
+                body=_read_response_body(response, byte_limit),
             )
     except urllib.error.HTTPError as error:
         return TransportResponse(
             status=int(error.code),
             headers=dict(error.headers) if error.headers is not None else {},
-            body=error.read(),
+            body=_read_response_body(error, byte_limit),
         )
     except OSError as error:
         raise TransportError(str(error)) from error
+
+
+def header_value(headers: Mapping[str, Any], name: str) -> str | None:
+    """Read a response header case-insensitively without exposing its value."""
+    wanted = name.casefold()
+    for key, value in headers.items():
+        if str(key).casefold() == wanted and isinstance(value, str):
+            return value
+    return None
+
+
+def retry_after_seconds(
+    headers: Mapping[str, Any],
+    now: datetime | None = None,
+) -> float:
+    """Parse Retry-After seconds or an HTTP-date with a safe five-second fallback."""
+    raw = header_value(headers, "Retry-After")
+    if raw is None:
+        return RETRY_FALLBACK_SECONDS
+
+    value = raw.strip()
+    if value.isdigit():
+        seconds = int(value)
+        return float(seconds) if seconds > 0 else RETRY_FALLBACK_SECONDS
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return RETRY_FALLBACK_SECONDS
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - current).total_seconds())
+
+
+def is_retryable_status(status: int) -> bool:
+    """Return whether an endpoint should apply the bounded retry policy."""
+    return status == 429 or 500 <= status <= 599
+
+
+def read_json_cache(
+    url: str,
+    ttl_hours: float,
+    validate: Callable[[dict[str, object]], object | None],
+) -> object | None:
+    """Return a fresh validator-approved HTTP 200 payload or a safe miss."""
+    if ttl_hours <= 0:
+        return None
+    path = cache_path_for_key(cache_key_for_url(url))
+    if not path.exists():
+        return None
+
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("status") != 200
+            or not isinstance(envelope.get("response"), dict)
+            or not isinstance(envelope.get("fetched_at"), str)
+        ):
+            raise ValueError("invalid cache envelope")
+        fetched_at = datetime.fromisoformat(envelope["fetched_at"])
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        response = envelope["response"]
+        if not isinstance(response, dict):
+            raise ValueError("cache response must be an object")
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        _remove_cache_path(path)
+        return None
+
+    if datetime.now(timezone.utc) - fetched_at > timedelta(hours=ttl_hours):
+        return None
+
+    try:
+        validated = validate(response)
+    except (TypeError, ValueError, KeyError):
+        _remove_cache_path(path)
+        return None
+    if validated is None:
+        _remove_cache_path(path)
+        return None
+    return validated
+
+
+def _remove_cache_path(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning("could not remove invalid cache entry %s", path.name)
+
+
+def write_json_cache(
+    url: str,
+    payload: dict[str, object],
+    *,
+    fetched_at: datetime | None = None,
+) -> Path:
+    """Atomically publish a validated HTTP 200 JSON cache envelope."""
+    path = cache_path_for_key(cache_key_for_url(url))
+    timestamp = fetched_at or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    dump_json(
+        {
+            "fetched_at": timestamp.isoformat(),
+            "status": 200,
+            "response": payload,
+        },
+        path,
+    )
+    return path
 
 
 def setup_logging(verbose: bool = False) -> None:
