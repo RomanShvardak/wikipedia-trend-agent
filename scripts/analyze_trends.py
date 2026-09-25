@@ -9,6 +9,7 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
+from fractions import Fraction
 from pathlib import Path
 from statistics import median
 from typing import Any, cast
@@ -294,7 +295,15 @@ def _growth_result(
                 "reason": INSUFFICIENT_OBSERVATIONS_REASON,
             },
         }
-    previous_mean = sum(previous_values) / len(previous_values)
+    previous_mean = sum(
+        (
+            Fraction(value)
+            if isinstance(value, int)
+            else Fraction.from_float(value)
+            for value in previous_values
+        ),
+        Fraction(0),
+    ) / len(previous_values)
     if previous_mean == 0:
         return {
             "pct": None,
@@ -306,13 +315,23 @@ def _growth_result(
                 "reason": ZERO_PREVIOUS_MEAN_REASON,
             },
         }
-    current_mean = sum(current_values) / len(current_values)
+    current_mean = sum(
+        (
+            Fraction(value)
+            if isinstance(value, int)
+            else Fraction.from_float(value)
+            for value in current_values
+        ),
+        Fraction(0),
+    ) / len(current_values)
+    exact_pct = (current_mean / previous_mean - 1) * 100
+    exact_abs = current_mean - previous_mean
     return {
-        "pct": round((current_mean / previous_mean - 1) * 100, 1),
-        "abs": int(round(current_mean - previous_mean)),
+        "pct": float(round(exact_pct, 1)),
+        "abs": int(round(exact_abs)),
         "clean": {
-            "pct": round((current_mean / previous_mean - 1) * 100, 1),
-            "abs": int(round(current_mean - previous_mean)),
+            "pct": float(round(exact_pct, 1)),
+            "abs": int(round(exact_abs)),
         },
     }
 
@@ -414,7 +433,7 @@ def compute_seasonality(
 
 def score_confidence(
     period_days: int,
-    monthly_30d: float,
+    monthly_30d: int | float | Fraction,
     anomaly_share: float,
     clean_y1_available: bool,
     comparison_span: tuple[date, date] | None,
@@ -475,7 +494,7 @@ def safe_direction(
     raw_y1_pct: float | None,
     clean_y1_pct: float | None,
     confidence: str,
-    monthly_30d: float,
+    monthly_30d: int | float | Fraction,
 ) -> str:
     """Apply period, confidence, volume, and raw/clean agreement safety gates."""
     if period_days < MIN_PERIOD_DAYS or clean_y1_pct is None:
@@ -553,9 +572,10 @@ def build_metrics(
         start = observations[0].date
         end = observations[-1].date
         period_days = (end - start).days + 1
-        total_views = sum(observation.views for observation in observations)
-        avg_daily_views = round(total_views / period_days, 1)
-        monthly_30d = avg_daily_views * 30
+        total_views = sum(int(observation.views) for observation in observations)
+        average_daily_exact = Fraction(total_views, period_days)
+        monthly_30d_exact = average_daily_exact * 30
+        avg_daily_views = round(float(average_daily_exact), 1)
         anomalies = detect_anomalies(observations)
         anomaly_share = len(anomalies) / len(observations)
         clean_observations = replace_anomalies(observations, anomalies)
@@ -572,7 +592,7 @@ def build_metrics(
             comparison_span = (y1_previous_start, end)
         confidence, confidence_reasons = score_confidence(
             period_days,
-            monthly_30d,
+            monthly_30d_exact,
             anomaly_share,
             clean_y1_available,
             comparison_span,
@@ -584,7 +604,7 @@ def build_metrics(
             raw_y1 if isinstance(raw_y1, (int, float)) else None,
             clean_y1_pct if isinstance(clean_y1_pct, (int, float)) else None,
             confidence,
-            monthly_30d,
+            monthly_30d_exact,
         )
         output_series.append(
             {
