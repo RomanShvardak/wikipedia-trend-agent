@@ -1693,3 +1693,218 @@ def test_declared_oversize_rejects_before_stream_read(monkeypatch):
     assert stream.reads == []
 
 
+def _valid_discovery_document(
+    out: Path, tmp_path: Path, monkeypatch, transport_stub, resolve_fixture
+) -> dict[str, object]:
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def test_validate_resolved_document_accepts_discovery_and_confirmed_documents(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, forbidden_transport
+):
+    assert hasattr(resolve_articles, "validate_resolved_document")
+    out = tmp_path / "resolved.json"
+    discovery = _valid_discovery_document(
+        out, tmp_path, monkeypatch, transport_stub, resolve_fixture
+    )
+    _forbid_confirmation_side_effects(monkeypatch)
+
+    resolve_articles.validate_resolved_document(
+        discovery,
+        expected_topic="intermittent fasting",
+        expected_projects=["en.wikipedia"],
+        expected_overrides=[],
+        mode="discover",
+    )
+    confirmed, exit_code = resolve_articles.confirm(
+        topic="intermittent fasting",
+        projects=["en.wikipedia"],
+        topic_overrides=[],
+        selections={"en.wikipedia": "Intermittent_fasting"},
+        reason=None,
+        out=out,
+    )
+    assert exit_code == 0
+    assert confirmed is not None
+    resolve_articles.validate_resolved_document(
+        confirmed,
+        expected_topic="intermittent fasting",
+        expected_projects=["en.wikipedia"],
+        expected_overrides=[],
+        mode="confirm",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "delete_candidate_provenance",
+        "selectable_candidate_reason",
+        "search_hits_null_without_error",
+        "structural_unresolved_without_records",
+        "zero_hit_with_candidates",
+        "available_volume_null_total",
+        "unavailable_volume_numeric_total",
+        "changed_override_expression",
+    ],
+)
+def test_validate_resolved_document_rejects_structural_mutations(
+    mutation,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+):
+    out = tmp_path / "resolved.json"
+    document = _valid_discovery_document(
+        out, tmp_path, monkeypatch, transport_stub, resolve_fixture
+    )
+    project = document["projects"][0]
+    candidate = project["candidates"][0]
+
+    if mutation == "delete_candidate_provenance":
+        del candidate["redirect_chain"]
+    elif mutation == "selectable_candidate_reason":
+        candidate["reason"] = "redirect_cycle"
+    elif mutation == "search_hits_null_without_error":
+        project["search_hits"] = None
+    elif mutation == "structural_unresolved_without_records":
+        project["status"] = "unresolved"
+        project["reason"] = "no_selectable_candidates"
+        project["candidates"] = []
+    elif mutation == "zero_hit_with_candidates":
+        project["status"] = "unresolved"
+        project["reason"] = "search_no_hits"
+    elif mutation == "available_volume_null_total":
+        candidate["volume"]["total_views"] = None
+    elif mutation == "unavailable_volume_numeric_total":
+        candidate["volume"] = {
+            "status": "unavailable",
+            "total_views": 0,
+            "window": {"start": "2026-08-26", "end": "2026-09-24"},
+            "observed_days": None,
+            "last_observed_date": None,
+            "low_volume": None,
+            "reason": "aqs_404_zero_or_not_loaded",
+        }
+    else:
+        document["topic_overrides"] = [
+            {"project": "en.wikipedia", "query": "changed"}
+        ]
+
+    with pytest.raises(resolve_articles.ResolveInputError):
+        resolve_articles.validate_resolved_document(
+            document,
+            expected_topic="intermittent fasting",
+            expected_projects=["en.wikipedia"],
+            expected_overrides=[],
+            mode="discover",
+        )
+
+
+def test_override_context_change_and_omission_follow_cli_path_without_side_effects(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, forbidden_transport
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(
+        out,
+        tmp_path,
+        monkeypatch,
+        transport_stub,
+        resolve_fixture,
+        extra_args=["--topic-for", "en.wikipedia=fasting"],
+    )
+    before = out.read_bytes()
+    forbidden_calls: list[str] = []
+
+    def record(name):
+        def forbidden(*_args: object, **_kwargs: object) -> None:
+            forbidden_calls.append(name)
+            raise AssertionError(f"confirmation must not call {name}")
+
+        return forbidden
+
+    for name in ("user_agent", "throttle", "read_json_cache", "write_json_cache"):
+        monkeypatch.setattr(common, name, record(name))
+
+    changed = [
+        *_args(out),
+        "--topic-for",
+        "en.wikipedia=changed",
+        "--select",
+        "en.wikipedia=Intermittent_fasting",
+    ]
+    omitted = [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"]
+    assert resolve_articles.main(changed, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+    assert resolve_articles.main(omitted, transport=forbidden_transport) == 2
+    assert out.read_bytes() == before
+    assert forbidden_calls == []
+
+    exact_replay = [
+        *_args(out),
+        "--topic-for",
+        "en.wikipedia=fasting",
+        "--select",
+        "en.wikipedia=Intermittent_fasting",
+    ]
+    assert resolve_articles.main(exact_replay, transport=forbidden_transport) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["status"] == "confirmed"
+
+
+def test_structural_unresolved_manifest_cannot_be_confirmed_and_keeps_bytes(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, forbidden_transport
+):
+    out = tmp_path / "resolved.json"
+    document = _valid_discovery_document(
+        out, tmp_path, monkeypatch, transport_stub, resolve_fixture
+    )
+    project = document["projects"][0]
+    project["status"] = "unresolved"
+    project["reason"] = "no_selectable_candidates"
+    project["candidates"] = []
+    common.dump_json(document, out)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+
+    assert resolve_articles.main(
+        [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"],
+        transport=forbidden_transport,
+    ) == 2
+    assert out.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["dump_json", "os_replace"])
+def test_publication_failure_preserves_bytes_and_removes_staging_file(
+    failure,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+    forbidden_transport,
+):
+    out = tmp_path / "resolved.json"
+    _run_discovery(out, tmp_path, monkeypatch, transport_stub, resolve_fixture)
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+
+    if failure == "dump_json":
+        def fail_publish(_document, _path):
+            raise OSError("injected publication failure")
+
+        monkeypatch.setattr(common, "dump_json", fail_publish)
+    else:
+        def fail_replace(_source, _target):
+            raise OSError("injected replace failure")
+
+        monkeypatch.setattr(common.os, "replace", fail_replace)
+
+    assert resolve_articles.main(
+        [*_args(out), "--select", "en.wikipedia=Intermittent_fasting"],
+        transport=forbidden_transport,
+    ) == 1
+    assert out.read_bytes() == before
+    assert list(out.parent.glob(".resolved.json.*.tmp")) == []
+
+
