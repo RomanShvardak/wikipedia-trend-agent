@@ -1100,7 +1100,7 @@ def _precision_gap_rows() -> list[dict[str, object]]:
         rows.append(
             {
                 "date": (volume_start + timedelta(days=index)).isoformat(),
-                "views": 33 if index < 335 else 34,
+                "views": 33 if index < 665 else 34,
                 "series_id": "exact-volume",
                 "project": "en.wikipedia",
                 "article": "Exact_volume",
