@@ -7,6 +7,7 @@ import json
 import math
 import unicodedata
 from datetime import date, timedelta
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -1050,3 +1051,104 @@ def test_committed_golden_has_no_unreachable_seasonality_note() -> None:
     for series in golden["series"]:
         assert series["seasonality"]["note"] in reachable_notes
         assert series["seasonality"]["note"] != analyze_trends.SEASONALITY_UNAVAILABLE_NOTE
+
+
+def _write_precision_gap_spec(tmp_path: Path) -> Path:
+    spec = {
+        "name": "exact-growth-volume-tracer",
+        "request": "Verify exact growth and exact monthly-volume eligibility.",
+        "language": "uk",
+        "window": {"start": "20220101", "end": "20251230", "granularity": "daily"},
+        "series": [
+            {
+                "id": "large-count",
+                "project": "en.wikipedia",
+                "article": "Large_count",
+                "label": "Large count",
+                "language": "en",
+            },
+            {
+                "id": "exact-volume",
+                "project": "en.wikipedia",
+                "article": "Exact_volume",
+                "label": "Exact volume",
+                "language": "en",
+            },
+        ],
+    }
+    path = tmp_path / "precision-gap-spec.json"
+    path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _precision_gap_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    large_start = date(2024, 1, 1)
+    for index in range(730):
+        rows.append(
+            {
+                "date": (large_start + timedelta(days=index)).isoformat(),
+                "views": 10**19 + (1 if index >= 365 else 0),
+                "series_id": "large-count",
+                "project": "en.wikipedia",
+                "article": "Large_count",
+            }
+        )
+
+    volume_start = date(2022, 9, 24)
+    for index in range(1_000):
+        rows.append(
+            {
+                "date": (volume_start + timedelta(days=index)).isoformat(),
+                "views": 33 if index < 335 else 34,
+                "series_id": "exact-volume",
+                "project": "en.wikipedia",
+                "article": "Exact_volume",
+            }
+        )
+    return rows
+
+
+def test_exact_growth_and_unrounded_volume_end_to_end(tmp_path: Path) -> None:
+    """One offline CLI run preserves exact large-count growth and volume gates."""
+    spec_path = _write_precision_gap_spec(tmp_path)
+    out_dir = tmp_path / "out"
+    _write_series_csv(out_dir / "series.csv", _precision_gap_rows())
+
+    assert _run_analyzer(spec_path, out_dir) == 0
+
+    document = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+    _assert_all_finite(document)
+    assert set(document) == {"spec_name", "as_of", "generated_from", "series"}
+    assert [series["series_id"] for series in document["series"]] == [
+        "large-count",
+        "exact-volume",
+    ]
+    large_count, exact_volume = document["series"]
+
+    assert large_count["growth"]["y1"]["abs"] == 1
+    assert large_count["growth"]["y1"]["clean"]["abs"] == 1
+    assert large_count["growth"]["y1"]["pct"] == 0.0
+    assert large_count["growth"]["y1"]["clean"]["pct"] == 0.0
+
+    monthly_30d_exact = Fraction(exact_volume["total_views"], exact_volume["period"]["days"]) * 30
+    assert monthly_30d_exact == Fraction(20_001, 20)
+    assert exact_volume["avg_daily_views"] == 33.3
+    expected_confidence, _ = analyze_trends.score_confidence(
+        exact_volume["period"]["days"],
+        monthly_30d_exact,
+        exact_volume["anomaly_share"],
+        True,
+        None,
+    )
+    expected_direction = analyze_trends.safe_direction(
+        exact_volume["period"]["days"],
+        exact_volume["growth"]["y1"]["pct"],
+        exact_volume["growth"]["y1"]["clean"]["pct"],
+        expected_confidence,
+        monthly_30d_exact,
+    )
+    assert exact_volume["confidence"] == expected_confidence
+    assert exact_volume["trend_direction"] == expected_direction
+    assert analyze_trends.VOLUME_MINIMUM_REASON in exact_volume["confidence_reasons"]
+    assert analyze_trends.VOLUME_BELOW_MINIMUM_REASON not in exact_volume["confidence_reasons"]
