@@ -442,6 +442,9 @@ def test_transport_exports_are_common_implementation_aliases():
     assert fetch_pageviews.TransportResponse is common.TransportResponse
     assert fetch_pageviews.FetchTransportError is common.TransportError
     assert fetch_pageviews.default_transport is common.default_transport
+    assert fetch_pageviews.header_value is common.header_value
+    assert fetch_pageviews.retry_after_seconds is common.retry_after_seconds
+    assert fetch_pageviews.is_retryable_status is common.is_retryable_status
 
 
 def test_default_transport_converts_http_error_to_response(monkeypatch):
