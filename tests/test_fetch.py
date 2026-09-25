@@ -438,6 +438,12 @@ def test_distinct_series_urls_create_distinct_cache_files(
     assert all("items" in envelope["response"] for envelope in envelopes)
 
 
+def test_transport_exports_are_common_implementation_aliases():
+    assert fetch_pageviews.TransportResponse is common.TransportResponse
+    assert fetch_pageviews.FetchTransportError is common.TransportError
+    assert fetch_pageviews.default_transport is common.default_transport
+
+
 def test_default_transport_converts_http_error_to_response(monkeypatch):
     body = b'{"status":404}'
     error = urllib.error.HTTPError(
@@ -453,7 +459,7 @@ def test_default_transport_converts_http_error_to_response(monkeypatch):
         assert timeout == 3.0
         raise error
 
-    monkeypatch.setattr(fetch_pageviews.urllib.request, "urlopen", fail_urlopen)
+    monkeypatch.setattr(common.urllib.request, "urlopen", fail_urlopen)
 
     response = default_transport(
         "https://wikimedia.org/example",
