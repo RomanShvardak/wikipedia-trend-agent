@@ -49,6 +49,24 @@ def test_user_agent_ok(monkeypatch):
     assert user_agent() == DESCRIPTIVE_UA
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        DESCRIPTIVE_UA + "\r\nInjected: true",
+        DESCRIPTIVE_UA + "\x00",
+        DESCRIPTIVE_UA + "\x85",
+        DESCRIPTIVE_UA + ("x" * 257),
+    ],
+)
+def test_user_agent_rejects_controls_and_unreasonable_length(monkeypatch, value):
+    # Bypass os.environ's platform-level NUL restriction so the production
+    # validator itself is exercised for every C0/C1 code point class.
+    monkeypatch.setattr(common.os, "environ", {"WTI_USER_AGENT": value})
+
+    with pytest.raises(SystemExit, match="User-Agent"):
+        user_agent()
+
+
 def test_cache_key_deterministic():
     """sha256 of the same URL is stable, 64 chars, hex-only."""
     key = cache_key_for_url("https://example.com/a")

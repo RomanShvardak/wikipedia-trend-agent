@@ -1466,12 +1466,223 @@ def test_confirmation_rejects_unresolved_and_error_manifests(
         common.dump_json(document, out)
         before = out.read_bytes()
         _forbid_confirmation_side_effects(monkeypatch)
-        assert resolve_articles.main(
-            [
-                "--topic", "topic", "--projects", "en.wikipedia", "--out", str(out),
-                "--select", "en.wikipedia=Target",
-            ],
-            transport=forbidden_transport,
-        ) == 2
-        assert out.read_bytes() == before
+    assert resolve_articles.main(
+        [
+            "--topic", "topic", "--projects", "en.wikipedia", "--out", str(out),
+            "--select", "en.wikipedia=Target",
+        ],
+        transport=forbidden_transport,
+    ) == 2
+    assert out.read_bytes() == before
+
+
+def test_ttl_parser_uses_24_environment_fallback_and_cli_precedence(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path / "resolved.json")
+    monkeypatch.delenv("WTI_TTL_HOURS", raising=False)
+    assert resolve_articles._parser().parse_args(args).ttl_hours == 24.0
+
+    monkeypatch.setenv("WTI_TTL_HOURS", "6.5")
+    assert resolve_articles._parser().parse_args(args).ttl_hours == 6.5
+    assert (
+        resolve_articles._parser().parse_args([*args, "--ttl-hours", "0"]).ttl_hours
+        == 0.0
+    )
+
+    monkeypatch.setenv("WTI_TTL_HOURS", "not-a-number")
+    assert resolve_articles._parser().parse_args(args).ttl_hours == 24.0
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "-inf"])
+def test_invalid_ttl_fails_before_user_agent_transport_or_output(
+    value, tmp_path, monkeypatch, transport_stub
+):
+    def forbidden_user_agent() -> str:
+        raise AssertionError("invalid TTL must fail before User-Agent work")
+
+    monkeypatch.setattr(common, "user_agent", forbidden_user_agent)
+    out = tmp_path / "resolved.json"
+    stub = transport_stub([])
+
+    with pytest.raises(SystemExit) as raised:
+        resolve_articles.main(
+            [*_args(out), "--ttl-hours", value], transport=stub
+        )
+
+    assert raised.value.code == 2
+    assert stub.calls == []
+    assert not out.exists()
+
+
+def test_warm_validated_discovery_cache_makes_zero_transport_calls(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    cold = transport_stub(
+        [
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _volume_body(resolve_fixture)),
+        ]
+    )
+    assert resolve_articles.main(_args(out), transport=cold, today_utc=TODAY) == 0
+    cold_projects = json.loads(out.read_text(encoding="utf-8"))["projects"]
+
+    warm = transport_stub([])
+    assert resolve_articles.main(_args(out), transport=warm, today_utc=TODAY) == 0
+
+    assert warm.calls == []
+    assert json.loads(out.read_text(encoding="utf-8"))["projects"] == cold_projects
+
+
+def test_ttl_zero_bypasses_fresh_cache_and_rewrites_validated_entries(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    responses = [
+        (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+        (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+        (200, {}, _volume_body(resolve_fixture)),
+    ]
+    assert resolve_articles.main(
+        _args(out), transport=transport_stub(responses), today_utc=TODAY
+    ) == 0
+    cache_before = {
+        path.name: path.read_bytes() for path in (tmp_path / "cache").glob("*.json")
+    }
+    assert len(cache_before) == 3
+
+    forced = transport_stub(responses)
+    assert resolve_articles.main(
+        [*_args(out), "--ttl-hours", "0"],
+        transport=forced,
+        today_utc=TODAY,
+    ) == 0
+
+    assert len(forced.calls) == 3
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 3
+
+
+def test_retry_after_is_honored_with_three_attempt_ceiling(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, caplog
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(resolve_articles, "sleep", sleeps.append, raising=False)
+    stub = transport_stub(
+        [
+            (429, {"Retry-After": "2"}, b"rate limited"),
+            (429, {"Retry-After": "3"}, b"rate limited"),
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _volume_body(resolve_fixture)),
+        ]
+    )
+
+    with caplog.at_level("INFO"):
+        assert resolve_articles.main(_args(tmp_path / "resolved.json"), transport=stub, today_utc=TODAY) == 0
+
+    assert len(stub.calls) == 5
+    assert sleeps == [2.0, 3.0]
+    assert "retry 1/3 after 2.0 seconds" in caplog.text
+    assert "retry 2/3 after 3.0 seconds" in caplog.text
+
+
+def test_retryable_failure_exhausts_three_calls_without_cache(
+    tmp_path, monkeypatch, transport_stub
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(resolve_articles, "sleep", sleeps.append, raising=False)
+    stub = transport_stub([(503, {}, b"down") for _ in range(3)])
+
+    assert resolve_articles.main(_args(tmp_path / "resolved.json"), transport=stub) == 1
+
+    assert len(stub.calls) == 3
+    assert sleeps == [5.0, 5.0]
+    assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+def test_403_is_immediately_fatal_without_retry_or_cache(
+    tmp_path, monkeypatch, transport_stub
+):
+    _configure(monkeypatch, tmp_path)
+    sleeps: list[float] = []
+    monkeypatch.setattr(resolve_articles, "sleep", sleeps.append, raising=False)
+    stub = transport_stub([(403, {}, b"forbidden")])
+
+    assert resolve_articles.main(_args(tmp_path / "resolved.json"), transport=stub) == 1
+
+    assert len(stub.calls) == 1
+    assert sleeps == []
+    assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project", "pl.wikipedia"),
+        ("article", "Other_article"),
+        ("access", "desktop"),
+        ("agent", "spider"),
+        ("granularity", "monthly"),
+    ],
+)
+def test_wrong_aqs_identity_creates_no_aqs_cache_or_candidate_volume(
+    field,
+    value,
+    tmp_path,
+    monkeypatch,
+    transport_stub,
+    resolve_fixture,
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    payload = json.loads(_volume_body(resolve_fixture).decode("utf-8"))
+    payload["items"][0][field] = value
+    stub = transport_stub(
+        [
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, json.dumps(payload).encode("utf-8")),
+        ]
+    )
+
+    assert resolve_articles.main(_args(out), transport=stub, today_utc=TODAY) == 1
+
+    aqs_url = series_url(
+        "en.wikipedia", "Intermittent_fasting", "20260826", "20260924"
+    )
+    assert not common.cache_path_for_key(common.cache_key_for_url(aqs_url)).exists()
+    project = json.loads(out.read_text(encoding="utf-8"))["projects"][0]
+    assert "volume" not in project["candidates"][0]
+
+
+def test_declared_oversize_rejects_before_stream_read(monkeypatch):
+    class DeclaredOversizeStream:
+        status = 200
+        headers = {"Content-Length": str(resolve_articles.MAX_RESPONSE_BYTES + 1)}
+        reads: list[int | None] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, size: int | None = -1) -> bytes:
+            self.reads.append(size)
+            return b"{}"
+
+    stream = DeclaredOversizeStream()
+    monkeypatch.setattr(common.urllib.request, "urlopen", lambda *_args, **_kwargs: stream)
+
+    with pytest.raises(common.ResponseTooLarge):
+        resolve_articles.bounded_transport("https://en.wikipedia.org/w/api.php", {})
+
+    assert stream.reads == []
+
 
