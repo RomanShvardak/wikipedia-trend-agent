@@ -827,3 +827,227 @@ def test_structurally_invalid_candidate_never_reaches_volume_transport(
     document = json.loads(out.read_text(encoding="utf-8"))
     assert document["status"] == "unresolved"
     assert document["projects"][0]["candidates"][0]["reason"] == "non_article_namespace"
+
+
+def _volume_item(
+    *,
+    project: str = "en.wikipedia",
+    article: str = "Intermittent_fasting",
+    access: str = "all-access",
+    agent: str = "user",
+    granularity: str = "daily",
+    timestamp: str = "2026082600",
+    views: object = 10,
+) -> dict[str, object]:
+    return {
+        "project": project,
+        "article": article,
+        "access": access,
+        "agent": agent,
+        "granularity": granularity,
+        "timestamp": timestamp,
+        "views": views,
+    }
+
+
+def _volume_response(
+    body: object,
+    *,
+    status: int = 200,
+) -> common.TransportResponse:
+    if isinstance(body, bytes):
+        encoded = body
+    else:
+        encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return common.TransportResponse(status=status, headers={}, body=encoded)
+
+
+def test_volume_window_is_exactly_30_complete_utc_days():
+    assert hasattr(resolve_articles, "volume_window")
+
+    result = resolve_articles.volume_window(TODAY)
+
+    assert result == (VOLUME_START, VOLUME_END)
+    assert (result[1] - result[0]).days + 1 == 30
+    assert result[1] < TODAY
+
+
+def test_volume_valid_payload_sums_identity_bound_observations():
+    assert hasattr(resolve_articles, "parse_volume_response")
+    response = _volume_response(
+        {
+            "items": [
+                _volume_item(timestamp="2026082600", views=10),
+                _volume_item(timestamp="2026082700", views=20),
+                _volume_item(timestamp="2026083000", views=969),
+            ]
+        }
+    )
+
+    result = resolve_articles.parse_volume_response(
+        response,
+        expected_project="en.wikipedia",
+        expected_article="Intermittent_fasting",
+        start=VOLUME_START,
+        end=VOLUME_END,
+    )
+
+    assert result == {
+        "status": "available",
+        "total_views": 999,
+        "window": {"start": "2026-08-26", "end": "2026-09-24"},
+        "observed_days": 3,
+        "last_observed_date": "2026-08-30",
+        "low_volume": True,
+        "reason": None,
+    }
+
+
+def test_volume_404_is_unavailable_not_numeric_zero(resolve_fixture):
+    assert hasattr(resolve_articles, "parse_volume_response")
+    response = _volume_response(
+        _response_body(resolve_fixture, "pageviews.404.json"), status=404
+    )
+
+    result = resolve_articles.parse_volume_response(
+        response,
+        expected_project="en.wikipedia",
+        expected_article="Intermittent_fasting",
+        start=VOLUME_START,
+        end=VOLUME_END,
+    )
+
+    assert result == {
+        "status": "unavailable",
+        "total_views": None,
+        "window": {"start": "2026-08-26", "end": "2026-09-24"},
+        "observed_days": None,
+        "last_observed_date": None,
+        "low_volume": None,
+        "reason": "aqs_404_zero_or_not_loaded",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "test_id"),
+    [
+        ("project", "pl.wikipedia", "wrong_project"),
+        ("article", "Other_article", "wrong_article"),
+        ("access", "desktop", "wrong_access"),
+        ("agent", "spider", "wrong_agent"),
+        ("granularity", "monthly", "wrong_granularity"),
+    ],
+    ids=lambda value: value if isinstance(value, str) and value.startswith("wrong_") else None,
+)
+def test_wrong_volume_identity_fails_before_candidate_mutation(
+    field, value, test_id, resolve_fixture
+):
+    del test_id
+    assert hasattr(resolve_articles, "parse_volume_response")
+    candidate = {"volume": {"status": "sentinel"}}
+    items = [
+        _volume_item(timestamp="2026082600", views=999),
+        {**_volume_item(timestamp="2026082700"), field: value},
+    ]
+
+    with pytest.raises(resolve_articles.ResolveVolumeError, match=field):
+        resolve_articles.parse_volume_response(
+            _volume_response({"items": items}),
+            expected_project="en.wikipedia",
+            expected_article="Intermittent_fasting",
+            start=VOLUME_START,
+            end=VOLUME_END,
+        )
+
+    assert candidate["volume"] == {"status": "sentinel"}
+    assert resolve_fixture is not None
+
+
+@pytest.mark.parametrize(
+    ("items", "message"),
+    [
+        ([_volume_item(timestamp="2026082600"), _volume_item(timestamp="2026082600")], "duplicate"),
+        ([_volume_item(views=-1)], "views"),
+        ([_volume_item(views=True)], "views"),
+        ([_volume_item(timestamp="2026092500")], "outside"),
+        ([_volume_item(timestamp="2026082500")], "outside"),
+        ([_volume_item(timestamp="2026082623")], "timestamp"),
+        ([_volume_item() for _ in range(31)], "30"),
+        (["not-an-object"], "object"),
+    ],
+)
+def test_malformed_volume_items_are_errors_not_low_volume(items, message):
+    assert hasattr(resolve_articles, "parse_volume_response")
+
+    with pytest.raises(resolve_articles.ResolveVolumeError, match=message):
+        resolve_articles.parse_volume_response(
+            _volume_response({"items": items}),
+            expected_project="en.wikipedia",
+            expected_article="Intermittent_fasting",
+            start=VOLUME_START,
+            end=VOLUME_END,
+        )
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, 503])
+def test_volume_http_failures_are_errors_not_low_volume(status):
+    assert hasattr(resolve_articles, "parse_volume_response")
+
+    with pytest.raises(resolve_articles.ResolveVolumeError, match=str(status)):
+        resolve_articles.parse_volume_response(
+            _volume_response({}, status=status),
+            expected_project="en.wikipedia",
+            expected_article="Intermittent_fasting",
+            start=VOLUME_START,
+            end=VOLUME_END,
+        )
+
+
+def test_low_volume_999_and_404_candidates_remain_selectable(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+
+    for index, (response, expected_status, expected_total) in enumerate(
+        [
+            (_volume_response({"items": [_volume_item(views=999)]}), "available", 999),
+            (
+                _volume_response(
+                    _response_body(resolve_fixture, "pageviews.404.json"),
+                    status=404,
+                ),
+                "unavailable",
+                None,
+            ),
+        ]
+    ):
+        out = tmp_path / f"resolved-{index}.json"
+        stub = transport_stub(
+            [
+                (
+                    200,
+                    {},
+                    _response_body(resolve_fixture, "resolve.search.en.wikipedia.json"),
+                ),
+                (
+                    200,
+                    {},
+                    _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json"),
+                ),
+                (response.status, response.headers, response.body),
+            ]
+        )
+
+        assert resolve_articles.main(
+            _args(out), transport=stub, today_utc=TODAY
+        ) == 0
+
+        document = json.loads(out.read_text(encoding="utf-8"))
+        candidate = document["projects"][0]["candidates"][0]
+        assert candidate["status"] == "selectable"
+        assert candidate["volume"]["status"] == expected_status
+        assert candidate["volume"]["total_views"] == expected_total
+        if expected_status == "available":
+            assert candidate["volume"]["low_volume"] is True
+        else:
+            assert candidate["volume"]["low_volume"] is None
