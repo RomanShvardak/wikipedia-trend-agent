@@ -641,3 +641,150 @@ def test_confirm_requires_reason_for_ambiguous_saved_project(
     assert resolve_articles.main(reason_args, transport=forbidden_transport) == 0
     confirmed = json.loads(out.read_text(encoding="utf-8"))
     assert confirmed["projects"][0]["selection"]["reason"] == "Explicit semantic match"
+
+
+def _metadata_payload(
+    *,
+    normalized: list[dict[str, str]] | None = None,
+    redirects: list[dict[str, str]] | None = None,
+    pages: list[dict[str, object]] | None = None,
+) -> bytes:
+    return json.dumps(
+        {
+            "query": {
+                "normalized": normalized or [],
+                "redirects": redirects or [],
+                "pages": pages or [],
+            }
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def test_redirect_chain_preserves_normalized_order_and_final_target():
+    assert hasattr(resolve_articles, "follow_redirects")
+    assert hasattr(resolve_articles, "parse_metadata")
+    body = _metadata_payload(
+        normalized=[{"from": "old name", "to": "Old Name"}],
+        redirects=[
+            {"from": "Old Name", "to": "Middle title"},
+            {"from": "Middle title", "to": "Canonical Target"},
+        ],
+        pages=[{"ns": 0, "title": "Canonical Target", "pageprops": {}}],
+    )
+
+    final_title, chain, reason = resolve_articles.follow_redirects(
+        "old name",
+        {"old name": "Old Name"},
+        {"Old Name": "Middle title", "Middle title": "Canonical Target"},
+    )
+    candidates = resolve_articles.parse_metadata(
+        body,
+        [{"title": "old name", "rank": 1}],
+        "old name",
+    )
+
+    assert (final_title, chain, reason) == ("Canonical Target", ["Middle title", "Canonical Target"], None)
+    assert candidates == [
+        {
+            "status": "selectable",
+            "article": "Canonical_Target",
+            "title": "Canonical Target",
+            "namespace": 0,
+            "input_titles": ["old name"],
+            "redirect_chain": ["Middle title", "Canonical Target"],
+            "search_rank": 1,
+            "exact_title_match": True,
+            "disambiguation": False,
+            "reason": None,
+        }
+    ]
+
+
+def test_redirect_cycle_is_unresolved_with_stable_reason():
+    assert hasattr(resolve_articles, "follow_redirects")
+
+    final_title, chain, reason = resolve_articles.follow_redirects(
+        "A",
+        {},
+        {"A": "B", "B": "A"},
+    )
+
+    assert (final_title, chain, reason) == ("A", ["B", "A"], "redirect_cycle")
+
+
+def test_redirect_eleventh_hop_is_unresolved_with_stable_reason():
+    assert hasattr(resolve_articles, "follow_redirects")
+    redirects = {f"Title {index}": f"Title {index + 1}" for index in range(11)}
+    redirects["Title 11"] = "Canonical"
+
+    final_title, chain, reason = resolve_articles.follow_redirects(
+        "Title 0", {}, redirects
+    )
+
+    assert final_title == "Title 11"
+    assert len(chain) == 11
+    assert reason == "redirect_too_deep"
+
+
+@pytest.mark.parametrize(
+    ("page", "expected_reason"),
+    [
+        ({"missing": True, "ns": 0, "title": "Missing"}, "missing_target"),
+        ({"ns": 14, "title": "Category:Target"}, "non_article_namespace"),
+        (
+            {"ns": 0, "title": "Target", "pageprops": {"disambiguation": ""}},
+            "disambiguation_page",
+        ),
+    ],
+)
+def test_invalid_metadata_target_is_retained_as_unresolved(page, expected_reason):
+    assert hasattr(resolve_articles, "parse_metadata")
+    body = _metadata_payload(pages=[page])
+
+    candidates = resolve_articles.parse_metadata(
+        body,
+        [{"title": "Requested", "rank": 1}],
+        "Requested",
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["status"] == "unresolved"
+    assert candidates[0]["reason"] == expected_reason
+
+
+def test_redirect_discovery_calls_aqs_only_for_final_canonical_target(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    metadata = _metadata_payload(
+        redirects=[{"from": "Redirect title", "to": "Canonical fasting"}],
+        pages=[{"ns": 0, "title": "Canonical fasting", "pageprops": {}}],
+    )
+    volume = _volume_body(resolve_fixture).replace(
+        b"Intermittent_fasting", b"Canonical_fasting"
+    )
+    stub = transport_stub(
+        [
+            (200, {}, b'{"query":{"search":[{"ns":0,"title":"Redirect title"}]}}'),
+            (200, {}, metadata),
+            (200, {}, volume),
+        ]
+    )
+    out = tmp_path / "resolved.json"
+
+    assert resolve_articles.main(
+        ["--topic", "redirect title", "--projects", "en.wikipedia", "--out", str(out)],
+        transport=stub,
+        today_utc=TODAY,
+    ) == 0
+
+    assert stub.calls[-1][0] == series_url(
+        "en.wikipedia", "Canonical_fasting", "20260826", "20260924"
+    )
+    assert "Redirect_title" not in stub.calls[-1][0]
+    document = json.loads(out.read_text(encoding="utf-8"))
+    candidate = document["projects"][0]["candidates"][0]
+    assert candidate["input_titles"] == ["Redirect title"]
+    assert candidate["redirect_chain"] == ["Canonical fasting"]
+    assert candidate["article"] == "Canonical_fasting"
