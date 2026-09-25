@@ -510,14 +510,14 @@ def test_threshold_fixture_summaries_remain_inside_calibrated_bands() -> None:
         )
     )
     expected = {
-        "fasting-pl": (727, 728, 239.6, 0.0179, -37.5, -38.5, "medium", "noise"),
-        "fasting-cs": (725, 728, 276.4, 0.0331, -54.3, -44.5, "medium", "noise"),
+        "fasting-pl": (727, 728, 239.6, 0.0179, -37.5, -38.5, "low", "noise"),
+        "fasting-cs": (725, 728, 276.4, 0.0331, -54.3, -44.5, "low", "noise"),
         "astronomy-uk": (1094, 1094, 1417.5, 0.0219, -56.0, -56.2, "medium", "down"),
-        "space-exploration-uk": (1092, 1094, 545.8, 0.0247, -55.7, -57.7, "medium", "noise"),
+        "space-exploration-uk": (1092, 1094, 545.8, 0.0247, -55.7, -57.7, "low", "noise"),
         "english-pl": (728, 728, 8801.0, 0.0412, -18.6, -19.2, "medium", "down"),
         "english-cs": (728, 728, 3183.8, 0.0316, -22.3, -22.8, "medium", "down"),
         "english-uk": (728, 728, 8230.5, 0.0288, -36.2, -36.5, "medium", "down"),
-        "english-pt": (728, 728, 10458.5, 0.0247, -24.7, -25.1, "high", "down"),
+        "english-pt": (728, 728, 10458.5, 0.0247, -24.7, -25.1, "medium", "down"),
     }
     assert {item["id"] for item in fixture["series"]} == set(expected)
     for item in fixture["series"]:
@@ -992,3 +992,61 @@ def test_metrics_output_is_atomic_and_preserves_sentinel(
     assert "metrics output" in captured.err
     assert metrics_path.read_bytes() == sentinel
     assert {path.name for path in out_dir.iterdir()} == {"series.csv", "metrics.json"}
+
+
+def test_committed_analysis_pair_matches_golden_per_series() -> None:
+    """The committed spec/series pair regenerates every golden series exactly."""
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    spec_path = fixtures / "spec.example.json"
+    series_path = fixtures / "series.example.csv"
+    assert series_path.is_file(), "committed analyzer input series.example.csv is required"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    golden = json.loads(
+        (fixtures / "metrics.example.json").read_text(encoding="utf-8")
+    )
+
+    grouped = analyze_trends.load_series_csv(series_path, spec)
+    actual = analyze_trends.build_metrics(
+        spec, "tests/fixtures/spec.example.json", grouped
+    )
+
+    assert actual["series"] == golden["series"]
+    assert actual["spec_name"] == golden["spec_name"]
+    assert actual["as_of"] == golden["as_of"]
+    assert actual["generated_from"] == golden["generated_from"]
+
+
+def test_threshold_fixture_confidence_matches_production_score() -> None:
+    """Every calibration label is produced by the frozen production scorer."""
+    fixture = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "analysis.threshold-validation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    for item in fixture["series"]:
+        confidence, _ = analyze_trends.score_confidence(
+            item["span_days"],
+            item["monthly_30d"],
+            item["anomaly_share"],
+            item["clean_y1_pct"] is not None,
+            None,
+        )
+        assert item["confidence"] == confidence, item["id"]
+
+
+def test_committed_golden_has_no_unreachable_seasonality_note() -> None:
+    """Complete committed input never carries the unavailable-seasonality note."""
+    golden = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "metrics.example.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reachable_notes = {
+        analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+        analyze_trends.SEASONALITY_AVAILABLE_NOTE,
+    }
+
+    for series in golden["series"]:
+        assert series["seasonality"]["note"] in reachable_notes
+        assert series["seasonality"]["note"] != analyze_trends.SEASONALITY_UNAVAILABLE_NOTE
