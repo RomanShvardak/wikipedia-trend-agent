@@ -692,11 +692,10 @@ def test_redirect_chain_preserves_normalized_order_and_final_target():
             "title": "Canonical Target",
             "namespace": 0,
             "input_titles": ["old name"],
-                "redirect_chain": ["Middle title", "Canonical Target"],
-                "search_rank": 1,
-                "exact_title_match": False,
-                "disambiguation": False,
-
+            "redirect_chain": ["Middle title", "Canonical Target"],
+            "search_rank": 1,
+            "exact_title_match": False,
+            "disambiguation": False,
             "reason": None,
         }
     ]
@@ -796,3 +795,31 @@ def test_redirect_discovery_calls_aqs_only_for_final_canonical_target(
     assert candidate["input_titles"] == ["Redirect title"]
     assert candidate["redirect_chain"] == ["Canonical fasting"]
     assert candidate["article"] == "Canonical_fasting"
+
+
+def test_structurally_invalid_candidate_never_reaches_volume_transport(
+    tmp_path, monkeypatch, transport_stub
+):
+    _configure(monkeypatch, tmp_path)
+    metadata = _metadata_payload(
+        redirects=[{"from": "Requested", "to": "Category:Target"}],
+        pages=[{"ns": 14, "title": "Category:Target"}],
+    )
+    stub = transport_stub(
+        [
+            (200, {}, b'{"query":{"search":[{"ns":0,"title":"Requested"}]}}'),
+            (200, {}, metadata),
+        ]
+    )
+    out = tmp_path / "resolved.json"
+
+    assert resolve_articles.main(
+        ["--topic", "requested", "--projects", "en.wikipedia", "--out", str(out)],
+        transport=stub,
+        today_utc=TODAY,
+    ) == 2
+
+    assert len(stub.calls) == 2
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["status"] == "unresolved"
+    assert document["projects"][0]["candidates"][0]["reason"] == "non_article_namespace"
