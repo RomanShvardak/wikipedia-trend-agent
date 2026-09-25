@@ -81,7 +81,7 @@ def _validated_max_bytes(max_bytes: int | None) -> int | None:
 
 def _read_response_body(stream: Any, max_bytes: int | None) -> bytes:
     if max_bytes is None:
-        return stream.read()
+        return bytes(stream.read())
 
     declared = header_value(dict(getattr(stream, "headers", {}) or {}), "Content-Length")
     if declared is not None:
@@ -94,7 +94,7 @@ def _read_response_body(stream: Any, max_bytes: int | None) -> bytes:
                 f"response Content-Length {declared_length} exceeds {max_bytes} bytes"
             )
 
-    body = stream.read(max_bytes + 1)
+    body = bytes(stream.read(max_bytes + 1))
     if len(body) > max_bytes:
         raise ResponseTooLarge(f"response body exceeds {max_bytes} bytes")
     return body
