@@ -50,6 +50,21 @@ with code 2 (D-08).
 | `label` | yes | Human-readable label for charts/report, e.g. `"Польська: інтервальне голодування"` |
 | `language` | yes | Language code, e.g. `"pl"`, `"cs"` |
 
+### Project codes are stems, not hosts
+
+A project code is a Wikimedia Site Matrix **host stem** (`en.wikipedia`), not a
+hostname. The two endpoints use it differently, so never reuse a project code as
+a host:
+
+| Endpoint | How the project code appears | Example |
+|---|---|---|
+| Action API (`resolve_articles.py`) | stem + `.org` as the **host** | `https://en.wikipedia.org/w/api.php` |
+| AQS Pageviews (`fetch_pageviews.py`) | bare stem as a **path segment** | `https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/…` |
+
+Both forms come from the committed `assets/wikipedia-projects.json`
+(`wikipedia-projects.v1`, 364 codes) and are validated by exact membership before
+any URL is built.
+
 ### Unknown-field rejection
 
 Unknown fields at any level are rejected (validation error), not ignored: the

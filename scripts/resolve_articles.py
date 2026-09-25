@@ -33,6 +33,7 @@ MAX_DISPLAY_CODE_POINTS = 256
 MAX_REQUEST_ATTEMPTS = 3
 VOLUME_DAYS = 30
 PROJECTS_FILE = Path(__file__).resolve().parents[1] / "assets" / "wikipedia-projects.json"
+ACTION_API_HOST_TEMPLATE = "https://{project}.org/w/api.php"
 log = common.log
 sleep = time.sleep
 
@@ -253,10 +254,18 @@ def preflight_inputs(
 
 
 def action_api_url(project: str, params: Mapping[str, str]) -> str:
-    """Construct an Action endpoint only after exact local allowlist membership."""
+    """Construct an Action endpoint only after exact local allowlist membership.
+
+    The wikipedia-projects.v1 catalog stores Site Matrix host *stems*
+    (``en.wikipedia``), not hosts. The official Site Matrix publishes the URL for
+    that edition as ``https://en.wikipedia.org``, so the host is the stem plus
+    ``.org``; the stem is never used verbatim as a host. The template is the only
+    place ``.org`` is added, and membership is checked before it is formatted, so
+    no caller value can contribute a scheme, port, userinfo, or path.
+    """
     if project not in load_allowed_projects():
         raise ResolveInputError(f"project is not in the committed allowlist: {project}")
-    return f"https://{project}/w/api.php?{urlencode(params)}"
+    return f"{ACTION_API_HOST_TEMPLATE.format(project=project)}?{urlencode(params)}"
 
 
 def search_url(project: str, query: str, limit: int = MAX_SEARCH_RESULTS) -> str:

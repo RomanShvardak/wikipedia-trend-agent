@@ -139,7 +139,7 @@ def test_single_project_tracer(
     search_params = parse_qs(search.query)
     assert (search.scheme, search.netloc, search.path) == (
         "https",
-        "en.wikipedia",
+        "en.wikipedia.org",
         "/w/api.php",
     )
     assert search_params == {
@@ -238,12 +238,70 @@ def test_search_url_uses_exact_unicode_without_normalization():
 
     assert (parsed.scheme, parsed.netloc, parsed.path) == (
         "https",
-        "en.wikipedia",
+        "en.wikipedia.org",
         "/w/api.php",
     )
     assert parse_qs(parsed.query)["srsearch"] == [query]
     assert "srwhat" not in parse_qs(parsed.query)
     assert resolve_articles.canonical_article("Cafe\u0301 東京") == "Cafe%CC%81_%E6%9D%B1%E4%BA%AC"
+
+
+def test_action_api_host_is_site_matrix_shape_not_a_bare_catalog_stem():
+    """The catalog stores Site Matrix host stems; the host is the stem plus .org.
+
+    04-08: `action_api_url` used the stem verbatim as the host and produced
+    `https://en.wikipedia/...`, which does not resolve, while the official Site
+    Matrix publishes `https://en.wikipedia.org` for that edition. This test binds
+    every Action URL builder to the catalog, so the stem-as-host reconstruction
+    cannot be reintroduced or re-pinned as expected behavior.
+    """
+    catalog = json.loads(
+        (Path(__file__).resolve().parents[1] / "assets" / "wikipedia-projects.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    projects = catalog["projects"]
+    assert len(projects) == 364
+    sampled = [projects[0], "en.wikipedia", "pl.wikipedia", "zh-yue.wikipedia", projects[-1]]
+
+    for project in sampled:
+        assert project in resolve_articles.load_allowed_projects()
+        expected_netloc = f"{project}.org"
+        for url in (
+            resolve_articles.action_api_url(project, {"action": "query"}),
+            resolve_articles.search_url(project, "topic"),
+            resolve_articles.metadata_url(project, ["Topic"]),
+        ):
+            parsed = urlparse(url)
+            assert parsed.scheme == "https", project
+            assert parsed.netloc == expected_netloc, project
+            assert parsed.path == "/w/api.php", project
+            # The stem is an identifier, never a bare host.
+            assert parsed.netloc != project, project
+            assert parsed.username is None and parsed.password is None, project
+            assert parsed.port is None, project
+
+
+def test_action_api_host_rejects_non_catalog_and_host_shaped_projects():
+    for rejected in (
+        "en.wikipedia.evil.example",
+        "en.wikipedia.org",
+        "https://en.wikipedia.org",
+        "en.wikipedia:8443",
+        "en.wikipedia/w/api.php",
+        "user@en.wikipedia",
+    ):
+        with pytest.raises(resolve_articles.ResolveInputError):
+            resolve_articles.action_api_url(rejected, {"action": "query"})
+
+
+def test_aqs_project_code_stays_a_path_segment_and_is_not_given_a_suffix():
+    """AQS carries the bare stem in the path; only the Action host gets `.org`."""
+    aqs = urlparse(series_url("en.wikipedia", "Barack_Obama", "20260826", "20260924"))
+
+    assert aqs.netloc == "wikimedia.org"
+    assert "/per-article/en.wikipedia/" in aqs.path
+    assert ".wikipedia.org" not in aqs.path
 
 
 def test_preflight_rejects_empty_topic_before_user_agent_and_transport(
@@ -1259,8 +1317,8 @@ def test_multi_project_override_is_scoped_and_provenance_is_persisted(
     ]
     assert resolve_articles.main(args, transport=stub, today_utc=TODAY) == 0
     assert [urlparse(call[0]).netloc for call in stub.calls] == [
-        "en.wikipedia", "en.wikipedia", "wikimedia.org",
-        "pl.wikipedia", "pl.wikipedia", "wikimedia.org",
+        "en.wikipedia.org", "en.wikipedia.org", "wikimedia.org",
+        "pl.wikipedia.org", "pl.wikipedia.org", "wikimedia.org",
     ]
     assert parse_qs(urlparse(stub.calls[0][0]).query)["srsearch"] == ["intermittent fasting"]
     assert parse_qs(urlparse(stub.calls[3][0]).query)["srsearch"] == ["Post przerywany"]
