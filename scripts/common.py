@@ -270,8 +270,8 @@ def user_agent() -> str:
         or len(ua) > 256
     ):
         raise SystemExit(
-            "User-Agent is empty, non-descriptive, uses a placeholder, is over 256 code points, "
-            "or contains controls; set WTI_USER_AGENT to a descriptive value "
+            "invalid_ua: User-Agent is empty, non-descriptive, uses a placeholder, is over 256 "
+            "code points, or contains controls; set WTI_USER_AGENT to a descriptive value "
             "(e.g. 'wikipedia-trend-agent/0.1.0 (you@example.com) python-urllib')"
         )
     return ua

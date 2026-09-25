@@ -849,6 +849,8 @@ def _error_record(error: BaseException) -> dict[str, str]:
         code = "action_api_error"
     elif isinstance(error, ResolveVolumeError):
         code = "aqs_error"
+    elif isinstance(error, common.ResponseTooLarge):
+        code = "response_too_large"
     elif isinstance(error, common.TransportError):
         code = "transport_error"
     elif isinstance(error, ResolveResponseError):
