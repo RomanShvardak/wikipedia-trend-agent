@@ -5,6 +5,7 @@ import ast
 import csv
 import json
 import math
+import shutil
 import unicodedata
 from datetime import date, timedelta
 from fractions import Fraction
@@ -939,28 +940,6 @@ def test_views_cell_rejects_overlong_integers(
             assert json.loads(metrics_path.read_text(encoding="utf-8"))["series"]
 
 
-def test_missing_seasonality_month_is_unavailable_above_row_floor() -> None:
-    """A missing calendar month blocks seasonality even above the 80% row floor."""
-    end = date(2025, 12, 30)
-    observations = _constant_observations(date(2024, 1, 1), 730)
-    previous_start = date(2024, 1, 1)
-    previous_end = date(2024, 12, 31)
-    missing_month = [row for row in observations if row.date.month != 2 and row.date <= previous_end]
-    current_half = [row for row in observations if row.date > previous_end]
-    assert len(missing_month) >= math.ceil(0.8 * 365)
-    assert len(current_half) >= math.ceil(0.8 * 365)
-    assert previous_start <= observations[0].date <= previous_end
-
-    growth = analyze_trends.compute_growth_for_days(observations, end, 365)
-    seasonality = analyze_trends.compute_seasonality(missing_month + current_half, end)
-
-    assert growth["pct"] == 0.0
-    assert seasonality == {
-        "months": [],
-        "note": analyze_trends.SEASONALITY_UNAVAILABLE_NOTE,
-    }
-
-
 def test_metrics_output_is_atomic_and_preserves_sentinel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -993,6 +972,181 @@ def test_metrics_output_is_atomic_and_preserves_sentinel(
     assert "metrics output" in captured.err
     assert metrics_path.read_bytes() == sentinel
     assert {path.name for path in out_dir.iterdir()} == {"series.csv", "metrics.json"}
+
+
+def test_seasonality_cli_controls_cover_all_month_classes(tmp_path: Path) -> None:
+    """Every required month list is produced by the production CLI, not a helper."""
+    for index, (shape, effect_months, expected) in enumerate(
+        SEASONALITY_CONTROL_MATRIX
+    ):
+        label = f"{shape}-{'.'.join(str(month) for month in sorted(effect_months)) or 'none'}"
+        case_dir = tmp_path / f"case-{index}-{label}"
+        spec_path = _write_control_spec(
+            case_dir,
+            name=f"control-{index}",
+            series=[_control_series_item("control-series", "Control_series")],
+        )
+        out_dir = case_dir / "out"
+        _write_series_csv(
+            out_dir / "series.csv",
+            _control_rows(
+                series_id="control-series",
+                article="Control_series",
+                shape=shape,
+                effect_months=effect_months,
+            ),
+        )
+
+        assert _run_analyzer(spec_path, out_dir) == 0, label
+
+        document = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+        series = document["series"][0]
+        assert series["period"]["days"] == SEASONALITY_CONTROL_DAYS
+        assert set(series["seasonality"]) == {"months", "note"}
+        assert series["seasonality"] == {
+            "months": expected,
+            "note": (
+                analyze_trends.SEASONALITY_AVAILABLE_NOTE
+                if expected
+                else analyze_trends.SEASONALITY_NO_PEAKS_NOTE
+            ),
+        }, label
+
+
+def test_shared_month_effect_fit_uses_pre_effect_repeatability() -> None:
+    """Selection evidence is the pre-effect residual, never y - trend - s_m."""
+    for shape, effect_months, expected in SEASONALITY_CONTROL_MATRIX:
+        label = f"{shape}-{'.'.join(str(month) for month in sorted(effect_months)) or 'none'}"
+        observations = _control_observations(shape, effect_months)
+
+        fit = analyze_trends._shared_month_effects(observations, SEASONALITY_CONTROL_END)
+
+        assert fit is not None, label
+        assert sorted(fit.shared_effects) == list(range(1, 13))
+        assert sorted(fit.pre_effect_residual) == list(range(1, 13))
+        selected = sorted(
+            month
+            for month in range(1, 13)
+            if fit.shared_effects[month] > 0
+            and all(
+                fit.pre_effect_residual[month][half_index] > 0
+                for half_index in (0, 1)
+            )
+        )
+        assert selected == expected, label
+        assert sorted(fit.shared_effects) == list(range(1, 13))
+        if expected:
+            for month in effect_months:
+                assert fit.shared_effects[month] > 0, (label, month)
+                for half_index in (0, 1):
+                    evidence = fit.pre_effect_residual[month][half_index]
+                    assert evidence > 0, (label, month, half_index)
+                    # The evidence is measured BEFORE subtracting the shared effect:
+                    # `y - t_h(x) - s_m` collapses to exactly zero here, which a
+                    # strict > 0 selector would wrongly reject.
+                    assert evidence - fit.shared_effects[month] == 0, (
+                        label,
+                        month,
+                        half_index,
+                    )
+        else:
+            assert all(
+                effect == 0 for effect in fit.shared_effects.values()
+            ), (label, fit.shared_effects)
+            assert all(
+                residual == 0
+                for per_month in fit.pre_effect_residual.values()
+                for residual in per_month.values()
+            ), (label, fit.pre_effect_residual)
+
+
+def test_missing_seasonality_month_is_unavailable_above_row_floor(
+    tmp_path: Path,
+) -> None:
+    """A missing calendar month blocks seasonality even above the 80% row floor."""
+    end = SEASONALITY_CONTROL_END
+    previous_window, current_window = analyze_trends._aligned_year_windows([], end)
+    dropped = _february_dates_in(previous_window)
+    case_dir = tmp_path / "missing-february"
+    spec_path = _write_control_spec(
+        case_dir,
+        name="missing-february",
+        series=[_control_series_item("control-series", "Control_series")],
+    )
+    out_dir = case_dir / "out"
+    missing_february_rows = _control_rows(
+        series_id="control-series",
+        article="Control_series",
+        shape="linear",
+        effect_months=frozenset({4, 10}),
+        drop_dates=dropped,
+    )
+    _write_series_csv(out_dir / "series.csv", missing_february_rows)
+    kept_previous = 365 - len(dropped)
+    assert kept_previous >= math.ceil(0.8 * 365)
+    assert 365 >= math.ceil(0.8 * 365)
+    assert dropped and all(previous_window[0] <= day <= previous_window[1] for day in dropped)
+    assert not any(current_window[0] <= day <= current_window[1] for day in dropped)
+    assert len(missing_february_rows) == SEASONALITY_CONTROL_DAYS - len(dropped)
+
+    assert _run_analyzer(spec_path, out_dir) == 0
+
+    document = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+    series = document["series"][0]
+    assert series["period"]["days"] == SEASONALITY_CONTROL_DAYS
+    assert series["seasonality"] == {
+        "months": [],
+        "note": analyze_trends.SEASONALITY_UNAVAILABLE_NOTE,
+    }
+    assert series["growth"]["y1"]["pct"] is not None
+    assert series["growth"]["y1"]["clean"]["pct"] is not None
+
+
+def test_committed_monotonic_golden_has_no_recurring_peaks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unchanged committed spec and series regenerate the golden through the CLI."""
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    package_root = Path(__file__).resolve().parents[1]
+    committed_spec = package_root / "tests" / "fixtures" / "spec.example.json"
+    committed_series = fixtures / "series.example.csv"
+    spec = json.loads(committed_spec.read_text(encoding="utf-8"))
+    golden = json.loads(
+        (fixtures / "metrics.example.json").read_text(encoding="utf-8")
+    )
+    spec_bytes = committed_spec.read_bytes()
+    series_bytes = committed_series.read_bytes()
+
+    with committed_series.open(newline="", encoding="utf-8") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    for series_id in (item["id"] for item in spec["series"]):
+        values = [int(row["views"]) for row in csv_rows if row["series_id"] == series_id]
+        assert values
+        assert all(current > previous for previous, current in zip(values, values[1:]))
+
+    out_dir = tmp_path / "committed-out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(committed_series, out_dir / "series.csv")
+    assert {path.name for path in out_dir.iterdir()} == {"series.csv"}
+    monkeypatch.chdir(package_root)
+
+    assert (
+        analyze_trends.main(
+            ["--spec", "tests/fixtures/spec.example.json", "--out", str(out_dir)]
+        )
+        == 0
+    )
+
+    emitted = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert emitted["generated_from"] == "tests/fixtures/spec.example.json"
+    assert emitted == golden
+    for series in golden["series"]:
+        assert series["seasonality"] == {
+            "months": [],
+            "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+        }
+    assert committed_spec.read_bytes() == spec_bytes
+    assert committed_series.read_bytes() == series_bytes
 
 
 def test_committed_analysis_pair_matches_golden_per_series() -> None:
@@ -1218,44 +1372,6 @@ def test_seasonality_separates_monotonic_trend_from_repeating_month_effects() ->
     }
 
 
-def test_committed_monotonic_golden_has_no_recurring_peaks() -> None:
-    """The committed input is strictly monotonic and regenerates no-peak goldens."""
-    fixtures = Path(__file__).resolve().parent / "fixtures"
-    spec_path = fixtures / "spec.example.json"
-    series_path = fixtures / "series.example.csv"
-    golden = json.loads(
-        (fixtures / "metrics.example.json").read_text(encoding="utf-8")
-    )
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
-
-    with series_path.open(newline="", encoding="utf-8") as handle:
-        csv_rows = list(csv.DictReader(handle))
-    for series_id in (item["id"] for item in spec["series"]):
-        values = [int(row["views"]) for row in csv_rows if row["series_id"] == series_id]
-        assert values
-        assert all(current > previous for previous, current in zip(values, values[1:]))
-
-    grouped = analyze_trends.load_series_csv(series_path, spec)
-    actual = analyze_trends.build_metrics(
-        spec, "tests/fixtures/spec.example.json", grouped
-    )
-    assert actual == golden
-
-    end = date(2026, 9, 20)
-    for series_id, observations in grouped.items():
-        assert analyze_trends.detect_anomalies(observations) == []
-        assert analyze_trends.compute_seasonality(observations, end) == {
-            "months": [],
-            "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
-        }, series_id
-
-    for series in golden["series"]:
-        assert series["seasonality"] == {
-            "months": [],
-            "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
-        }
-
-
 def _control_series_item(series_id: str, article: str) -> dict[str, str]:
     return {
         "id": series_id,
@@ -1281,6 +1397,7 @@ def _write_control_spec(
         "series": series,
     }
     path = tmp_path / f"{name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -1296,6 +1413,21 @@ def _control_base_views(shape: str, index: int, days: int) -> int:
     raise AssertionError(f"unknown monotonic control shape: {shape}")
 
 
+def _control_daily_values(
+    shape: str,
+    effect_months: frozenset[int],
+    start: date = SEASONALITY_CONTROL_START,
+    days: int = SEASONALITY_CONTROL_DAYS,
+    amplitude: int = SEASONALITY_CONTROL_AMPLITUDE,
+) -> list[tuple[date, int]]:
+    values: list[tuple[date, int]] = []
+    for index in range(days):
+        current = start + timedelta(days=index)
+        effect = amplitude if current.month in effect_months else 0
+        values.append((current, _control_base_views(shape, index, days) + effect))
+    return values
+
+
 def _control_rows(
     *,
     series_id: str,
@@ -1307,22 +1439,52 @@ def _control_rows(
     amplitude: int = SEASONALITY_CONTROL_AMPLITUDE,
     drop_dates: frozenset[date] = frozenset(),
 ) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for index in range(days):
-        current = start + timedelta(days=index)
-        if current in drop_dates:
-            continue
-        effect = amplitude if current.month in effect_months else 0
-        rows.append(
-            {
-                "date": current.isoformat(),
-                "views": _control_base_views(shape, index, days) + effect,
-                "series_id": series_id,
-                "project": "en.wikipedia",
-                "article": article,
-            }
+    return [
+        {
+            "date": current.isoformat(),
+            "views": views,
+            "series_id": series_id,
+            "project": "en.wikipedia",
+            "article": article,
+        }
+        for current, views in _control_daily_values(
+            shape, effect_months, start, days, amplitude
         )
-    return rows
+        if current not in drop_dates
+    ]
+
+
+def _control_observations(
+    shape: str,
+    effect_months: frozenset[int],
+    start: date = SEASONALITY_CONTROL_START,
+    days: int = SEASONALITY_CONTROL_DAYS,
+) -> list[analyze_trends.Observation]:
+    return [
+        analyze_trends.Observation(
+            date=current,
+            views=views,
+            series_id="control-series",
+            project="en.wikipedia",
+            article="Control_series",
+        )
+        for current, views in _control_daily_values(shape, effect_months, start, days)
+    ]
+
+
+SEASONALITY_CONTROL_END = SEASONALITY_CONTROL_START + timedelta(
+    days=SEASONALITY_CONTROL_DAYS - 1
+)
+
+SEASONALITY_CONTROL_MATRIX: list[tuple[str, frozenset[int], list[int]]] = [
+    ("linear", frozenset(), []),
+    ("concave", frozenset(), []),
+    ("convex", frozenset(), []),
+    ("linear", frozenset({1}), [1]),
+    ("linear", frozenset({12}), [12]),
+    ("linear", frozenset({1, 12}), [1, 12]),
+    ("linear", frozenset({4, 10}), [4, 10]),
+]
 
 
 def _february_dates_in(window: tuple[date, date]) -> frozenset[date]:
