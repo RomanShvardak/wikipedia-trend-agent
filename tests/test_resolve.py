@@ -1147,3 +1147,188 @@ def test_low_volume_999_and_404_candidates_remain_selectable(
             assert candidate["volume"]["low_volume"] is True
         else:
             assert candidate["volume"]["low_volume"] is None
+
+
+def _volume_body_for_project(resolve_fixture, project: str, article: str) -> bytes:
+    template = json.loads(
+        _response_body(resolve_fixture, "pageviews.200.json").decode("utf-8")
+    )
+    source = template["items"][0]
+    items: list[dict[str, object]] = []
+    current = VOLUME_START
+    while current <= VOLUME_END:
+        items.append(
+            {
+                **source,
+                "project": project,
+                "article": article,
+                "timestamp": f"{current:%Y%m%d}00",
+                "views": 20,
+            }
+        )
+        current += timedelta(days=1)
+    return json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
+
+
+def test_assignment_and_conservative_recommendation_contract():
+    assert hasattr(resolve_articles, "parse_assignment")
+    assert hasattr(resolve_articles, "recommend_candidates")
+    assert resolve_articles.parse_assignment(" pl.wikipedia = Post przerywany ", "topic-for") == (
+        "pl.wikipedia",
+        "Post przerywany",
+    )
+    assert resolve_articles.recommend_candidates(
+        [
+            {"status": "selectable", "article": "Lower", "exact_title_match": False},
+            {"status": "selectable", "article": "Exact", "exact_title_match": True},
+            {"status": "selectable", "article": "Higher", "exact_title_match": False},
+        ]
+    ) == "Exact"
+    assert resolve_articles.recommend_candidates(
+        [
+            {"status": "selectable", "article": "One", "exact_title_match": False},
+            {"status": "selectable", "article": "Two", "exact_title_match": False},
+        ]
+    ) is None
+
+
+def test_preflight_aggregates_over_fanout_and_bad_assignments_before_side_effects(
+    tmp_path, monkeypatch, transport_stub
+):
+    def forbidden_user_agent() -> str:
+        raise AssertionError("user_agent must not run before preflight completes")
+
+    monkeypatch.setattr(common, "user_agent", forbidden_user_agent)
+    stub = transport_stub([])
+    out = tmp_path / "resolved.json"
+    projects = ["en.wikipedia"] * 9
+    args = [
+        "--topic", "topic",
+        *[arg for project in projects for arg in ("--projects", project)],
+        "--topic-for", "en.wikipedia=one",
+        "--topic-for", "en.wikipedia=two",
+        "--topic-for", "https://en.wikipedia.org/w/api.php=three",
+        "--select", "en.wikipedia=https://en.wikipedia.org/wiki/Target",
+        "--out", str(out),
+    ]
+    assert resolve_articles.main(args, transport=stub) == 2
+    assert stub.calls == []
+    assert not out.exists()
+
+
+def test_multi_project_override_is_scoped_and_provenance_is_persisted(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    stub = transport_stub(
+        [
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _volume_body_for_project(resolve_fixture, "en.wikipedia", "Intermittent_fasting")),
+            (200, {}, _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")),
+            (200, {}, _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")),
+            (200, {}, _volume_body_for_project(resolve_fixture, "pl.wikipedia", "Intermittent_fasting")),
+        ]
+    )
+    args = [
+        "--topic", "intermittent fasting",
+        "--projects", "en.wikipedia", "--projects", "pl.wikipedia",
+        "--topic-for", "pl.wikipedia=Post przerywany",
+        "--out", str(out),
+    ]
+    assert resolve_articles.main(args, transport=stub, today_utc=TODAY) == 0
+    assert [urlparse(call[0]).netloc for call in stub.calls] == [
+        "en.wikipedia", "en.wikipedia", "wikimedia.org",
+        "pl.wikipedia", "pl.wikipedia", "wikimedia.org",
+    ]
+    assert parse_qs(urlparse(stub.calls[0][0]).query)["srsearch"] == ["intermittent fasting"]
+    assert parse_qs(urlparse(stub.calls[3][0]).query)["srsearch"] == ["Post przerywany"]
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert [project["project"] for project in document["projects"]] == [
+        "en.wikipedia", "pl.wikipedia"
+    ]
+    assert document["projects"][0]["query_source"] == "shared"
+    assert document["projects"][1]["query_source"] == "project_override"
+    assert document["projects"][1]["effective_query"] == "Post przerywany"
+
+
+def test_aggregate_project_outcomes_precedence_and_records():
+    assert hasattr(resolve_articles, "aggregate_project_outcomes")
+    ready = {"project": "en.wikipedia", "status": "ready", "candidates": [{"article": "Ready"}]}
+    ambiguous = {"project": "pl.wikipedia", "status": "ambiguous", "candidates": [{"article": "Ambiguous"}]}
+    error = {"project": "de.wikipedia", "status": "error", "search_hits": None, "error": {"code": "x", "message": "x"}}
+    unresolved = {
+        "project": "fr.wikipedia", "status": "unresolved", "search_hits": [{"title": "X", "rank": 1}],
+        "candidates": [{"status": "unresolved", "reason": "missing_target"}], "reason": "no_selectable_candidates",
+    }
+    assert resolve_articles.aggregate_project_outcomes([ready, ambiguous]) == ("awaiting_confirmation", 0)
+    assert resolve_articles.aggregate_project_outcomes([ready, error]) == ("partial_error", 3)
+    assert resolve_articles.aggregate_project_outcomes([ready, error, unresolved]) == ("unresolved", 2)
+    assert resolve_articles.aggregate_project_outcomes([error]) == ("error", 1)
+
+
+def test_project_failures_are_aggregated_and_confirmation_rejects_partial_bytes(
+    tmp_path, monkeypatch, transport_stub, resolve_fixture, forbidden_transport
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    search = _response_body(resolve_fixture, "resolve.search.en.wikipedia.json")
+    metadata = _response_body(resolve_fixture, "resolve.redirects.en.wikipedia.json")
+    stub = transport_stub(
+        [
+            (200, {}, search), (200, {}, metadata),
+            (200, {}, _volume_body_for_project(resolve_fixture, "en.wikipedia", "Intermittent_fasting")),
+            (200, {}, b'{"error":{"code":"badrequest","info":"raw body must not persist"}}'),
+        ]
+    )
+    args = [
+        "--topic", "intermittent fasting",
+        "--projects", "en.wikipedia", "--projects", "pl.wikipedia",
+        "--out", str(out),
+    ]
+    assert resolve_articles.main(args, transport=stub, today_utc=TODAY) == 3
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["status"] == "partial_error"
+    assert document["projects"][0]["status"] == "ready"
+    assert document["projects"][1]["status"] == "error"
+    assert document["projects"][1]["error"]["code"] == "action_api_error"
+    assert "raw body" not in json.dumps(document["projects"][1]["error"])
+    before = out.read_bytes()
+    _forbid_confirmation_side_effects(monkeypatch)
+    assert resolve_articles.main(
+        [*args, "--select", "en.wikipedia=Intermittent_fasting", "--select", "pl.wikipedia=Intermittent_fasting"],
+        transport=forbidden_transport,
+    ) == 2
+    assert out.read_bytes() == before
+
+
+def test_zero_hit_and_all_structural_invalid_projects_remain_unresolved(
+    tmp_path, monkeypatch, transport_stub
+):
+    _configure(monkeypatch, tmp_path)
+    out = tmp_path / "resolved.json"
+    metadata = _metadata_payload(
+        redirects=[{"from": "Requested", "to": "Category:Target"}],
+        pages=[{"ns": 14, "title": "Category:Target"}],
+    )
+    stub = transport_stub(
+        [
+            (200, {}, b'{"query":{"search":[]}}'),
+            (200, {}, b'{"query":{"search":[{"ns":0,"title":"Requested"}]}}'),
+            (200, {}, metadata),
+        ]
+    )
+    args = [
+        "--topic", "topic", "--projects", "en.wikipedia", "--projects", "pl.wikipedia", "--out", str(out)
+    ]
+    assert resolve_articles.main(args, transport=stub, today_utc=TODAY) == 2
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["status"] == "unresolved"
+    assert document["projects"][0]["search_hits"] == []
+    assert document["projects"][0]["reason"] == "search_no_hits"
+    assert document["projects"][1]["search_hits"] == [{"title": "Requested", "rank": 1}]
+    assert document["projects"][1]["candidates"][0]["status"] == "unresolved"
+    assert document["projects"][1]["candidates"][0]["reason"] == "non_article_namespace"
+    assert document["projects"][1]["reason"] == "no_selectable_candidates"
+
