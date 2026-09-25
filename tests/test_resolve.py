@@ -684,7 +684,11 @@ def test_redirect_chain_preserves_normalized_order_and_final_target():
         "old name",
     )
 
-    assert (final_title, chain, reason) == ("Canonical Target", ["Middle title", "Canonical Target"], None)
+    assert (final_title, chain, reason) == (
+        "Canonical Target",
+        ["Middle title", "Canonical Target"],
+        None,
+    )
     assert candidates == [
         {
             "status": "selectable",

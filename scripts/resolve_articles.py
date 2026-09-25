@@ -466,7 +466,9 @@ def parse_metadata(
         page_props = page.get("pageprops")
         if page_props is not None and not isinstance(page_props, dict):
             raise ResolveResponseError("metadata pageprops must be an object")
-        is_disambiguation = isinstance(page_props, dict) and "disambiguation" in page_props
+        is_disambiguation = (
+            isinstance(page_props, dict) and "disambiguation" in page_props
+        )
         if is_disambiguation:
             candidates.append(
                 _unresolved_candidate(
@@ -482,7 +484,9 @@ def parse_metadata(
             continue
 
         article = canonical_article(final_title)
-        exact_title_match = exact_normalized_query == final_title and not redirect_chain
+        exact_title_match = (
+            exact_normalized_query == final_title and not redirect_chain
+        )
         existing = grouped.get(article)
         if existing is None:
             grouped[article] = {
@@ -652,6 +656,8 @@ def discover(
         )
         candidates = parse_metadata(metadata_payload, search_hits, effective_query)
         for candidate in candidates:
+            if candidate["status"] != "selectable":
+                continue
             article = cast(str, candidate["article"])
             url = fetch_pageviews.series_url(
                 project, article, start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -668,7 +674,13 @@ def discover(
                 end=end,
             )
         selectable = [candidate for candidate in candidates if candidate["status"] == "selectable"]
-        status = "ready" if len(selectable) == 1 else "ambiguous" if selectable else "unresolved"
+        status = (
+            "ready"
+            if len(selectable) == 1
+            else "ambiguous"
+            if selectable
+            else "unresolved"
+        )
         recommendation = cast(str, selectable[0]["article"]) if len(selectable) == 1 else None
         project_documents.append(
             {
