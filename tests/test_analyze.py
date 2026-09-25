@@ -1154,13 +1154,19 @@ def test_exact_growth_and_unrounded_volume_end_to_end(tmp_path: Path) -> None:
     assert analyze_trends.VOLUME_BELOW_MINIMUM_REASON not in exact_volume["confidence_reasons"]
 
 
+SEASONALITY_CONTROL_START = date(2024, 1, 1)
+SEASONALITY_CONTROL_DAYS = 730
+SEASONALITY_CONTROL_AMPLITUDE = 200
+SEASONALITY_CONTROL_WINDOW = ("20240101", "20251230")
+
+
 def _seasonality_control_rows(
     start: date,
     count: int,
     base_views: int,
     trend_step: int,
     seasonal_months: set[int],
-    seasonal_amplitude: int = 200,
+    seasonal_amplitude: int = SEASONALITY_CONTROL_AMPLITUDE,
 ) -> list[analyze_trends.Observation]:
     rows: list[analyze_trends.Observation] = []
     for index in range(count):
@@ -1178,46 +1184,25 @@ def _seasonality_control_rows(
 
 
 def test_seasonality_separates_monotonic_trend_from_repeating_month_effects() -> None:
-    """Endpoint detrending removes level changes but retains repeated calendar effects."""
-    start = date(2024, 1, 1)
+    """Production seasonality removes level changes but retains repeated calendar effects."""
     end = date(2025, 12, 30)
-    previous_window, current_window = analyze_trends._aligned_year_windows([], end)
-    monotonic = _seasonality_control_rows(start, 730, 1_000, 1, set())
+    previous_window, _ = analyze_trends._aligned_year_windows([], end)
+    monotonic = _seasonality_control_rows(
+        SEASONALITY_CONTROL_START, SEASONALITY_CONTROL_DAYS, 1_000, 1, set()
+    )
 
-    monotonic_result = analyze_trends.compute_seasonality(monotonic, end)
-    assert monotonic_result == {
+    assert analyze_trends.compute_seasonality(monotonic, end) == {
         "months": [],
         "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
     }
-    assert hasattr(analyze_trends, "_detrended_monthly_means")
-    for window in (previous_window, current_window):
-        profiles = analyze_trends._monthly_means(monotonic, *window)
-        assert profiles is not None
-        residuals = analyze_trends._detrended_monthly_means(profiles)
-        assert set(residuals) == set(range(1, 13))
-        assert all(residual == 0 for residual in residuals.values())
-        assert residuals[1] == 0
-        assert residuals[12] == 0
 
-    repeating = _seasonality_control_rows(start, 730, 1_000, 1, {4, 10})
-    repeating_result = analyze_trends.compute_seasonality(repeating, end)
-    assert repeating_result == {
+    repeating = _seasonality_control_rows(
+        SEASONALITY_CONTROL_START, SEASONALITY_CONTROL_DAYS, 1_000, 1, {4, 10}
+    )
+    assert analyze_trends.compute_seasonality(repeating, end) == {
         "months": [4, 10],
         "note": analyze_trends.SEASONALITY_AVAILABLE_NOTE,
     }
-    for window in (previous_window, current_window):
-        profiles = analyze_trends._monthly_means(repeating, *window)
-        assert profiles is not None
-        residuals = analyze_trends._detrended_monthly_means(profiles)
-        assert {
-            month: residual
-            for month, residual in residuals.items()
-            if residual != 0
-        } == {4: 200, 10: 200}
-        assert all(
-            residual == (200 if month in {4, 10} else 0)
-            for month, residual in residuals.items()
-        )
 
     missing_month = [
         observation
@@ -1238,9 +1223,10 @@ def test_committed_monotonic_golden_has_no_recurring_peaks() -> None:
     fixtures = Path(__file__).resolve().parent / "fixtures"
     spec_path = fixtures / "spec.example.json"
     series_path = fixtures / "series.example.csv"
-    golden_path = fixtures / "metrics.example.json"
+    golden = json.loads(
+        (fixtures / "metrics.example.json").read_text(encoding="utf-8")
+    )
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    golden = json.loads(golden_path.read_text(encoding="utf-8"))
 
     with series_path.open(newline="", encoding="utf-8") as handle:
         csv_rows = list(csv.DictReader(handle))
@@ -1256,20 +1242,197 @@ def test_committed_monotonic_golden_has_no_recurring_peaks() -> None:
     assert actual == golden
 
     end = date(2026, 9, 20)
-    previous_window, current_window = analyze_trends._aligned_year_windows([], end)
-    for observations in grouped.values():
+    for series_id, observations in grouped.items():
         assert analyze_trends.detect_anomalies(observations) == []
-        for window in (previous_window, current_window):
-            profiles = analyze_trends._monthly_means(observations, *window)
-            assert profiles is not None
-            assert hasattr(analyze_trends, "_detrended_monthly_means")
-            residuals = analyze_trends._detrended_monthly_means(profiles)
-            assert all(residual == 0 for residual in residuals.values())
-            assert residuals[1] == 0
-            assert residuals[12] == 0
+        assert analyze_trends.compute_seasonality(observations, end) == {
+            "months": [],
+            "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+        }, series_id
 
     for series in golden["series"]:
         assert series["seasonality"] == {
             "months": [],
             "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
         }
+
+
+def _control_series_item(series_id: str, article: str) -> dict[str, str]:
+    return {
+        "id": series_id,
+        "project": "en.wikipedia",
+        "article": article,
+        "label": series_id,
+        "language": "en",
+    }
+
+
+def _write_control_spec(
+    tmp_path: Path, *, name: str, series: list[dict[str, str]]
+) -> Path:
+    spec = {
+        "name": name,
+        "request": "Verify recurring-season context offline.",
+        "language": "uk",
+        "window": {
+            "start": SEASONALITY_CONTROL_WINDOW[0],
+            "end": SEASONALITY_CONTROL_WINDOW[1],
+            "granularity": "daily",
+        },
+        "series": series,
+    }
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _control_base_views(shape: str, index: int, days: int) -> int:
+    """Return the exact daily level of one strictly increasing control shape."""
+    if shape == "linear":
+        return 1_000 + index
+    if shape == "concave":
+        return 1_000_000 - (days - index) ** 2
+    if shape == "convex":
+        return 1_000 + index ** 2
+    raise AssertionError(f"unknown monotonic control shape: {shape}")
+
+
+def _control_rows(
+    *,
+    series_id: str,
+    article: str,
+    shape: str,
+    effect_months: frozenset[int] = frozenset(),
+    start: date = SEASONALITY_CONTROL_START,
+    days: int = SEASONALITY_CONTROL_DAYS,
+    amplitude: int = SEASONALITY_CONTROL_AMPLITUDE,
+    drop_dates: frozenset[date] = frozenset(),
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index in range(days):
+        current = start + timedelta(days=index)
+        if current in drop_dates:
+            continue
+        effect = amplitude if current.month in effect_months else 0
+        rows.append(
+            {
+                "date": current.isoformat(),
+                "views": _control_base_views(shape, index, days) + effect,
+                "series_id": series_id,
+                "project": "en.wikipedia",
+                "article": article,
+            }
+        )
+    return rows
+
+
+def _february_dates_in(window: tuple[date, date]) -> frozenset[date]:
+    start, end = window
+    return frozenset(
+        start + timedelta(days=index)
+        for index in range((end - start).days + 1)
+        if (start + timedelta(days=index)).month == 2
+    )
+
+
+FROZEN_SERIES_KEYS = {
+    "series_id",
+    "project",
+    "article",
+    "label",
+    "language",
+    "total_views",
+    "avg_daily_views",
+    "period",
+    "growth",
+    "anomaly_share",
+    "trend_direction",
+    "confidence",
+    "confidence_reasons",
+    "seasonality",
+    "anomalies",
+}
+
+
+def test_seasonality_cli_retains_boundary_effects_and_removes_nonlinear_curvature(
+    tmp_path: Path,
+) -> None:
+    """One production CLI run keeps January/December effects and drops concave curvature."""
+    spec_path = _write_control_spec(
+        tmp_path,
+        name="boundary-nonlinear-tracer",
+        series=[
+            _control_series_item("boundary-series", "Boundary_series"),
+            _control_series_item("concave-series", "Concave_series"),
+        ],
+    )
+    out_dir = tmp_path / "out"
+    rows = _control_rows(
+        series_id="boundary-series",
+        article="Boundary_series",
+        shape="linear",
+        effect_months=frozenset({1, 12}),
+    )
+    rows += _control_rows(
+        series_id="concave-series",
+        article="Concave_series",
+        shape="concave",
+    )
+    _write_series_csv(out_dir / "series.csv", rows)
+
+    assert _run_analyzer(spec_path, out_dir) == 0
+
+    document = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert set(document) == {"spec_name", "as_of", "generated_from", "series"}
+    by_id = {series["series_id"]: series for series in document["series"]}
+    assert sorted(by_id) == ["boundary-series", "concave-series"]
+    for series in by_id.values():
+        assert set(series) == FROZEN_SERIES_KEYS
+        assert set(series["growth"]) == {"m3", "y1", "y2"}
+        assert series["growth"]["y1"]["clean"]["pct"] is not None
+        assert series["confidence_reasons"]
+        assert series["seasonality"] == {
+            "months": series["seasonality"]["months"],
+            "note": series["seasonality"]["note"],
+        }
+
+    assert by_id["boundary-series"]["seasonality"] == {
+        "months": [1, 12],
+        "note": analyze_trends.SEASONALITY_AVAILABLE_NOTE,
+    }
+    assert by_id["concave-series"]["seasonality"] == {
+        "months": [],
+        "note": analyze_trends.SEASONALITY_NO_PEAKS_NOTE,
+    }
+
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+    boundary_end = date.fromisoformat(by_id["boundary-series"]["period"]["end"])
+    boundary_fit = analyze_trends._shared_month_effects(
+        grouped["boundary-series"], boundary_end
+    )
+    assert boundary_fit is not None
+    assert sorted(boundary_fit.shared_effects) == list(range(1, 13))
+    for month in (1, 12):
+        assert boundary_fit.shared_effects[month] > 0
+        assert boundary_fit.pre_effect_residual[month][0] > 0
+        assert boundary_fit.pre_effect_residual[month][1] > 0
+
+    concave_end = date.fromisoformat(by_id["concave-series"]["period"]["end"])
+    concave_fit = analyze_trends._shared_month_effects(
+        grouped["concave-series"], concave_end
+    )
+    assert concave_fit is not None
+    assert all(
+        effect == 0 for effect in concave_fit.shared_effects.values()
+    ), concave_fit.shared_effects
+
+
+def test_solve_exact_normal_equations_rejects_singular_system() -> None:
+    """A singular exact system is rejected before any selection evidence exists."""
+    matrix = [[Fraction(1), Fraction(2)], [Fraction(2), Fraction(4)]]
+    right_hand_side = [Fraction(1), Fraction(2)]
+
+    with pytest.raises(
+        analyze_trends.AnalysisError, match="singular|non-identifiable"
+    ):
+        analyze_trends._solve_exact_normal_equations(matrix, right_hand_side)
