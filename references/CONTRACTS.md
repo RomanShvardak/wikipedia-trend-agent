@@ -622,6 +622,13 @@ validated each document: a second read could read different bytes than the one
 that was validated, and the digest would then attest to content the report never
 saw.
 
+The report's **existence** is a separate and weaker question than its bytes, and
+it is answered here: a manifest that names a `report.md` which is not on disk
+describes a document nobody can open, so a directory without one reads as stale —
+an `is_file()` check, never a modification time. Its bytes, by contrast, decide
+nothing: the digests describe the inputs, and a report whose content was
+replaced under an intact manifest is still the render the manifest attests to.
+
 **Recorded deviation from ROADMAP SC#4's wording.** That criterion reads
 "when `metrics.json` is newer than the report". This contract detects staleness
 by **digest comparison, never by mtime**, and the reason is that an mtime

@@ -47,6 +47,18 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 # to be derived - which this one, by design, is not.
 LOW_CONFIDENCE_EXAMPLE = FIXTURES_DIR / "metrics.low-confidence.example.json"
 
+# The ONLY committed document in which `growth.<window>.pct` and
+# `growth.<window>.clean.pct` differ (series[0].growth.y1: 19.6 against 16.7), so
+# it is the only fixture from which CONTRACTS.md §8.4's first bullet — "a
+# `clean.pct` is displayed and the raw `pct` never is" — can be told apart from
+# its opposite. Every other document the report stage renders agrees with itself
+# in every window, which is exactly why that clause had zero discriminating
+# coverage. It is already a member of `COMMITTED_FIXTURES` below, so this plan
+# adds nothing there; what is new is a second READER of a file the immutability
+# guard already watches, which is why the expectation is that its bytes do not
+# change at all.
+ANOMALIES_EXAMPLE = FIXTURES_DIR / "metrics.anomalies.example.json"
+
 # The fixtures this stage reads or copies. Their bytes are compared before and
 # after every test, because a stage that rewrites its own golden input is a
 # stage whose "passing" tests prove nothing on the second run.
@@ -1293,6 +1305,111 @@ def test_no_invented_numbers_in_the_rendered_report(tmp_out: Path) -> None:
     )
 
 
+def test_the_clean_percentage_is_displayed_and_the_raw_one_never_is(tmp_out: Path) -> None:
+    """CONTRACTS.md §8.4's first bullet, with coverage that can actually fail.
+
+    §8.4 says a `clean.pct` is displayed and the raw `pct` **never** is, because
+    the raw value carries the spike the clean variant removed. `_growth_phrase`
+    has always done that — the production behaviour was never the defect. The
+    defect was COVERAGE: both fixtures the report stage rendered had
+    `pct == clean.pct` in every window, so no test could tell §8.4's first bullet
+    from its opposite. `ANOMALIES_EXAMPLE` is the only committed document in which
+    the two differ, and this is the only test that reads it.
+
+    The order below is the whole design, because three of the four steps guard
+    against an all-absence test:
+
+    1. Render and read `report.md` **off disk** — a fidelity check reading the
+       planner's return value would prove the planner formats what it intends,
+       while the published file is what a reader opens. Positives first: exit 0, a
+       non-empty document, the six headings in order, a non-empty `metrics_shown`.
+    2. MEASURE the premise from the document just written. If no window separates
+       the two values, this is another all-absence test that can never fail, so
+       the divergent list is asserted non-empty and `series[0].growth.y1`'s pair
+       is pinned to exactly `(19.6, 16.7)` — read out of the file, not recomputed
+       by eye.
+    3. Assert the RAW value IS a legitimate number in the source documents. This
+       is the load-bearing sentence of the test: `19.6` is IN `metrics.json`, so
+       `assert_no_invented_numbers` would happily accept a report displaying it.
+       That is precisely why §8.4's clause was blind, and asserting it here makes
+       the general gate's blindness a tested fact rather than a comment. If this
+       assertion ever fails, the general gate has grown the power to catch this
+       class and the comment above it must be corrected.
+    4. Only then the absences, plus the positive that the clean value IS shown.
+
+    The name keeps the substring `clean_percentage` because Task 4's non-vacuity
+    probe 3 selects it with `-k clean_percentage`; a rename would silently make
+    that probe select nothing and still exit non-zero.
+    """
+    before = _fixture_bytes()
+    assert ANOMALIES_EXAMPLE.is_file(), (
+        f"the spike-injected metrics fixture must be committed at "
+        f"{ANOMALIES_EXAMPLE.name} so §8.4's clean-vs-raw clause is reachable from "
+        f"committed data"
+    )
+    _copy_chart_inputs(tmp_out)
+    _write_metrics(tmp_out, ANOMALIES_EXAMPLE.read_bytes())
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert make_charts.main(["--spec", str(spec_path), "--out", str(tmp_out)]) == 0
+    assert _run_report(tmp_out) == 0
+
+    text = tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+    metrics = json.loads(tmp_out.joinpath("metrics.json").read_text(encoding="utf-8"))
+    charts = json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        tmp_out.joinpath(build_report.REPORT_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    language = _spec_language()
+
+    # --- 1. positives, before any absence ---
+    assert text.strip(), "report.md is empty, so the absence assertions prove nothing"
+    order = _section_order(text, language)
+    assert order == sorted(order), f"the six sections are out of order: {order}"
+    assert manifest["metrics_shown"], "metrics_shown is empty, so nothing was rendered"
+
+    # --- 2. the premise, measured from the document on disk ---
+    divergent: list[tuple[int, str, float, float]] = []
+    for index, node in enumerate(metrics["series"]):
+        for window in analyze_trends.GROWTH_WINDOWS:
+            entry = node["growth"][window]
+            raw = entry.get("pct")
+            clean = entry["clean"].get("pct")
+            if raw is not None and clean is not None and raw != clean:
+                divergent.append((index, window, float(raw), float(clean)))
+    assert divergent, (
+            "no (series, window) in the fixture separates the raw pct from the clean "
+            "one, so this test cannot fail and has become another all-absence test"
+        )
+    assert (0, "y1", 19.6, 16.7) in divergent, (
+        f"series[0].growth.y1 must be the divergent pair this test reasons about; "
+        f"measured {divergent!r}"
+    )
+
+    # --- 3. why the general gate cannot help ---
+    available = _source_numbers([metrics, charts])
+    for index, window, raw, _clean in divergent:
+        assert float(raw) in available, (
+            f"series[{index}].growth.{window}: the raw value {raw!r} is NOT in the "
+            f"source documents, so assert_no_invented_numbers WOULD catch this class "
+            f"and the comment claiming it cannot has become false"
+        )
+
+    # --- 4. the absences, and the positive beside them ---
+    for index, window, raw, clean in divergent:
+        raw_text = f"{build_report.format_number(raw, percent=True)}%"
+        clean_text = f"{build_report.format_number(clean, percent=True)}%"
+        assert raw_text not in text, (
+            f"series[{index}].growth.{window}: §8.4 forbids displaying the raw pct, "
+            f"and {raw_text!r} is on the page"
+        )
+        assert clean_text in text, (
+            f"series[{index}].growth.{window}: the clean pct {clean_text!r} was not "
+            f"displayed either, so the absence above is not the clean/raw distinction"
+        )
+
+    assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
 def test_metrics_shown_equals_the_frozen_required_set(tmp_out: Path) -> None:
     """The published `metrics_shown` is the required set, built from the fixture.
 
@@ -2022,6 +2139,24 @@ def _charts_note_not_a_string(out_dir: Path) -> None:
     _patch_json(out_dir.joinpath("charts.json"), mutate)
 
 
+def _empty_confidence_reasons(out_dir: Path) -> None:
+    """`confidence_reasons` present but EMPTY — a different defect from `[""]`.
+
+    The existing `confidence-reasons-shape` row sends `[""]`, which fails the
+    per-item test. This one sends `[]`, which is what `all()` returns `True` for:
+    a guard that checked only the members of the list could not see it, even
+    though its own message already promised to refuse "a list of non-empty
+    strings". The two ids are kept distinct and both HYPHENATED, because pytest's
+    `-k` matches the `[param-id]` suffix case-insensitively and an underscored id
+    would select nothing while pytest still exited 5.
+    """
+
+    def mutate(document):
+        document["series"][0]["confidence_reasons"] = []
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
 # One entry per row of the matrix. `id` is the row's own name so a failure reads
 # as a row name rather than as an index.
 FAIL_CLOSED_ROWS = (
@@ -2034,6 +2169,7 @@ FAIL_CLOSED_ROWS = (
     pytest.param(_missing_period_days, id="metrics-period-days-absent"),
     pytest.param(_null_clean_pct_without_reason, id="null-clean-pct-without-reason"),
     pytest.param(_non_finite_clean_pct, id="metrics-non-finite-number"),
+    pytest.param(_empty_confidence_reasons, id="metrics-confidence-reasons-empty"),
     pytest.param(_missing_charts, id="charts-absent"),
     pytest.param(_wrong_charts_version, id="charts-wrong-contract-version"),
     pytest.param(_empty_charts, id="charts-empty"),
@@ -2218,6 +2354,11 @@ KEY_NAMED_ROWS = (
         _shape_less_confidence_reasons,
         "series[0].confidence_reasons",
         id="confidence-reasons-shape",
+    ),
+    pytest.param(
+        _empty_confidence_reasons,
+        "series[0].confidence_reasons",
+        id="confidence-reasons-empty",
     ),
 )
 
@@ -2550,6 +2691,61 @@ def test_report_module_never_reads_a_timestamp() -> None:
     assert "hashlib.sha256" in source, (
         "build_report computes no digest, so the absence of a timestamp API proves "
         "only that nothing is compared at all"
+    )
+
+
+def test_report_is_stale_answers_true_when_the_report_itself_is_absent(
+    tmp_path: Path,
+) -> None:
+    """A manifest naming a `report.md` that is not there describes nothing.
+
+    Two properties, and the second is the one that could have been lost while
+    fixing the first.
+
+    **The arc.** False → True → False: a whole directory reads as current, the
+    report is removed, the directory reads as stale, and writing the
+    BYTE-IDENTICAL bytes back reads as current again. The restore is asserted
+    byte-equal rather than assumed, so the third answer cannot be faked by
+    re-rendering something subtly different. Every branch answers True, so a row
+    that only asserted True would be satisfied by an implementation returning
+    True unconditionally — which is why the False answers on both sides are here.
+
+    **The non-reversal.** Replacing the report's BYTES while leaving it present
+    keeps the answer `False`. §8.1's deliberate decision is that the output's own
+    bytes must not decide this question: the manifest's digests describe the
+    INPUTS, so a consumer holding a report it is about to overwrite is asking
+    whether the inputs moved. Existence decides the answer; content does not.
+    """
+    out_dir = tmp_path / "out.absent-report"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _render_two_series(out_dir)
+    report_path = out_dir / build_report.REPORT_FILENAME
+    original = report_path.read_bytes()
+    assert original.strip(), "the rendered report is empty, so the arc proves nothing"
+
+    assert build_report.report_is_stale(out_dir) is False, (
+        "a freshly published report is not stale - if this test cannot reach a "
+        "False answer, the True below proves nothing"
+    )
+
+    report_path.unlink()
+    assert build_report.report_is_stale(out_dir) is True, (
+        "report.md is absent, so the manifest describes a document nobody can open, "
+        "and the directory must not read as current"
+    )
+
+    report_path.write_bytes(original)
+    assert report_path.read_bytes() == original, "the restore was not byte-identical"
+    assert build_report.report_is_stale(out_dir) is False, (
+        "the original report.md was restored and the directory still reads stale, so "
+        "something other than the report's existence is deciding the answer"
+    )
+
+    # 8.1's other half, held explicitly: content decides nothing.
+    report_path.write_bytes(b"a different document entirely")
+    assert build_report.report_is_stale(out_dir) is False, (
+        "report.md's own bytes decided the answer; existence is what this check "
+        "reads, and the digests describe the inputs rather than the output"
     )
 
 

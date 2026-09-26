@@ -596,7 +596,17 @@ def require_display_fields(metrics: Mapping[str, Any]) -> None:
         for key in ("trend_direction", "confidence"):
             _require_str(node, key, where)
         reasons = node.get("confidence_reasons")
-        if not isinstance(reasons, list) or not all(
+        # Three terms, and the message already said all three: a list, a NON-EMPTY
+        # list, and a list of non-empty strings. `all()` over `[]` is `True`, so
+        # the middle term was the one the code was missing while the message
+        # promised it — an empty list reached the trust bullet's `"; ".join(...)`
+        # and rendered a verdict with a dangling em-dash and no reasons at all.
+        # The condition is written as one literal line on purpose: Task 4's
+        # non-vacuity probe 4 removes the `or not reasons` term by exact string
+        # substitution, so a reformat here would silently make that probe match
+        # nothing — and a probe whose mutation never applied reports itself
+        # vacuous rather than failing.
+        if not isinstance(reasons, list) or not reasons or not all(
             isinstance(item, str) and item for item in reasons
         ):
             raise ReportError(f"{where}.confidence_reasons must be a list of non-empty strings")
@@ -983,11 +993,11 @@ def report_is_stale(out_dir: str | Path) -> bool:
 
     Every unanswerable state returns True rather than raising. A consumer asking
     "is this report current?" must get an answer when the answer is plainly no:
-    a missing, unreadable, malformed, non-object or key-incomplete manifest, and
-    a missing or unreadable input, all mean the manifest cannot be shown to
-    describe what is on disk. Raising would push that decision back onto a
-    caller, and a caller that guesses is how a stale report gets presented as
-    current.
+    a missing, unreadable, malformed, non-object or key-incomplete manifest, a
+    missing or unreadable input, and a `report.md` that is not there at all, all
+    mean the manifest cannot be shown to describe what is on disk. Raising would
+    push that decision back onto a caller, and a caller that guesses is how a
+    stale report gets presented as current.
     """
     directory = Path(out_dir)
     try:
@@ -998,6 +1008,20 @@ def report_is_stale(out_dir: str | Path) -> bool:
         return True
     recorded = (manifest.get("metrics_sha256"), manifest.get("charts_sha256"))
     if not all(isinstance(value, str) for value in recorded):
+        return True
+    # The report's EXISTENCE, which is a separate and weaker question than its
+    # bytes and is answered here. A manifest that names a `report.md` which is
+    # not on disk describes a document nobody can open, so "current" would be a
+    # claim about a file that does not exist — and Phase 7's `run_all.py` is
+    # directed to call exactly this seam, so the wrong answer here is a wrong
+    # answer in the orchestrator.
+    #
+    # Existence without a timestamp, deliberately: `is_file()` reads the
+    # directory, never a modification time, so §8.1's rejection of mtime stands
+    # unchanged and `test_report_module_never_reads_a_timestamp` still forbids
+    # every timestamp API in this module. The report's BYTES are still not read
+    # and still decide nothing — see the paragraph above.
+    if not (directory / REPORT_FILENAME).is_file():
         return True
     for name, expected in zip(("metrics.json", "charts.json"), recorded):
         try:
