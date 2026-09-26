@@ -75,25 +75,123 @@ REASON_NA_LABEL = "n/a"  # D-04: a null growth renders as a labelled n/a bar
 # CONTRACTS.md §7 (D-18).
 CHARTS_CONTRACT_VERSION = "charts.v1"
 # D-09: the method disclosure a chart carries so it stays self-describing when
-# it travels on its own. The wording is a numeric description of the two drawn
-# series, not prose, so it is language-neutral; the *label* is spec-authored in
-# the requested language and is copied verbatim (D-16).
-METHOD_PHRASE = "raw daily / 7-day median"
-RAW_LINE_LABEL = "raw daily"
-MEDIAN_LINE_LABEL = "7-day median"
-# D-20: the overlay's disclosure. A constant rather than a formatted sentence, so
-# a test can assert it exactly and Phase 6 can quote it verbatim.
+# it travels on its own. The wording is composed from the chart's own language
+# tokens (D-16), never from an English constant baked in here.
+#
+# D-16: this table is the ONLY source of the words the chart module writes. A
+# chart is read by the same audience as the report, and a PNG carrying English
+# method text above a Ukrainian label is a bilingual artefact nobody asked for.
+# `chart_tokens` refuses a language with no table rather than falling back to
+# English, which is what makes T-5-24 structurally impossible rather than
+# merely tested.
+#
+# Every entry is short on purpose: these strings live in a legend, a subtitle or
+# an in-plot annotation on a 9-inch figure, and a wrapped legend row is a
+# legibility defect (the 05-04/05-05 class).
+CHART_TOKENS: dict[str, dict[str, str]] = {
+    "en": {
+        "raw_daily": "raw daily",
+        "median7": "7-day median",
+        "anomalies": "anomaly",
+        "no_data": "no data",
+        "clean_growth": "clean growth (anomalies excluded)",
+        "views_per_day": "views/day",
+        "on_base": "on",
+        "scales_differ": "comparative view; per-series scales differ",
+        "na": "n/a",
+        "comparison_view": "all series compared",
+    },
+    "uk": {
+        "raw_daily": "сирі дані",
+        "median7": "медіана 7 днів",
+        "anomalies": "аномалія",
+        "no_data": "немає даних",
+        "clean_growth": "чисте зростання (без аномалій)",
+        "views_per_day": "переглядів/день",
+        "on_base": "на основі",
+        "scales_differ": "порівняльний графік; масштаби різні",
+        "na": "н/д",
+        "comparison_view": "усі теми порівняно",
+    },
+    # D-16's documented v1 gap is demonstrated here rather than merely described:
+    # this table exists so a Japanese spec produces Japanese chart text, and the
+    # warning below tells the caller that the default font cannot draw it. The
+    # alternative - no table - would fail the whole run closed over a FONT
+    # limitation, which is a worse answer than a disclosed tofu box.
+    "ja": {
+        "raw_daily": "日次ビュー数",
+        "median7": "7日中位値",
+        "anomalies": "異常値",
+        "no_data": "データなし",
+        "clean_growth": "クリーン成長（異常値を除く）",
+        "views_per_day": "ビュー/日",
+        "on_base": "基準",
+        "scales_differ": "比較ビュー; スケールは異なる",
+        "na": "該当なし",
+        "comparison_view": "全テーマ比較",
+    },
+}
+# The keys a language table MUST define. A partial table is the same defect as a
+# missing one - a KeyError raised halfway through a render leaves figures open
+# and nothing published - so `chart_tokens` checks the whole set and reports the
+# language either way.
+REQUIRED_CHART_TOKENS: tuple[str, ...] = (
+    "raw_daily",
+    "median7",
+    "anomalies",
+    "no_data",
+    "clean_growth",
+    "views_per_day",
+    "on_base",
+    "scales_differ",
+    "na",
+    "comparison_view",
+)
+# The v1 scripts the default DejaVu font cannot draw. An explicit list, not a
+# Unicode-block classifier: RESEARCH Pitfall 7 established the gap by observing
+# one CJK label warn and one Ukrainian label not, and a general script detector
+# is more machinery than a documented v1 gap justifies (05-PATTERNS.md
+# "CJK is a documented gap, not a guard"). A language can be in this set AND
+# have a token table - the two questions are independent: one is about font
+# coverage, the other about what the chart should say.
+UNSUPPORTED_SCRIPT_LANGUAGES = frozenset(
+    {"ja", "zh", "ko", "th", "he", "ar", "hi", "el"}
+)
+UNSUPPORTED_SCRIPT_WARNING = (
+    "warning: chart text for language {language!r} uses a script the default "
+    "DejaVu font does not cover; labels and titles may render as missing-glyph "
+    "boxes. CJK and other scripts are a documented v1 gap (D-16) - charts still "
+    "render, and the series labels are spec-authored and unchanged."
+)
+# D-20: the overlay's manifest disclosure. A constant rather than a formatted
+# sentence, so a test can assert it exactly and Phase 6 can quote it verbatim -
+# and deliberately ASCII even when the chart's own language is not, because a
+# manifest field is an interface a machine reads, while the on-image text is
+# prose and comes from the language tokens. Both are correct: they have different
+# readers.
 OVERLAY_NOTE = "comparative view; per-series scales differ"
-# The overlay owns no single series and so has no metrics `label` to copy. This
-# constant names the comparison view itself - it is a manifest display name, not
-# a metrics value, and the per-series names are not lost to it: the legend
-# carries each SeriesLine.label verbatim.
-OVERLAY_LABEL = "all series compared"
-# The overlay draws one raw line per series, so it names its own method with its
-# own phrase rather than the per-series one: claiming a 7-day median on a picture
-# that carries no median line would be the exact misrepresentation this phase
-# exists to prevent.
-OVERLAY_METHOD_PHRASE = "raw daily; shared y-axis"
+# The overlay owns no single series and so has no metrics `label` to copy, so its
+# own name is a token like every other word the module writes. The per-series
+# names are not lost to it: the legend carries each SeriesLine.label verbatim.
+OVERLAY_LABEL = CHART_TOKENS["en"]["comparison_view"]
+# The English tokens, kept as named module constants because they are the
+# canonical wording an `en` chart draws and because the manifest/contract tests
+# assert them directly. They are ALIASES into CHART_TOKENS, not a second source:
+# an edit to the table moves them with it.
+RAW_LINE_LABEL = CHART_TOKENS["en"]["raw_daily"]
+MEDIAN_LINE_LABEL = CHART_TOKENS["en"]["median7"]
+ANOMALY_LEGEND_LABEL = CHART_TOKENS["en"]["anomalies"]
+NO_DATA_LABEL = CHART_TOKENS["en"]["no_data"]
+REASON_NA_LABEL = CHART_TOKENS["en"]["na"]
+# D-09 on the growth chart: the method this chart draws is the clean variant, so
+# the subtitle names that rather than reusing the timeseries' raw/median phrase.
+GROWTH_METHOD_PHRASE = CHART_TOKENS["en"]["clean_growth"]
+# The overlay draws one raw line per series and no median line at all, so its
+# subtitle names only the raw line - claiming a 7-day median on a picture that
+# carries no median line would be the misrepresentation this phase exists to
+# prevent. Its "the scales are not comparable" disclosure is the `scales_differ`
+# token, drawn as the overlay's own note; a second copy of it in the subtitle
+# would be the same sentence twice on one image.
 # D-08: the anomaly marker's geometry. Both endpoints are the anomalies[] entry's
 # own `median` and `value`; nothing here re-derives, rescales or narrows them.
 # RESEARCH Pattern 4 recorded that a real capture produced
@@ -111,19 +209,17 @@ ANOMALY_MARKER_SIZE = 4.0
 # express: a downward caret at the highest drawable value, so the picture says
 # "below the visible range" instead of drawing a stub clipped at the floor.
 ANOMALY_MASKED_MARKER = "v"
-# One token, used both as the legend entry and inside the subtitle, so a reader -
-# and a test - can look for the same word in both places.
-ANOMALY_LEGEND_LABEL = "anomaly"
-ANOMALY_METHOD_PHRASE = "anomaly markers"
 # matplotlib's documented way to keep a handle out of the legend without building
 # a proxy artist: the extra series after the first carries this label instead.
 NO_LEGEND_LABEL = "_nolegend_"
 # D-12/D-13: a gapped period is a grey band plus the text a reader needs to tell
 # an absence from the end of the history. RESEARCH verified a labelled `axvspan`
-# produces a real legend entry.
+# produces a real legend entry. The band's own words come from the chart's
+# language, so the annotation a reader sees is never English inside a Ukrainian
+# report.
 GAP_BAND_COLOR = "#ADB5BD"
 GAP_BAND_ALPHA = 0.30
-GAP_BAND_LABEL = "no data"
+GAP_BAND_LABEL = NO_DATA_LABEL
 GAP_TEXT_COLOR = "#495057"
 GAP_TEXT_FONT_SIZE = 7
 # A band whose right edge lies within this fraction of the plot width anchors its
@@ -141,11 +237,10 @@ OVERLAY_COLOR_CYCLE = ("#1c7ed6", "#f08c00", "#2f9e44", "#d6336c", "#7048e8", "#
 GROWTH_BAR_WINDOWS = ("m3", "y1", "y2")
 # D-05: the reader never maps a tick position to a window by counting rows; the
 # window names itself. These are display tokens, not metrics values, so no
-# compared number is affected by them.
+# compared number is affected by them, and they are unit abbreviations rather
+# than prose - which is why they are language-neutral and sit outside
+# CHART_TOKENS.
 WINDOW_LABELS = {"m3": "3M", "y1": "1Y", "y2": "2Y"}
-# D-09 on the growth chart: the method this chart draws is the clean variant, so
-# the subtitle names that rather than reusing the timeseries' raw/median phrase.
-GROWTH_METHOD_PHRASE = "clean growth (anomalies excluded)"
 # D-04: a null growth is a visible, labelled, hatched bar - never a missing row
 # and never a zero-height solid one.
 NULL_BAR_COLOR = "#ADB5BD"
@@ -192,14 +287,66 @@ class SeriesPoint:
     views: int | float
 
 
-def gap_annotation_text(start: date, end: date) -> str:
+def chart_tokens(language: str) -> Mapping[str, str]:
+    """D-16: the chart's own words for `language`, or a refusal - never English.
+
+    Two states are the same defect and get the same message: a language with no
+    table at all, and a table missing one of `REQUIRED_CHART_TOKENS`. A
+    `KeyError` raised mid-render would instead leave figures open, nothing
+    published, and a traceback instead of a model-readable line.
+
+    T-5-24 is why this raises rather than falling back: a Ukrainian chart with
+    one English legend row is a bilingual artefact that no reader asked for and
+    no test of the *content* would catch. The caller that adds a language is told
+    exactly which language is missing.
+    """
+    table = CHART_TOKENS.get(language)
+    if table is None or any(key not in table for key in REQUIRED_CHART_TOKENS):
+        raise ChartError(f"no chart tokens for language: {language}")
+    return table
+
+
+def _unsupported_script_warning(language: str) -> bool:
+    """Whether this language's script the default font cannot draw (D-16).
+
+    True for a language with no token table as well as for one on the explicit
+    unsupported list: both are cases the caller should hear about on stderr
+    before the render, and the first of them is then refused by `chart_tokens`
+    anyway. The check is a list membership test, not a Unicode-block classifier
+    - RESEARCH Pitfall 7 established the gap by observing one CJK label warn and
+    one Ukrainian label not, and a general detector would be more machinery than
+    a documented v1 gap warrants.
+    """
+    return language not in CHART_TOKENS or language in UNSUPPORTED_SCRIPT_LANGUAGES
+
+
+def _warn_unsupported_script(language: str) -> bool:
+    """Emit D-16's single stderr line for an unsupported script, and report it.
+
+    A warning, never a refusal: the failure RESEARCH Pitfall 7 measured is
+    SILENCE - a valid PNG full of tofu boxes and no exception - so the stage says
+    so, once, naming the language and the documented gap, and then renders. It
+    prints to stderr rather than logging so the line is on the same stream as
+    every other model-readable message this stage emits, and so a test can count
+    it without capturing a second channel.
+    """
+    if not _unsupported_script_warning(language):
+        return False
+    print(UNSUPPORTED_SCRIPT_WARNING.format(language=language), file=sys.stderr)
+    return True
+
+
+def gap_annotation_text(start: date, end: date, no_data: str = NO_DATA_LABEL) -> str:
     """D-13: the exact string a reader sees under a gapped period.
 
     Named as a function so the format is asserted against one literal rather
     than pattern-matched at the call site - the text is the reader's only
-    evidence that a break is an absence and not the end of the history.
+    evidence that a break is an absence and not the end of the history. The
+    prefix is the chart's own language token, so a Ukrainian chart never carries
+    the word "no data"; the DATE FORMAT around it is the contract's and does not
+    move.
     """
-    return f"no data {start.isoformat()}..{end.isoformat()}"
+    return f"{no_data} {start.isoformat()}..{end.isoformat()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +362,11 @@ class DataGap:
     series_id: str
     start: date
     end: date
+    # D-16: the absence's own word in the chart's language. Carried on the gap
+    # rather than looked up in the renderer so the plan object, the drawn
+    # annotation and the test all read ONE fact - a band whose text the renderer
+    # recomputed could disagree with the manifest about what it says.
+    no_data: str
 
     @property
     def days(self) -> int:
@@ -224,7 +376,7 @@ class DataGap:
     @property
     def label(self) -> str:
         """The band's own annotation, so plan and image cannot disagree."""
-        return gap_annotation_text(self.start, self.end)
+        return gap_annotation_text(self.start, self.end, self.no_data)
 
 
 def calendar_gaps(points: Sequence[SeriesPoint]) -> tuple[tuple[date, date], ...]:
@@ -311,6 +463,14 @@ class ChartEntry:
     series_lines: tuple[SeriesLine, ...]
     label: str
     language: str
+    # D-16: the DOCUMENT-level language the chart's own words are written in -
+    # `spec.language`, never one series' language. Kept separate from
+    # `language` above, which stays the per-series data Phase 6 quotes, because a
+    # comparison view spans series in several languages and a Ukrainian overlay
+    # whose title was Polish would be its own defect. The renderer resolves the
+    # tokens from this field, so the words on the canvas and the words in the
+    # manifest's `language` can never come from different sources.
+    text_language: str
     filename: str
     points: tuple[SeriesPoint, ...]
     raw_values: tuple[int | float, ...]
@@ -437,15 +597,19 @@ def series_filename(series_id: str, kind: str) -> str:
     return f"chart_{series_id}_{kind}.png"
 
 
-def _subtitle(label: str, anomalies_drawn: int = 0) -> str:
+def _subtitle(
+    label: str, tokens: Mapping[str, str], anomalies_drawn: int = 0
+) -> str:
     """D-09: the chart names its own method, next to the spec-authored label.
 
     `anomalies_drawn` decides whether the anomaly token appears: a chart that
     draws no marker must not claim one, and a chart that draws them must say so.
+    The anomaly word is the SAME token the legend uses, so one lookup answers
+    "what does this chart claim" in both places (D-09's whole point).
     """
-    phrase = METHOD_PHRASE
+    phrase = f"{tokens['raw_daily']} / {tokens['median7']}"
     if anomalies_drawn:
-        phrase = f"{METHOD_PHRASE} / {ANOMALY_METHOD_PHRASE}"
+        phrase = f"{phrase} / {tokens['anomalies']}"
     return f"{label} - {phrase}"
 
 
@@ -586,6 +750,8 @@ def _timeseries_entry(
     node: Mapping[str, Any],
     observations: Sequence[analyze_trends.Observation],
     spec_index: int,
+    tokens: Mapping[str, str],
+    text_language: str,
     *,
     log_scale: bool = False,
 ) -> ChartEntry:
@@ -598,7 +764,7 @@ def _timeseries_entry(
     # D-12: the gap walk runs on THIS series' own points, never on the
     # concatenated file order (RESEARCH Pitfall 4).
     gaps = tuple(
-        DataGap(series_id, start, end) for start, end in calendar_gaps(points)
+        DataGap(series_id, start, end, tokens["no_data"]) for start, end in calendar_gaps(points)
     )
     masked = _nonpositive_count(raw_values) if log_scale else 0
     ceiling = float(max(raw_values)) * Y_HEADROOM_FACTOR
@@ -615,6 +781,7 @@ def _timeseries_entry(
         series_lines=(),
         label=label,
         language=_require_str(node, "language", "metrics.series entry"),
+        text_language=text_language,
         filename=series_filename(series_id, TIMESERIES_KIND),
         points=points,
         raw_values=raw_values,
@@ -632,7 +799,7 @@ def _timeseries_entry(
         y_limits=(floor, ceiling),
         bars=(),
         note=None,
-        subtitle=_subtitle(label, len(anomalies)),
+        subtitle=_subtitle(label, tokens, len(anomalies)),
         x_limits=_period_bounds(node, points),
     )
 
@@ -727,7 +894,9 @@ def _growth_value_limits(bars: Sequence[GrowthBar]) -> tuple[float, float]:
     return (y_min - pad, y_max + pad)
 
 
-def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
+def _growth_entry(
+    node: Mapping[str, Any], spec_index: int, tokens: Mapping[str, str], text_language: str
+) -> ChartEntry:
     """Build the one growth entry a series owns, alongside its timeseries sibling.
 
     Every plotted value is copied from metrics.json by `_growth_bars`; this body
@@ -744,6 +913,7 @@ def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
         series_lines=(),
         label=label,
         language=_require_str(node, "language", "metrics.series entry"),
+        text_language=text_language,
         filename=series_filename(series_id, GROWTH_KIND),
         # The growth chart draws bars, not a daily series: no points, so the
         # manifest reports 0 plotted observations rather than borrowing the
@@ -769,12 +939,16 @@ def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
         x_limits=None,
         bars=bars,
         note=None,
-        subtitle=f"{label} - {GROWTH_METHOD_PHRASE}",
+        subtitle=f"{label} - {tokens['clean_growth']}",
     )
 
 
 def _overlay_entry(
-    per_series: Sequence[ChartEntry], spec_language: str, *, log_scale: bool = False
+    per_series: Sequence[ChartEntry],
+    spec_language: str,
+    tokens: Mapping[str, str],
+    *,
+    log_scale: bool = False,
 ) -> ChartEntry:
     """Build the one comparison view a document publishes, last in charts[].
 
@@ -821,11 +995,16 @@ def _overlay_entry(
         spec_index=None,
         series_ids=tuple(line.series_id for line in lines),
         series_lines=lines,
-        label=OVERLAY_LABEL,
+        label=tokens["comparison_view"],
         # The document-level language, never one series' language: the overlay
         # spans them all, and Phase 6 must be able to tell a Ukrainian overlay
         # from an English one without reading pixels.
         language=spec_language,
+        # D-16: the overlay's own WORDS are the document language's too, for the
+        # same reason - the comparison view is a document-level artefact, and a
+        # chart whose title is in one language and whose axis words are in
+        # another is the mixed-language defect T-5-24 names.
+        text_language=spec_language,
         filename=OVERLAY_FILENAME,
         # The overlay owns no single series' point tuple; its plotted data lives
         # in series_lines, which the manifest reports as a count only.
@@ -842,9 +1021,14 @@ def _overlay_entry(
         log_note=_log_note(masked) if log_scale else None,
         y_limits=(floor, float(largest) * Y_HEADROOM_FACTOR),
         bars=(),
+        # D-20: the manifest's machine-readable disclosure, deliberately ASCII
+        # and unlocalized because Phase 6 quotes it verbatim. The ON-IMAGE text
+        # is the same disclosure in the document language - see
+        # `_draw_overlay`, which draws `tokens["scales_differ"]` rather than
+        # this field. Both are correct; they have different readers.
         note=OVERLAY_NOTE,
-        subtitle=f"{OVERLAY_LABEL} - {OVERLAY_METHOD_PHRASE}"
-        + (f" / {ANOMALY_METHOD_PHRASE}" if anomalies else ""),
+        subtitle=f"{tokens['comparison_view']} - {tokens['raw_daily']}"
+        + (f" / {tokens['anomalies']}" if anomalies else ""),
         x_limits=(start, end),
     )
 
@@ -869,7 +1053,15 @@ def build_chart_plan(
     regime an explicit opt-in: a caller that does not name the flag gets the
     linear axis, and no threshold anywhere in this module can change that.
     """
+    # D-16, in this order and for a reason. The unsupported-script warning fires
+    # FIRST, so a caller whose language has no table is told both facts - the
+    # font gap and the missing vocabulary - rather than only the second. Then
+    # the table is resolved, and a refusal happens here, before a single PNG
+    # exists: a language this stage cannot write must not leave a half-drawn
+    # chart set on disk for a reader to find.
     language = _require_str(spec, "language", "spec")
+    _warn_unsupported_script(language)
+    tokens = chart_tokens(language)
     series_nodes = metrics["series"]
     if not isinstance(series_nodes, list) or not series_nodes:
         raise ChartError("metrics.series must be a non-empty list")
@@ -898,10 +1090,15 @@ def build_chart_plan(
         # chart is not a separate list and never sorts away from its series.
         charts.append(
             _timeseries_entry(
-                node, observations, spec_index_by_id[series_id], log_scale=log_scale
+                node,
+                observations,
+                spec_index_by_id[series_id],
+                tokens,
+                language,
+                log_scale=log_scale,
             )
         )
-        charts.append(_growth_entry(node, spec_index_by_id[series_id]))
+        charts.append(_growth_entry(node, spec_index_by_id[series_id], tokens, language))
     # D-01/D-19: the comparison view is a *separate* chart, appended last. It
     # never replaces or suppresses the per-series charts, because a per-series
     # view and a comparison answer different questions. It is fed the
@@ -909,7 +1106,10 @@ def build_chart_plan(
     # including it would contribute an empty line to the shared axis.
     charts.append(
         _overlay_entry(
-            [c for c in charts if c.kind == TIMESERIES_KIND], language, log_scale=log_scale
+            [c for c in charts if c.kind == TIMESERIES_KIND],
+            language,
+            tokens,
+            log_scale=log_scale,
         )
     )
     return ChartDocument(
@@ -995,7 +1195,8 @@ def _draw_gap_bands(
     at one alpha, and the manifest keeps both tagged records so the attribution
     survives. Only the first band is labelled - two identical "no data" legend
     rows on a chart with two absences is noise, and the count of absences is
-    already in the manifest.
+    already in the manifest. The word itself comes off the first band, so the
+    legend, the annotation and `DataGap.label` cannot disagree (D-16).
     """
     domain_start = mdates.date2num(domain[0])
     domain_span = mdates.date2num(domain[1]) - domain_start
@@ -1012,7 +1213,7 @@ def _draw_gap_bands(
             end_number,
             color=GAP_BAND_COLOR,
             alpha=GAP_BAND_ALPHA,
-            label=GAP_BAND_LABEL if not labelled else NO_LEGEND_LABEL,
+            label=gap.no_data if not labelled else NO_LEGEND_LABEL,
         )
         labelled = True
         anchor, alignment = _gap_label_anchor(start_number, end_number, domain_start, domain_span)
@@ -1036,6 +1237,7 @@ def _draw_anomaly_marks(
     ax: Any,
     anomalies: Sequence[Mapping[str, Any]],
     labelled: bool,
+    anomaly_label: str,
     masked_anchor: float | None = None,
 ) -> None:
     """D-08: one vertical segment per anomaly, between the contract's own numbers.
@@ -1060,10 +1262,14 @@ def _draw_anomaly_marks(
     days that is. The same anomaly colour and the same legend row are reused, so
     a masked marker is still recognisably an anomaly marker and
     `anomalies_drawn == len(anomalies)` keeps holding for every kind.
+
+    `anomaly_label` is the chart's own word for a marker (D-16), passed in rather
+    than read from a constant so the same string reaches the legend here and in
+    the subtitle.
     """
     for index, anomaly in enumerate(anomalies):
         when = date.fromisoformat(anomaly["date"])
-        label = ANOMALY_LEGEND_LABEL if (labelled and index == 0) else NO_LEGEND_LABEL
+        label = anomaly_label if (labelled and index == 0) else NO_LEGEND_LABEL
         if masked_anchor is not None and (
             anomaly["value"] <= 0 or anomaly["median"] <= 0
         ):
@@ -1159,8 +1365,10 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     reader can see. D-14's zero floor is a timeseries rule and is applied here,
     off the entry's own limits - and D-15's log regime replaces that floor with
     the smallest positive reading, which is the only honest floor a
-    logarithmic axis can have.
+    logarithmic axis can have. Every word on this chart comes from
+    `entry.text_language` (D-16), so nothing here is an English constant.
     """
+    tokens = chart_tokens(entry.text_language)
     _apply_log_regime(ax, entry)
     x_values, raw_values = _plotted_coordinates(
         entry.points, entry.raw_values, entry.gaps, mdates
@@ -1168,9 +1376,9 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     _, median_values = _plotted_coordinates(
         entry.points, entry.median_values, entry.gaps, mdates
     )
-    ax.plot(x_values, raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=RAW_LINE_LABEL)
+    ax.plot(x_values, raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=tokens["raw_daily"])
     ax.plot(
-        x_values, median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
+        x_values, median_values, lw=1.8, color="#212529", label=tokens["median7"]
     )
     _draw_gap_bands(ax, entry.gaps, mdates, entry.x_limits or (
         entry.points[0].date, entry.points[-1].date
@@ -1179,6 +1387,7 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
         ax,
         entry.anomalies,
         labelled=True,
+        anomaly_label=tokens["anomalies"],
         masked_anchor=entry.y_limits[0] if entry.yscale == LOG_YSCALE else None,
     )
     # D-14: an explicit zero floor, timeseries axes only. A growth chart must
@@ -1212,6 +1421,7 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     or the smallest positive reading on a log entry.
     """
     _apply_log_regime(ax, entry)
+    tokens = chart_tokens(entry.text_language)
     for index, line in enumerate(entry.series_lines):
         x_values, raw_values = _plotted_coordinates(
             line.points, line.raw_values, line.gaps, mdates
@@ -1233,7 +1443,11 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     masked_anchor = entry.y_limits[0] if entry.yscale == LOG_YSCALE else None
     for line in entry.series_lines:
         _draw_anomaly_marks(
-            ax, line.anomalies, labelled=not drew_any, masked_anchor=masked_anchor
+            ax,
+            line.anomalies,
+            labelled=not drew_any,
+            anomaly_label=tokens["anomalies"],
+            masked_anchor=masked_anchor,
         )
         drew_any = drew_any or bool(line.anomalies)
     ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
@@ -1246,10 +1460,12 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     # D-09: the disclosure is drawn into the image, so a PNG separated from the
     # report still says the scales are not comparable. It sits above the legend
-    # so the two never overlap.
+    # so the two never overlap. The drawn word is the DOCUMENT language's, not
+    # `entry.note` - the note stays ASCII because Phase 6 quotes it from the
+    # manifest, while a reader of the image needs it in their own language (D-16).
     if entry.note:
         ax.annotate(
-            entry.note,
+            tokens["scales_differ"],
             xy=(0.0, 1.0),
             xycoords="axes fraction",
             xytext=(4, -8),
@@ -1280,6 +1496,11 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
     `test_growth_axes_never_receive_a_zero_floor` walks this branch by AST to
     keep it that way.
     """
+    # D-16: the n/a marker and the volume unit are the chart's own words. They
+    # are display text on a bar label, so they are localized like every other
+    # string the module writes - and the numbers beside them are not, which is
+    # why the tokens are interpolated rather than the whole label being stored.
+    tokens = chart_tokens(entry.text_language)
     positions = list(range(len(entry.bars)))
     labels: list[str] = []
     # The only arithmetic in this body: the width of the n/a stub, as a fraction
@@ -1307,7 +1528,7 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
                 patch.set_edgecolor(NULL_BAR_EDGE)
                 patch.set_hatch(NULL_BAR_HATCH)
             ax.annotate(
-                f"{REASON_NA_LABEL}\n{textwrap.fill(bar.reason or '', NULL_BAR_REASON_WRAP)}",
+                f"{tokens['na']}\n{textwrap.fill(bar.reason or '', NULL_BAR_REASON_WRAP)}",
                 xy=(NULL_LABEL_AXES_FRACTION, index),
                 xycoords=("axes fraction", "data"),
                 xytext=(0, 0),
@@ -1328,7 +1549,8 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
         # showed. The base is formatted with a space thousands separator
         # (display-only; the compared value in charts.json is unformatted).
         ax.annotate(
-            f"{window_label} {bar.pct:+.1f}%\non {bar.base_avg_daily_views: .1f} views/day",
+            f"{window_label} {bar.pct:+.1f}%\n{tokens['on_base']} "
+            f"{bar.base_avg_daily_views: .1f} {tokens['views_per_day']}",
             xy=(bar.pct, index),
             xytext=(0, 9),
             textcoords="offset points",

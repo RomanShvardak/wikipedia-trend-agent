@@ -1223,10 +1223,14 @@ def test_overlay_shares_axis_and_declares_scale_difference(tmp_out: Path) -> Non
     assert [line.label for line in entry.series_lines] == labels
 
     # The two always-emitted text fields resolve to their own sources, never to
-    # an invented value: the overlay's own constant label, and the document-level
-    # language rather than any single series' language.
-    assert entry.label == make_charts.OVERLAY_LABEL
+    # an invented value: the overlay's own name (a language token like every
+    # other word this module writes), and the document-level language rather
+    # than any single series' language.
+    assert entry.label == make_charts.chart_tokens("uk")["comparison_view"]
     assert entry.language == document.language
+    assert entry.text_language == document.language, (
+        "the overlay's WORDS follow the document language, not a member series'"
+    )
     assert document.language == json.loads(spec_path.read_text(encoding="utf-8"))["language"]
     assert entry.language not in {node["language"] for node in metrics["series"]}
     assert entry.filename == make_charts.OVERLAY_FILENAME
@@ -1437,11 +1441,14 @@ def test_anomaly_segments_match_contract_endpoints(tmp_path: Path) -> None:
         and item.get("series_id") == TRACER_SERIES_ID
     )
     assert published["anomalies_drawn"] == 1
-    # And the chart names the markers it drew: D-09, on the image itself.
+    # And the chart names the markers it drew: D-09, on the image itself. The
+    # words are the chart's own language's (D-16), not the module's English
+    # aliases - the committed spec asks for Ukrainian.
+    tokens = make_charts.chart_tokens("uk")
     labels = _legend_labels(pl)
-    assert make_charts.ANOMALY_LEGEND_LABEL in labels, labels
-    assert make_charts.RAW_LINE_LABEL in labels
-    assert make_charts.MEDIAN_LINE_LABEL in labels
+    assert tokens["anomalies"] in labels, labels
+    assert tokens["raw_daily"] in labels
+    assert tokens["median7"] in labels
 
 
 def test_growth_entry_never_carries_anomalies(tmp_path: Path) -> None:
@@ -1467,19 +1474,21 @@ def test_growth_entry_never_carries_anomalies(tmp_path: Path) -> None:
 
     # Same series, same document, two kinds: the growth chart's own legend must
     # not claim a marker it does not draw.
+    tokens = make_charts.chart_tokens("uk")
     labels = _legend_labels(growth)
-    assert make_charts.ANOMALY_LEGEND_LABEL not in labels, labels
+    assert tokens["anomalies"] not in labels, labels
 
 
 def test_empty_anomalies_render_no_markers_and_no_legend_entry(tmp_out: Path) -> None:
     """`anomalies: []` is a valid, common state: zero markers, no anomaly legend entry."""
     spec_path, manifest = _render_two_series(tmp_out)
     document = _plan(tmp_out, spec_path)
+    tokens = make_charts.chart_tokens("uk")
 
     for entry in document.charts:
         assert entry.anomalies == (), f"{entry.kind} must carry no anomaly on the golden"
         assert entry.anomalies_drawn == 0
-        assert "anomaly" not in entry.subtitle, (
+        assert tokens["anomalies"] not in entry.subtitle, (
             "a chart that draws no anomaly must not claim one in its subtitle"
         )
     for item in manifest["charts"]:
@@ -1493,7 +1502,7 @@ def test_empty_anomalies_render_no_markers_and_no_legend_entry(tmp_out: Path) ->
 
     for entry in document.charts:
         if entry.kind in {make_charts.TIMESERIES_KIND, make_charts.OVERLAY_KIND}:
-            assert make_charts.ANOMALY_LEGEND_LABEL not in _legend_labels(entry)
+            assert tokens["anomalies"] not in _legend_labels(entry)
 
 
 def _write_gaps_pair(out_dir: Path) -> None:
@@ -1634,7 +1643,7 @@ def test_zero_length_anomaly_segment_still_gets_a_marker(tmp_path: Path) -> None
         assert drawn, "a zero-length anomaly must still get a visible marker point"
         legend = ax.get_legend()
         labels = [text.get_text() for text in legend.get_texts()] if legend else []
-        assert make_charts.ANOMALY_LEGEND_LABEL in labels, labels
+        assert make_charts.chart_tokens("uk")["anomalies"] in labels, labels
     finally:
         plt.close(fig)
 
@@ -1648,16 +1657,17 @@ def test_chart_subtitle_and_legend_name_their_method(tmp_path: Path) -> None:
 
     document = _plan(out_dir, spec_path)
     kinds: set[str] = set()
+    tokens = make_charts.chart_tokens("uk")
     for entry in document.charts:
         kinds.add(entry.kind)
         assert isinstance(entry.subtitle, str) and entry.subtitle.strip()
         if entry.kind == make_charts.TIMESERIES_KIND:
-            assert "raw" in entry.subtitle
-            assert "median" in entry.subtitle
+            assert tokens["raw_daily"] in entry.subtitle
+            assert tokens["median7"] in entry.subtitle
             if entry.anomalies_drawn > 0:
-                assert "anomaly" in entry.subtitle
+                assert tokens["anomalies"] in entry.subtitle
         if entry.kind == make_charts.GROWTH_KIND:
-            assert "clean" in entry.subtitle
+            assert tokens["clean_growth"] in entry.subtitle
     assert kinds == {
         make_charts.TIMESERIES_KIND,
         make_charts.GROWTH_KIND,
@@ -1814,8 +1824,9 @@ def test_absent_day_breaks_the_line_and_is_not_bridged(tmp_path: Path) -> None:
             index for index, value in enumerate(raw_ydata) if value != value  # NaN != NaN
         ]
         assert len(nan_positions) == GAP_DAYS
-        bands = [patch for patch in ax.patches if patch.get_label() == make_charts.GAP_BAND_LABEL]
-        assert len(bands) == 1, "exactly one 'no data' band for the one gap"
+        band_label = make_charts.chart_tokens("uk")["no_data"]
+        bands = [patch for patch in ax.patches if patch.get_label() == band_label]
+        assert len(bands) == 1, "exactly one band legend row for the one gap"
     finally:
         plt.close(fig)
 
@@ -1875,19 +1886,29 @@ def test_gap_annotation_text_is_in_the_manifest(tmp_path: Path) -> None:
     "no data <start>..<end>" is the string that stops a break being read as the
     end of the history, so its format is pinned rather than pattern-matched: a
     separator change or a dropped range is a defect a reader would see and a
-    loose assertion would not.
+    loose assertion would not. D-16 changes the PREFIX, not the format - the
+    committed spec is Ukrainian, so the drawn text is the `uk` token around the
+    contract's own `YYYY-MM-DD` range, and the English form remains assertable
+    through the same function's default argument.
     """
     out_dir, spec_path = _run_gap_pair(tmp_path)
     document = _plan(out_dir, spec_path)
     cs = _timeseries_entry_of(document, GAP_SERIES_ID)
     gap = cs.gaps[0]
+    uk_no_data = make_charts.chart_tokens("uk")["no_data"]
 
-    assert gap.label == f"no data {GAP_START}..{GAP_END}"
-    assert gap.label == "no data 2025-05-10..2025-05-14"
+    assert gap.no_data == uk_no_data
+    assert gap.label == f"{uk_no_data} 2025-05-10..2025-05-14"
+    assert gap.label == "немає даних 2025-05-10..2025-05-14"
+    # The DATE FORMAT is the contract's and does not move with the language: the
+    # same function with the English token reproduces 05-05's exact string.
+    assert make_charts.gap_annotation_text(date(2025, 5, 10), date(2025, 5, 14)) == (
+        "no data 2025-05-10..2025-05-14"
+    )
     assert make_charts.gap_annotation_text(
-        date.fromisoformat(GAP_START), date.fromisoformat(GAP_END)
-    ) == "no data 2025-05-10..2025-05-14"
-    assert make_charts.GAP_BAND_LABEL == "no data"
+        date(2025, 5, 10), date(2025, 5, 14), uk_no_data
+    ) == gap.label
+    assert make_charts.NO_DATA_LABEL == "no data"
 
     # The render path draws the band's own text, so the plan object and the image
     # cannot disagree about what the absence is called.
@@ -1902,10 +1923,13 @@ def test_gap_annotation_text_is_in_the_manifest(tmp_path: Path) -> None:
     try:
         make_charts._draw_timeseries(cs, ax, mdates)
         drawn = [text.get_text() for text in ax.texts]
-        assert "no data 2025-05-10..2025-05-14" in drawn, drawn
+        assert "немає даних 2025-05-10..2025-05-14" in drawn, drawn
+        assert "no data 2025-05-10..2025-05-14" not in drawn, (
+            "an English absence note inside a Ukrainian chart is the T-5-24 defect"
+        )
         legend = ax.get_legend()
         labels = [text.get_text() for text in legend.get_texts()] if legend else []
-        assert make_charts.GAP_BAND_LABEL in labels, labels
+        assert uk_no_data in labels, labels
     finally:
         plt.close(fig)
 
@@ -1989,6 +2013,10 @@ def test_gap_text_stays_inside_the_canvas_even_at_a_series_edge(tmp_path: Path) 
     assert len(cs.gaps) == 2, "a hole at each end of the history"
     assert cs.gaps[0].start == date(2024, 9, 24)
     assert cs.gaps[1].end == date(2026, 9, 19)
+    # D-16: the prefix is the chart's own language token, so the canonical
+    # 05-05 string is one word longer here - and the same clipping geometry,
+    # which is what this test exists to pin.
+    uk_no_data = make_charts.chart_tokens("uk")["no_data"]
 
     import matplotlib
 
@@ -2003,8 +2031,8 @@ def test_gap_text_stays_inside_the_canvas_even_at_a_series_edge(tmp_path: Path) 
         fig.canvas.draw()
         width, height = fig.canvas.get_width_height()
         assert [text.get_text() for text in ax.texts] == [
-            "no data 2024-09-24..2024-10-09",
-            "no data 2026-09-04..2026-09-19",
+            f"{uk_no_data} 2024-09-24..2024-10-09",
+            f"{uk_no_data} 2026-09-04..2026-09-19",
         ]
         for artist in ax.texts:
             left, bottom, right, top = artist.get_window_extent().bounds
@@ -2016,7 +2044,7 @@ def test_gap_text_stays_inside_the_canvas_even_at_a_series_edge(tmp_path: Path) 
         # is noise, and the count of absences is already in the manifest.
         legend = ax.get_legend()
         labels = [text.get_text() for text in legend.get_texts()] if legend else []
-        assert labels.count(make_charts.GAP_BAND_LABEL) == 1, labels
+        assert labels.count(uk_no_data) == 1, labels
     finally:
         plt.close(fig)
 
@@ -2296,7 +2324,7 @@ def test_a_masked_anomaly_is_a_caret_not_a_stub_clipped_at_the_log_floor(
         # anomaly colour and the same single legend row.
         legend = ax.get_legend()
         labels = [text.get_text() for text in legend.get_texts()] if legend else []
-        assert labels.count(make_charts.ANOMALY_LEGEND_LABEL) == 1, labels
+        assert labels.count(make_charts.chart_tokens("uk")["anomalies"]) == 1, labels
         for line in carets:
             assert list(line.get_ydata())[0] >= floor
             assert list(line.get_ydata())[0] > 0.0
@@ -2477,7 +2505,11 @@ def test_unsupported_language_warns_once_and_still_renders(
     ) or True  # the assertion above is the one that bites
 
 
-def test_chart_tokens_are_required_per_language(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_chart_tokens_are_required_per_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """T-5-24: a language with no token table fails closed, with no English fallback.
 
     Rendering an English string inside a chart whose spec asked for another
@@ -2491,20 +2523,49 @@ def test_chart_tokens_are_required_per_language(tmp_path: Path, capsys: pytest.C
 
     assert _run_charts(spec_path, out_dir) == 1
     captured = capsys.readouterr()
-    assert captured.err.startswith("charts failed:"), captured.err
-    assert "no chart tokens for language" in captured.err
-    assert "sv" in captured.err
+    # The font-gap warning may precede the failure line: a language with no
+    # table is warned about AND then refused, so the caller is told both facts.
+    # What matters is that the refusal is a line of its own, not that it is the
+    # first thing on the stream.
+    failure_lines = [
+        line for line in captured.err.splitlines() if line.startswith("charts failed:")
+    ]
+    assert len(failure_lines) == 1, captured.err
+    assert "no chart tokens for language" in failure_lines[0]
+    assert "sv" in failure_lines[0]
     assert list(out_dir.glob("*.png")) == [], "a refused language must draw nothing"
     assert not out_dir.joinpath("charts.json").exists()
 
-    # A table that is present but incomplete is the same defect, so it is the
-    # same message rather than a KeyError halfway through a render.
+    # Every shipped table is complete, checked against the module's own key
+    # list rather than a copy of it - so a language added later cannot ship
+    # half a vocabulary.
+    for code in make_charts.CHART_TOKENS:
+        assert set(make_charts.CHART_TOKENS[code]) == set(make_charts.REQUIRED_CHART_TOKENS), (
+            f"the {code} table must define exactly the required keys"
+        )
+        assert all(token.strip() for token in make_charts.CHART_TOKENS[code].values()), (
+            f"the {code} table must not ship an empty word"
+        )
+    assert set(make_charts.REQUIRED_CHART_TOKENS) >= {
+        "raw_daily",
+        "median7",
+        "anomalies",
+        "no_data",
+        "clean_growth",
+        "views_per_day",
+        "scales_differ",
+        "na",
+    }, "the plan's eight keys are a floor, not the whole list"
+
+    # A table that is present but INCOMPLETE is the same defect, so it is the
+    # same message rather than a KeyError raised halfway through a render - which
+    # would leave figures open and nothing published.
+    incomplete = {code: dict(table) for code, table in make_charts.CHART_TOKENS.items()}
+    del incomplete["uk"]["median7"]
+    monkeypatch.setattr(make_charts, "CHART_TOKENS", incomplete)
     with pytest.raises(make_charts.ChartError) as raised:
-        make_charts.chart_tokens("en")
-    assert "no chart tokens for language" not in str(raised.value)
-    for token in make_charts.REQUIRED_CHART_TOKENS:
-        assert token in make_charts.CHART_TOKENS["en"]
-        assert token in make_charts.CHART_TOKENS["uk"]
+        make_charts.chart_tokens("uk")
+    assert str(raised.value) == "no chart tokens for language: uk"
 
 
 def test_labels_are_carried_verbatim(tmp_out: Path) -> None:
@@ -2556,6 +2617,99 @@ def test_labels_are_carried_verbatim(tmp_out: Path) -> None:
     source = _module_source()
     assert "unicodedata" not in source, "the chart stage must never normalize a string"
     assert "casefold" not in source and ".lower()" not in source
+
+
+def test_the_render_path_writes_no_hardcoded_chart_words(tmp_path: Path) -> None:
+    """Every word the renderer puts on a canvas comes from `CHART_TOKENS`.
+
+    The guard that would have caught 05-06's two localization leaks, both of
+    which shipped a Ukrainian chart with English in it and both of which were
+    found only by OPENING the PNG: the overlay subtitle still read
+    "усі теми порівняно - raw daily" and the growth bar still read "on 2363.5
+    переглядів/день". Neither was a wrong number, so no numeric assertion could
+    see either, and both were structurally correct.
+
+    So the rule is stated as code: inside the render helpers, a string literal
+    may only be a matplotlib keyword, a colour, a date format, a number format,
+    a contract dict key, a token KEY, or an assertion message. A new user-facing
+    word has to arrive through the token table or this test fails - which is the
+    only way D-16's "no English fallback inside a chart" survives the next
+    feature added to a chart.
+    """
+    allowed = {
+        # matplotlib keyword arguments and coordinate systems
+        "upper left", "axes fraction", "offset points", "data", "left", "right",
+        "top", "bottom", "center", "Agg", "log", "mask",
+        # display constants that are not language: colours and a date format
+        "#212529", "#4C6EF5", "#495057", "%Y-%m",
+        # number and separator formats
+        "", " ", "\n", "%\n", "+.1f", " .1f",
+        # contract dictionary keys, read by subscript and never displayed
+        "date", "median", "value",
+        # CHART_TOKENS keys - the lookup, not the word
+        "raw_daily", "median7", "anomalies", "no_data", "scales_differ", "na",
+        "on_base", "views_per_day", "clean_growth", "comparison_view",
+        # assertion messages and the one non-localized refusal in the render path
+        "a timeseries chart always has a date axis",
+        "the comparison view always has a date axis",
+        "chart target escapes the output directory: ",
+    }
+    render_helpers = (
+        "_draw_timeseries",
+        "_draw_overlay",
+        "_draw_growth",
+        "_draw_gap_bands",
+        "_draw_anomaly_marks",
+        "_draw_log_disclosure",
+        "_apply_log_regime",
+        "render_chart",
+    )
+    offending: list[str] = []
+    for name in render_helpers:
+        function = _function_node(name)
+        docstrings = {
+            ast.get_docstring(function, clean=False),
+            *(ast.get_docstring(child, clean=False) for child in ast.walk(function)
+              if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))),
+        }
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if node.value in allowed or node.value in docstrings:
+                continue
+            offending.append(f"{name}:{node.lineno} {node.value!r}")
+    assert not offending, (
+        "the render path may not hardcode a user-facing word; route it through "
+        f"CHART_TOKENS (D-16): {offending}"
+    )
+
+    # And the positive half, so the guard cannot be satisfied by emptying the
+    # render path: a real Ukrainian run still draws tokens, and every one of them
+    # is absent from the English set.
+    out_dir = tmp_path / "uk"
+    _copy_fixtures(out_dir, ALL_SERIES_IDS)
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", out_dir) == 0
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    tokens = make_charts.chart_tokens("uk")
+    english = set(make_charts.CHART_TOKENS["en"].values())
+    assert not (set(tokens.values()) & english), (
+        "a Ukrainian token that is also the English one is not a translation"
+    )
+    for item in manifest["charts"]:
+        # The SUBTITLE is what the image carries, and it is built entirely from
+        # tokens plus the spec-authored label. `note` is deliberately excluded:
+        # it is the ASCII interface string Phase 6 quotes from the manifest, and
+        # D-16/D-20 want the manifest form and the on-image form to differ.
+        assert any(word in item["subtitle"] for word in tokens.values()), (
+            f"{item['filename']}: {item['subtitle']!r} names nothing from the token table"
+        )
+    overlay = next(item for item in manifest["charts"] if item["kind"] == make_charts.OVERLAY_KIND)
+    assert overlay["note"] == make_charts.OVERLAY_NOTE
+    assert overlay["note"] not in tokens.values(), (
+        "the manifest note stays ASCII; the drawn disclosure is the token"
+    )
+    growth = next(item for item in manifest["charts"] if item["kind"] == make_charts.GROWTH_KIND)
+    assert tokens["clean_growth"] in growth["subtitle"]
 
 
 def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
