@@ -1525,3 +1525,362 @@ def test_footer_states_source_as_of_what_was_measured_and_what_this_is_not(tmp_o
             f"forecast"
         )
 
+
+# --- 06-02 Task 3: the fail-closed matrix ------------------------------------
+
+
+def _prepared_report_dir(tmp_path: Path, name: str) -> Path:
+    """A directory holding a REAL chart-stage run: `series.csv`, `metrics.json`, `charts.json`.
+
+    Built by running the actual chart stage rather than by writing two documents
+    by hand, for the reason the tracer gives: a hand-written `charts.json` could
+    drift from the emitter, and then the report stage would be proving its
+    refusals against inputs the pipeline never produces. Every matrix row mutates
+    a document in HERE, never a committed fixture.
+    """
+    out_dir = tmp_path / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _copy_chart_inputs(out_dir)
+    assert make_charts.main(
+        ["--spec", str(FIXTURES_DIR / "spec.example.json"), "--out", str(out_dir)]
+    ) == 0, "the chart stage must succeed before a refusal can be attributed to the report stage"
+    return out_dir
+
+
+def _patch_json(path: Path, mutate) -> None:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    mutate(document)
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+
+def _missing_metrics(out_dir: Path) -> None:
+    out_dir.joinpath("metrics.json").unlink()
+
+
+def _malformed_metrics(out_dir: Path) -> None:
+    out_dir.joinpath("metrics.json").write_text('{"spec_name": "x", ', encoding="utf-8")
+
+
+def _metrics_is_a_list(out_dir: Path) -> None:
+    out_dir.joinpath("metrics.json").write_text("[1, 2, 3]", encoding="utf-8")
+
+
+def _empty_series(out_dir: Path) -> None:
+    _patch_json(out_dir.joinpath("metrics.json"), lambda d: d.__setitem__("series", []))
+
+
+def _missing_confidence(out_dir: Path) -> None:
+    def mutate(document):
+        del document["series"][0]["confidence"]
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
+def _missing_trend_direction(out_dir: Path) -> None:
+    def mutate(document):
+        del document["series"][0]["trend_direction"]
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
+def _missing_period_days(out_dir: Path) -> None:
+    def mutate(document):
+        del document["series"][0]["period"]["days"]
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
+def _null_clean_pct_without_reason(out_dir: Path) -> None:
+    def mutate(document):
+        del document["series"][0]["growth"]["y2"]["clean"]["reason"]
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
+def _non_finite_clean_pct(out_dir: Path) -> None:
+    path = out_dir.joinpath("metrics.json")
+    # `Infinity` is what `json.dumps` emits for a non-finite float and what
+    # `json.loads` reads back, so this is the shape a `1e400` in a real
+    # `metrics.json` takes. The reused finite walk must catch it before anything
+    # is formatted - a NaN drawn or printed is a silent lie.
+    path.write_text(
+        path.read_text(encoding="utf-8").replace('"pct": 16.7', '"pct": Infinity', 1),
+        encoding="utf-8",
+    )
+
+
+def _missing_charts(out_dir: Path) -> None:
+    out_dir.joinpath("charts.json").unlink()
+
+
+def _wrong_charts_version(out_dir: Path) -> None:
+    _patch_json(
+        out_dir.joinpath("charts.json"),
+        lambda d: d.__setitem__("contract_version", "charts.v0"),
+    )
+
+
+def _empty_charts(out_dir: Path) -> None:
+    _patch_json(out_dir.joinpath("charts.json"), lambda d: d.__setitem__("charts", []))
+
+
+def _unmapped_confidence_reason(out_dir: Path) -> None:
+    """A reason string no `analyze_trends` constant emits, in the DOCUMENT.
+
+    The other refusal in this matrix (`test_reason_token_refuses_an_unmapped_reason`)
+    calls `reason_token()` in process, so it proves the lookup refuses and nothing
+    more. Only this row proves the STAGE's exit-1 path: that an unmapped reason
+    stops the run with the English string named on stderr and NOTHING written. A
+    refactor that caught `ReportError` and degraded to a printed warning would
+    pass the in-process test and fail here - and would ship a half-translated
+    Ukrainian report.
+    """
+
+    def mutate(document):
+        document["series"][0]["confidence_reasons"] = [
+            document["series"][0]["confidence_reasons"][0],
+            "a reason no production code emits",
+        ]
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
+# One entry per row of the matrix. `id` is the row's own name so a failure reads
+# as a row name rather than as an index.
+FAIL_CLOSED_ROWS = (
+    pytest.param(_missing_metrics, id="metrics-absent"),
+    pytest.param(_malformed_metrics, id="metrics-malformed"),
+    pytest.param(_metrics_is_a_list, id="metrics-top-level-is-a-list"),
+    pytest.param(_empty_series, id="metrics-series-empty"),
+    pytest.param(_missing_confidence, id="metrics-confidence-absent"),
+    pytest.param(_missing_trend_direction, id="metrics-trend-direction-absent"),
+    pytest.param(_missing_period_days, id="metrics-period-days-absent"),
+    pytest.param(_null_clean_pct_without_reason, id="null-clean-pct-without-reason"),
+    pytest.param(_non_finite_clean_pct, id="metrics-non-finite-number"),
+    pytest.param(_missing_charts, id="charts-absent"),
+    pytest.param(_wrong_charts_version, id="charts-wrong-contract-version"),
+    pytest.param(_empty_charts, id="charts-empty"),
+    pytest.param(_unmapped_confidence_reason, id="metrics-unmapped-confidence-reason"),
+)
+
+
+@pytest.mark.parametrize("mutate", FAIL_CLOSED_ROWS)
+def test_fail_closed_matrix_rows_refuse_with_exit_one_and_write_nothing(
+    tmp_path: Path, capsys, mutate
+) -> None:
+    """Every malformed, missing, non-finite or untranslatable input is exit 1.
+
+    §8.7's table has three outcomes and no fourth, so each row asserts all three
+    halves of exit 1: the exit code itself, EXACTLY ONE `report failed:` line
+    naming the condition (a model gets one line to act on, not a traceback and
+    not two competing complaints), and neither output file written. A stage that
+    failed halfway and left a manifest naming a report that is not there has told
+    the reader something false, which is the defect the whole exit table exists
+    to prevent.
+    """
+    before = _fixture_bytes()
+    out_dir = _prepared_report_dir(tmp_path, "out.row")
+    mutate(out_dir)
+
+    assert _run_report(out_dir) == 1, (
+        f"row {mutate.__name__!r}: a bad local input must be exit 1, never a "
+        f"published report and never a traceback"
+    )
+
+    captured = capsys.readouterr()
+    failures = [
+        line for line in captured.err.splitlines() if line.startswith("report failed:")
+    ]
+    assert len(failures) == 1, (
+        f"row {mutate.__name__!r}: expected exactly one 'report failed:' line, got "
+        f"{len(failures)}: {captured.err!r}"
+    )
+    assert not out_dir.joinpath(build_report.REPORT_FILENAME).exists(), (
+        f"row {mutate.__name__!r}: report.md was written on a failed run"
+    )
+    assert not out_dir.joinpath(build_report.REPORT_MANIFEST_FILENAME).exists(), (
+        f"row {mutate.__name__!r}: report.manifest.json was written on a failed run"
+    )
+    assert _fixture_bytes() == before, "a matrix row mutated a committed fixture"
+
+
+def test_fail_closed_missing_confidence_names_the_key_and_never_a_traceback(
+    tmp_path: Path, capsys
+) -> None:
+    """The one row whose MESSAGE is the assertion: `series[0].confidence`.
+
+    `require_display_fields` exists to turn a missing display field into a line a
+    model can act on. Without it the same input produced a `KeyError` traceback
+    halfway through a render - an output a model cannot use, and a document that
+    may already be half-written. The assertion is on the message naming the exact
+    `where.key`, plus the absence of a traceback, because a guard that refused
+    correctly but named nothing would still leave the caller guessing.
+    """
+    out_dir = _prepared_report_dir(tmp_path, "out.keyname")
+    _missing_confidence(out_dir)
+
+    assert _run_report(out_dir) == 1
+    err = capsys.readouterr().err
+    assert "series[0].confidence" in err, (
+        f"the failure must name the exact field to fix; stderr was {err!r}"
+    )
+    assert "KeyError" not in err, (
+        f"a missing display field must be a refusal, not a traceback: {err!r}"
+    )
+    assert "Traceback" not in err, f"a refusal must not print a traceback: {err!r}"
+
+
+def test_invalid_spec_exits_with_exit_two_and_writes_nothing(tmp_path: Path, capsys) -> None:
+    """The exit-2 row: a spec problem is exit 2, inherited, never intercepted.
+
+    A different defect class from 06-01's `test_tracer_spec_problem_exits_two_and_writes_nothing`,
+    which omits `series` entirely: this one is a spec that is a valid JSON object
+    with the right root keys and an item carrying an UNKNOWN field and a missing
+    `label`, which is the shape a hand-edited spec actually has. Both coexist on
+    purpose - one row per exit code, each with its own input shape, because a
+    single exit-2 assertion that passed for the wrong reason would be a gate with
+    no reach.
+    """
+    spec = json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))
+    spec["series"][0]["unknown_field"] = "x"
+    del spec["series"][0]["label"]
+    spec_path = tmp_path / "spec.invalid.json"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+    out_dir = _prepared_report_dir(tmp_path, "out.exit2")
+
+    with pytest.raises(SystemExit) as exit_info:
+        build_report.main(["--spec", str(spec_path), "--out", str(out_dir)])
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "spec.json validation failed" in err, f"the spec header must be printed: {err!r}"
+    assert "label" in err, f"the aggregated list must name the offending field: {err!r}"
+    assert not out_dir.joinpath(build_report.REPORT_FILENAME).exists()
+    assert not out_dir.joinpath(build_report.REPORT_MANIFEST_FILENAME).exists()
+
+
+def test_report_tokens_are_required_per_language(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A language with no table, and a table missing one key, are the SAME defect.
+
+    `test_charts.py::test_chart_tokens_are_required_per_language` established the
+    shape for the sibling table; all three of its assertions are carried over here
+    in meaning - exit 1, exactly one `report failed:` line naming the language,
+    and nothing written.
+
+    Two languages are exercised, for two different reasons:
+
+    - `sv`, which no stage has a table for, as this plan specifies;
+    - `ja`, which the CHART stage supports and the report stage does not. This is
+      the genuinely reachable path, and the one §8.3 was written about: a `ja`
+      spec produces a valid `charts.json` from the real chart stage and is then
+      refused HERE. Testing only `sv` would exercise a path the real pipeline
+      cannot reach, because the chart stage refuses `sv` first.
+    """
+    before = _fixture_bytes()
+    out_dir = _prepared_report_dir(tmp_path, "out.language")
+
+    for language in ("sv", "ja"):
+        spec = json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))
+        spec["language"] = language
+        spec_path = tmp_path / f"spec.{language}.json"
+        spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+        for name, mutate in (
+            ("metrics.json", lambda d, lang=language: d.__setitem__("language", lang)),
+            ("charts.json", lambda d, lang=language: d.__setitem__("language", lang)),
+        ):
+            path = out_dir.joinpath(name)
+            document = json.loads(path.read_text(encoding="utf-8"))
+            mutate(document)
+            path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+        assert _run_report(out_dir, spec_path) == 1, (
+            f"language {language!r} has no report token table and must be refused"
+        )
+        captured = capsys.readouterr()
+        failures = [
+            line for line in captured.err.splitlines() if line.startswith("report failed:")
+        ]
+        assert len(failures) == 1, (
+            f"language {language!r}: expected exactly one 'report failed:' line, got "
+            f"{failures!r}"
+        )
+        assert language in failures[0], (
+            f"the refusal must name the language; stderr was {failures[0]!r}"
+        )
+        assert not out_dir.joinpath(build_report.REPORT_FILENAME).exists()
+        assert not out_dir.joinpath(build_report.REPORT_MANIFEST_FILENAME).exists()
+
+    # Every declared table is complete and every token is non-blank. A blank token
+    # would render an empty cell or an empty heading and satisfy a membership
+    # check, so membership is not enough on its own.
+    for code, table in build_report.REPORT_TOKENS.items():
+        assert set(table) == set(build_report.REQUIRED_REPORT_TOKENS), (
+            f"REPORT_TOKENS[{code!r}] must define exactly the required keys, "
+            f"differing on {sorted(set(table) ^ set(build_report.REQUIRED_REPORT_TOKENS))}"
+        )
+        for key, phrase in table.items():
+            assert phrase.strip(), f"REPORT_TOKENS[{code!r}][{key!r}] is blank"
+
+    # And the two states produce the IDENTICAL message, which is the property that
+    # makes them the same defect rather than two similar ones.
+    with pytest.raises(build_report.ReportError) as missing:
+        build_report.report_tokens("sv")
+    partial_table = {
+        key: value
+        for key, value in build_report.REPORT_TOKENS["uk"].items()
+        if key != "not_computable"
+    }
+    monkeypatch.setattr(build_report, "REPORT_TOKENS", {**build_report.REPORT_TOKENS, "uk": partial_table})
+    with pytest.raises(build_report.ReportError) as partial:
+        build_report.report_tokens("uk")
+    assert str(missing.value).replace("sv", "{language}") == str(partial.value).replace(
+        "uk", "{language}"
+    ), (
+        f"a partial table and a missing one must report identically: "
+        f"{missing.value!r} vs {partial.value!r}"
+    )
+
+    assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
+def test_reason_token_refuses_an_unmapped_reason() -> None:
+    """No reason can fall back to English, and the refusal names it.
+
+    Two halves. First, an unmapped reason raises and NAMES the reason verbatim,
+    so the caller knows which upstream constant to add - which is also what makes
+    an upstream RENAME loud instead of silent. Second, and structurally: the
+    `uk` table's key set EQUALS the full set of `analyze_trends` constants whose
+    name ends in `_REASON` or `_NOTE`, computed by walking `vars(analyze_trends)`.
+    That equality is the form "no reason can fall back to English" actually takes:
+    a reason constant added upstream without a localized phrase fails here, and a
+    phrase left behind after the constant was deleted fails here too.
+    """
+    unmapped = "a reason no production code emits"
+    with pytest.raises(build_report.ReportError) as refusal:
+        build_report.reason_token("uk", unmapped)
+    assert unmapped in str(refusal.value), (
+        f"the refusal must name the reason verbatim; got {refusal.value!r}"
+    )
+
+    # The KEY SET is the set of the constants' VALUES, because `REASON_TOKENS` is
+    # keyed by the verbatim English string (that is what makes an upstream RENAME
+    # loud); the CONSTANT NAMES are what the `_REASON` / `_NOTE` suffix filter is
+    # applied to.
+    upstream = {
+        value
+        for name, value in vars(analyze_trends).items()
+        if (name.endswith("_REASON") or name.endswith("_NOTE")) and isinstance(value, str)
+    }
+    assert upstream, (
+        "no analyze_trends constant matched _REASON/_NOTE, so this test's structural "
+        "half would silently pass on an empty set"
+    )
+    for code in build_report.REASON_TOKENS:
+        assert set(build_report.REASON_TOKENS[code]) == upstream, (
+            f"REASON_TOKENS[{code!r}] must cover every analyze_trends reason "
+            f"constant, differing on {sorted(upstream ^ set(build_report.REASON_TOKENS[code]))}"
+        )
+
+
