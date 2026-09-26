@@ -188,10 +188,10 @@ def test_tracer_one_series_renders_png_and_publishes_charts_json(tmp_path: Path,
     assert _run_charts(spec_path, tmp_out) == 0
 
     # Case 2: one real PNG per rendered chart, 8 magic bytes, non-trivial size.
-    # N=1 publishes the timeseries plus the comparison view (D-19: 2N+1), and at
-    # N=1 that is 2 of the 5 a two-kind inventory would reach at N=2.
+    # N=1 publishes the two per-series kinds plus the comparison view (D-19: 2N+1),
+    # which is 3 - half of the 5 the two-series fixture reaches.
     pngs = sorted(tmp_out.glob("*.png"))
-    assert len(pngs) == 2, f"expected the timeseries and the overlay, got {pngs}"
+    assert len(pngs) == 3, f"expected two per-series charts and the overlay, got {pngs}"
     for png in pngs:
         blob = png.read_bytes()
         assert blob[:8] == PNG_MAGIC, "rendered chart must be a real PNG"
@@ -201,7 +201,7 @@ def test_tracer_one_series_renders_png_and_publishes_charts_json(tmp_path: Path,
     assert manifest["contract_version"] == "charts.v1"
     assert manifest["spec_name"] == "intermittent_fasting_pl_cs"
     assert manifest["language"] == "uk"
-    assert len(manifest["charts"]) == 2
+    assert len(manifest["charts"]) == 3
     assert sorted(entry["filename"] for entry in manifest["charts"]) == [png.name for png in pngs]
     timeseries_entry = next(
         entry for entry in manifest["charts"] if entry["kind"] == make_charts.TIMESERIES_KIND
@@ -370,11 +370,28 @@ def test_timeseries_has_raw_and_median_series(tmp_out: Path) -> None:
 
 
 def test_timeseries_y_limits_anchored_at_zero(tmp_out: Path) -> None:
-    """D-14: the lower bound is exactly 0.0, not merely bounded below by zero."""
+    """D-14: the lower bound is exactly 0.0, not merely bounded below by zero.
+
+    Filtered to the two *timeseries* axes by kind. Zero anchoring is a
+    timeseries/overlay rule only (D-14 constrains `views`, which is
+    non-negative by contract); the growth chart's value axis is a percentage
+    axis that must be free to go below zero, or a decline is erased (RESEARCH
+    Pitfall 1). Plan 05-04 adds that third kind, so this test names the kinds
+    it is about rather than every entry in the document.
+    """
     spec_path, _manifest = _render_two_series(tmp_out)
+    timeseries_axes = {
+        make_charts.TIMESERIES_KIND,
+        make_charts.OVERLAY_KIND,
+    }
+    seen = 0
     for entry in _plan(tmp_out, spec_path).charts:
+        if entry.kind not in timeseries_axes:
+            continue
         assert entry.y_limits[0] == 0.0
         assert entry.y_limits[1] > 0.0
+        seen += 1
+    assert seen, "the timeseries/overlay axes must still be asserted"
 
 
 def test_charts_json_manifest_matches_rendered_files(tmp_out: Path) -> None:
@@ -493,10 +510,10 @@ def test_inventory_is_two_png_per_series_plus_overlay(tmp_out: Path) -> None:
     kinds_per_series = {entry.kind for entry in per_series}
     assert len(per_series) == len(order) * len(kinds_per_series)
     assert len(overlay) == 1, "the comparison view must never be conditional on N > 1"
-    # D-19's 2N+1: N x (per-series kinds) + exactly one comparison view. With the
-    # growth kind of 05-04 this is the literal 2N+1; today it is 2 + 1 = 3.
+    # D-19's 2N+1: N x (per-series kinds) + exactly one comparison view. With two
+    # per-series kinds this is the literal 2N+1; plan 05-04 Task 2 pins the
+    # number and the kind sequence here, and adds the N=1/N=2 parametrization.
     assert len(document.charts) == len(order) * len(kinds_per_series) + 1
-    assert len(document.charts) == 3
     assert document.charts[-1].kind == make_charts.OVERLAY_KIND, "the overlay is last"
 
     # Count from the manifest, never from a directory glob: an orphan file must
@@ -506,9 +523,9 @@ def test_inventory_is_two_png_per_series_plus_overlay(tmp_out: Path) -> None:
     assert sorted(path.name for path in tmp_out.glob("*.png")) == sorted(
         entry["filename"] for entry in manifest["charts"]
     )
-    assert [entry["spec_index"] for entry in manifest["charts"] if "series_id" in entry] == list(
-        range(len(order))
-    )
+    assert [entry["spec_index"] for entry in manifest["charts"] if "series_id" in entry] == [
+        entry.spec_index for entry in per_series
+    ], "the manifest must publish the same spec order the plan declares"
 
 
 def test_filenames_are_deterministic_and_derived_from_series_id(tmp_path: Path) -> None:
@@ -646,6 +663,199 @@ def test_metrics_series_absent_from_spec_fails_closed(
     assert not out_dir.joinpath("charts.json").exists()
 
 
+# --- Plan 05-04 Task 1: growth bars - three windows, clean-only, n/a (D-02..D-05)
+
+
+def _growth_entry_of(
+    document: make_charts.ChartDocument, series_id: str = TRACER_SERIES_ID
+) -> make_charts.ChartEntry:
+    """The one growth entry a series owns, by kind and id rather than by index."""
+    growth = [
+        entry
+        for entry in document.charts
+        if entry.kind == make_charts.GROWTH_KIND and entry.series_id == series_id
+    ]
+    assert len(growth) == 1, f"exactly one growth chart for {series_id}"
+    return growth[0]
+
+
+def _published_growth_of(manifest: dict[str, Any], series_id: str) -> dict[str, Any]:
+    """The manifest's growth entry for one series, selected by kind and id."""
+    published = [
+        item
+        for item in manifest["charts"]
+        if item["kind"] == make_charts.GROWTH_KIND and item.get("series_id") == series_id
+    ]
+    assert len(published) == 1, f"exactly one published growth chart for {series_id}"
+    return published[0]
+
+
+def _metrics_by_series(out_dir: Path) -> dict[str, dict[str, Any]]:
+    """The working metrics.json keyed by series_id, read as plain JSON."""
+    document = json.loads(out_dir.joinpath("metrics.json").read_text(encoding="utf-8"))
+    return {node["series_id"]: node for node in document["series"]}
+
+
+def test_growth_bars_cover_three_windows_with_labels(tmp_out: Path) -> None:
+    """D-02: all three windows get a bar, in contract order, each with a label."""
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    entry = _growth_entry_of(document)
+    assert entry.kind == make_charts.GROWTH_KIND
+
+    assert [bar.window for bar in entry.bars] == ["m3", "y1", "y2"]
+    published = _published_growth_of(manifest, TRACER_SERIES_ID)
+    assert [bar["window"] for bar in published["bars"]] == ["m3", "y1", "y2"]
+    # D-05: every bar names its window, so the reader never maps tick position
+    # to window by counting rows.
+    for bar in published["bars"]:
+        assert bar["label"] == make_charts.WINDOW_LABELS[bar["window"]]
+        assert bar["label"]
+    assert [bar["label"] for bar in published["bars"]] == ["3M", "1Y", "2Y"]
+
+
+def test_growth_bars_equal_metrics_clean_pct(tmp_out: Path) -> None:
+    """CHRT-02's single-lineage assertion: clean.pct verbatim, plain `==`, no tolerance."""
+    spec_path, _manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    metrics = _metrics_by_series(tmp_out)
+
+    growth_entries = [c for c in document.charts if c.kind == make_charts.GROWTH_KIND]
+    assert len(growth_entries) == len(metrics)
+    for entry in growth_entries:
+        series_id = entry.series_id
+        assert series_id is not None
+        node = metrics[series_id]
+        for bar in entry.bars:
+            clean = node["growth"][bar.window]["clean"]
+            # Plain equality: a rounded or float-drifted copy fails here, which is
+            # the whole point - the bar IS the contract number, not a rendering of it.
+            assert bar.pct == clean["pct"], (
+                f"{series_id}/{bar.window}: the bar must be growth.{bar.window}.clean.pct "
+                f"verbatim, never a re-derived or rounded value"
+            )
+            assert bar.abs == clean["abs"]
+            # T-5-13: the volume base is metrics.json's own field, never a mean
+            # recomputed from series.csv.
+            assert bar.base_avg_daily_views == node["avg_daily_views"]
+
+
+def test_growth_bars_never_carry_the_raw_value(tmp_path: Path, tmp_out: Path) -> None:
+    """D-03: only `clean.pct` is plotted; the raw spike number never reaches a bar."""
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", out_dir) == 0
+
+    document = _plan(out_dir, FIXTURES_DIR / "spec.example.json")
+    entry = _growth_entry_of(document)
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    published = _published_growth_of(manifest, TRACER_SERIES_ID)
+
+    pl_bars = {bar["window"]: bar for bar in published["bars"]}
+    # The fixture's 10x day moved the raw 1Y growth to +19.6 and the clean to
+    # +16.7. The bar is the second number, and the first is nowhere on the chart.
+    assert pl_bars["y1"]["pct"] == 16.7
+    assert pl_bars["y1"]["pct"] != 19.6
+    serialized = json.dumps(published["bars"], ensure_ascii=False)
+    assert "19.6" not in serialized, "the raw pct must never appear in a growth bar"
+    assert 19.6 not in [bar.pct for bar in entry.bars]
+
+
+def _write_anomaly_pair(out_dir: Path) -> None:
+    """Materialize the committed spike pair (series + metrics) inside out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.joinpath("series.csv").write_bytes(
+        FIXTURES_DIR.joinpath("series.anomalies.example.csv").read_bytes()
+    )
+    out_dir.joinpath("metrics.json").write_bytes(
+        FIXTURES_DIR.joinpath("metrics.anomalies.example.json").read_bytes()
+    )
+
+
+def test_null_growth_is_labelled_na_with_reason(tmp_out: Path) -> None:
+    """D-04: a null is an explicit n/a bar carrying the contract reason, not a gap."""
+    spec_path, manifest = _render_two_series(tmp_out)
+    entry = _growth_entry_of(_plan(tmp_out, spec_path))
+    published = _published_growth_of(manifest, TRACER_SERIES_ID)
+    bars = {bar["window"]: bar for bar in published["bars"]}
+
+    null_bars = [bar for bar in entry.bars if bar.pct is None]
+    assert len(null_bars) == 1, "the committed golden has exactly one null window"
+    assert [bar.window for bar in null_bars] == ["y2"]
+    assert null_bars[0].reason == (
+        "insufficient observations in one or both equal-length windows"
+    )
+    assert null_bars[0].abs is None
+
+    y2 = bars["y2"]
+    # The no-null manifest rule (05-02): the keys are omitted, never nulled, and
+    # the documented boolean says which state the bar is in.
+    assert y2["bar_null"] is True
+    assert "pct" not in y2
+    assert "abs" not in y2
+    assert y2["reason"] == "insufficient observations in one or both equal-length windows"
+    for other_window in ("m3", "y1"):
+        assert bars[other_window]["bar_null"] is False
+        assert "reason" not in bars[other_window]
+        assert bars[other_window]["pct"] is not None
+    # No null *value* anywhere in the serialized bars payload. Checked by walking
+    # values rather than by substring search, because the key name `bar_null`
+    # itself contains the characters "null".
+    for bar in published["bars"]:
+        for key, value in bar.items():
+            assert value is not None, f"charts.json must never carry a null at bars.{key}"
+            if isinstance(value, str):
+                assert value not in {"None", "nan"}, f"charts.json leaked {value!r}"
+    assert "null" not in json.dumps(published["bars"], ensure_ascii=False).replace(
+        "bar_null", ""
+    )
+
+
+def _write_golden_copy(out_dir: Path, series_ids: tuple[str, ...] = ALL_SERIES_IDS) -> None:
+    """Copy the golden pair into out_dir, then let a test edit metrics.json in place."""
+    _copy_fixtures(out_dir, series_ids)
+
+
+def test_null_growth_without_reason_fails_closed(
+    tmp_out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A null with no reason is a contract violation, refused before anything is drawn."""
+    _write_golden_copy(tmp_out)
+    path = tmp_out / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)
+    del node["growth"]["y2"]["clean"]["reason"]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "null without a reason" in captured.err
+    assert TRACER_SERIES_ID in captured.err
+    assert list(tmp_out.glob("*.png")) == []
+    assert not tmp_out.joinpath("charts.json").exists()
+
+
+def test_missing_growth_window_fails_closed(
+    tmp_out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D-02: all three windows are required, because an absent 2Y is itself signal."""
+    _write_golden_copy(tmp_out)
+    path = tmp_out / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)
+    del node["growth"]["y2"]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "missing growth window" in captured.err
+    assert "'y2'" in captured.err
+    assert TRACER_SERIES_ID in captured.err
+    assert list(tmp_out.glob("*.png")) == []
+
+
 # --- Plan 05-03 Task 2: the shared-axis multi-series overlay (D-01, D-20)
 
 
@@ -728,7 +938,9 @@ def test_overlay_plots_raw_values_without_rescaling(tmp_out: Path) -> None:
     document = _plan(tmp_out, spec_path)
     entry = _overlay_entry_of(document)
     per_series = {
-        chart.series_id: chart for chart in document.charts if chart.series_id is not None
+        chart.series_id: chart
+        for chart in document.charts
+        if chart.kind == make_charts.TIMESERIES_KIND
     }
 
     for line in entry.series_lines:
