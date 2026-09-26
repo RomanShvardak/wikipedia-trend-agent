@@ -355,7 +355,7 @@ def test_report_module_imports_no_third_party_dependency() -> None:
             )
 
 
-def test_uk_section_headings_are_the_exact_roadmap_strings() -> None:
+def test_uk_report_tokens_carry_the_exact_roadmap_heading_strings() -> None:
     """The six `uk` headings are literals, not merely the order the tokens imply.
 
     Every other heading assertion in this module reads the strings back out of
