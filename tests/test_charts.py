@@ -257,19 +257,107 @@ def _render_two_series(out_dir: Path) -> tuple[Path, dict[str, Any]]:
     return spec_path, manifest
 
 
-def _plan(out_dir: Path, spec_path: Path) -> make_charts.ChartDocument:
-    """Rebuild the chart plan from the same inputs the CLI read."""
+def _plan(
+    out_dir: Path, spec_path: Path, *, log_scale: bool = False
+) -> make_charts.ChartDocument:
+    """Rebuild the chart plan from the same inputs the CLI read.
+
+    `log_scale` must be passed whenever the CLI was given `--log-scale`: the
+    plan is a pure function of its inputs, so rebuilding it without the flag
+    would silently describe the LINEAR chart while the disk holds a log one.
+    """
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     metrics, digest = make_charts.load_metrics(out_dir / "metrics.json")
     grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
     return make_charts.build_chart_plan(
-        spec, metrics, digest, grouped, str(out_dir / "metrics.json")
+        spec, metrics, digest, grouped, str(out_dir / "metrics.json"), log_scale=log_scale
     )
 
 
 def _module_source() -> str:
     """Read the chart module's own source, path resolved once here."""
     return Path(str(make_charts.__file__)).read_text(encoding="utf-8")
+
+
+# Every matplotlib method that changes an axis SCALE, as opposed to its limits.
+# `set_xlim`/`set_ylim` are absent on purpose: D-14 and D-10 both mandate them
+# on the timeseries axes, so a guard listing them would forbid the phase.
+AXIS_SCALE_METHODS = frozenset(
+    {
+        "set_xscale",
+        "set_yscale",
+        "set_zscale",
+        "set_rscale",
+        "set_rorigin",
+        "set_rlabel_position",
+        "loglog",
+        "semilogx",
+        "semilogy",
+    }
+)
+
+
+def _function_node(name: str) -> ast.FunctionDef:
+    """The single module-level function called `name`, located by AST."""
+    found = [
+        node
+        for node in ast.walk(ast.parse(_module_source()))
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    assert len(found) == 1, f"the module must define exactly one {name}()"
+    return found[0]
+
+
+def _scale_calls_in_render_path(function_name: str) -> list[dict[str, Any]]:
+    """Every axis-scale call reachable from `function_name`, delegation followed.
+
+    A guard that only reads one function's body stops guarding the moment the
+    call moves into a helper - which is exactly what happened when 05-06 lifted
+    D-15's `set_yscale` out of `_draw_overlay` into `_apply_log_regime`. So this
+    walk descends one level into any private helper the named function calls,
+    and reports each call's method name, its constant positional arguments and
+    its keyword arguments so an assertion can name a permitted exact call rather
+    than merely a permitted method.
+    """
+    tree = ast.parse(_module_source())
+    entry_point = _function_node(function_name)
+    bodies: list[Any] = list(entry_point.body)
+    for node in ast.walk(entry_point):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.startswith("_")
+        ):
+            bodies.extend(_function_node(node.func.id).body)
+    calls: list[dict[str, Any]] = []
+    for root in bodies:
+        for node in ast.walk(root):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in AXIS_SCALE_METHODS
+            ):
+                calls.append(
+                    {
+                        "attr": node.func.attr,
+                        "line": node.lineno,
+                        "positional": [
+                            arg.value
+                            for arg in node.args
+                            if isinstance(arg, ast.Constant)
+                        ],
+                        "keywords": {
+                            keyword.arg: (
+                                keyword.value.value
+                                if isinstance(keyword.value, ast.Constant)
+                                else "<dynamic>"
+                            )
+                            for keyword in node.keywords
+                            if keyword.arg is not None
+                        },
+                    }
+                )
+    return calls
 
 
 def test_backend_is_agg() -> None:
@@ -1156,23 +1244,31 @@ def test_overlay_shares_axis_and_declares_scale_difference(tmp_out: Path) -> Non
     assert "spec_index" not in published
     assert document.charts[-1].kind == make_charts.OVERLAY_KIND, "the overlay is last"
 
-    # No axis call in the overlay path may set a log or normalized scale: that
-    # would invent a per-series index with no source in metrics.json.
-    tree = ast.parse(_module_source())
-    overlay_functions = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_draw_overlay"
-    ]
-    assert len(overlay_functions) == 1, "the overlay render path must be its own function"
-    scale_calls = [
-        node
-        for node in ast.walk(overlay_functions[0])
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"set_yscale", "set_xscale", "set_rscale"}
-    ]
-    assert not scale_calls, "D-20 forbids a log or normalized scale on the overlay"
+    # No axis call in the overlay path may normalize, rebase or rescale a
+    # series: that would invent a per-series index with no source in
+    # metrics.json. D-15's explicitly-labelled log regime is the ONE scale call
+    # this path may make, and it rescales nothing - it only changes the spacing
+    # of the reader's eye along the one shared axis.
+    #
+    # The walk follows the delegation into `_apply_log_regime`, which is where
+    # the call now lives. It did not when 05-03 wrote this assertion, and a
+    # guard that stops covering the code it names is worse than no guard: it
+    # keeps passing after the rule it enforces has stopped being enforced.
+    scale_calls = _scale_calls_in_render_path("_draw_overlay")
+    for call in scale_calls:
+        assert call["attr"] == "set_yscale", (
+            f"the overlay path may only set the y scale; found {call}"
+        )
+        assert call["positional"] == ["log"], (
+            f"the only permitted y scale is D-15's labelled log regime: {call}"
+        )
+        assert call["keywords"].get("nonpositive") == "mask", (
+            f"the log regime must state its non-positive handling explicitly: {call}"
+        )
+    assert any(call["attr"] == "set_yscale" for call in scale_calls), (
+        "the overlay render path must still reach D-15's log regime - if this "
+        "fails the guard above has stopped covering the code it names"
+    )
 
 
 def test_overlay_plots_raw_values_without_rescaling(tmp_out: Path) -> None:
@@ -2019,8 +2115,9 @@ def test_log_mode_is_explicit_and_discloses_masked_points(tmp_path: Path) -> Non
         assert "log_note" not in item, "a linear chart states no log disclosure"
 
     log_dir = tmp_path / "log"
+    _write_zero_pair(log_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
     assert _run_charts_with_flags(spec_path, log_dir, "--log-scale") == 0
-    log_document = _plan(log_dir, spec_path)
+    log_document = _plan(log_dir, spec_path, log_scale=True)
     log_manifest = json.loads(log_dir.joinpath("charts.json").read_text(encoding="utf-8"))
 
     pl = _timeseries_entry_of(log_document)
@@ -2071,7 +2168,7 @@ def test_growth_stays_linear_under_log_scale(tmp_path: Path) -> None:
     spec_path = _write_zero_pair(out_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
     assert _run_charts_with_flags(spec_path, out_dir, "--log-scale") == 0
 
-    document = _plan(out_dir, spec_path)
+    document = _plan(out_dir, spec_path, log_scale=True)
     growth_entries = [e for e in document.charts if e.kind == make_charts.GROWTH_KIND]
     assert growth_entries, "the growth kind must still be asserted, or this is vacuous"
     for entry in growth_entries:
@@ -2088,24 +2185,13 @@ def test_growth_stays_linear_under_log_scale(tmp_path: Path) -> None:
             assert item["yscale"] == "linear"
             assert "log_note" not in item
 
-    # And the structural half: the growth render branch reads no scale decision
-    # at all, so the flag cannot reach it through a future edit either.
-    import ast as _ast
-
-    tree = _ast.parse(_module_source())
-    growth_helper = next(
-        node
-        for node in _ast.walk(tree)
-        if isinstance(node, _ast.FunctionDef) and node.name == "_draw_growth"
+    # And the structural half: the growth render branch reaches no scale call at
+    # all and does not even read the entry's regime, so the flag cannot reach it
+    # through a future edit either.
+    assert _scale_calls_in_render_path("_draw_growth") == [], (
+        "the growth branch must name no scale call at all"
     )
-    assert not [
-        node.func.attr
-        for node in _ast.walk(growth_helper)
-        if isinstance(node, _ast.Call)
-        and isinstance(node.func, _ast.Attribute)
-        and node.func.attr.endswith("scale")
-    ], "the growth branch must name no scale call at all"
-    assert "yscale" not in _ast.unparse(growth_helper), (
+    assert "yscale" not in ast.unparse(_function_node("_draw_growth")), (
         "the growth branch must not even read entry.yscale"
     )
 
@@ -2145,6 +2231,97 @@ def test_log_help_text_is_published_and_explicit() -> None:
     assert make_charts._parser().parse_args(["--spec", "s.json"]).log_scale is False
 
 
+def test_a_masked_anomaly_is_a_caret_not_a_stub_clipped_at_the_log_floor(
+    tmp_path: Path,
+) -> None:
+    """A `views=0` day the detector flagged cannot be drawn on a log axis - so it
+    is drawn as a caret, not as a segment clipped at the floor.
+
+    Found by opening the PNG, the 05-04 defect class: the first log-mode render
+    drew the anomaly's own segment from its median (115) down to its value (0)
+    while the axis floor is the smallest *positive* reading (100). matplotlib
+    clips the collection, so what reached the image was a short stub ending at
+    the floor - pixel-identical to a genuine reading that happened to land on
+    100, and carrying none of the information that the real value was zero. The
+    axes say nothing; only the code knows. A stub is worse than a caret, because
+    the reader cannot tell a clipped value from a real one.
+    """
+    out_dir = tmp_path / "log"
+    spec_path = _write_zero_pair(out_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
+    assert _run_charts_with_flags(spec_path, out_dir, "--log-scale") == 0
+
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    document = _plan(out_dir, spec_path, log_scale=True)
+    entry = _timeseries_entry_of(document)
+
+    # The zero days really are anomalies in metrics.json, so the collision is
+    # exercised by data rather than by a hand-built entry.
+    metrics = _metrics_by_series(out_dir)
+    zero_anomalies = [
+        item for item in metrics[TRACER_SERIES_ID]["anomalies"] if item["value"] == 0
+    ]
+    assert zero_anomalies, (
+        "the fixture must produce at least one anomaly whose value a log axis "
+        "cannot draw, or this test proves nothing"
+    )
+    assert entry.log_masked_points == LOG_MASKED_DAYS
+    assert len(zero_anomalies) <= entry.log_masked_points
+
+    fig, ax = plt.subplots(figsize=make_charts.FIGURESIZE, dpi=make_charts.DPI)
+    try:
+        make_charts._draw_timeseries(entry, ax, mdates)
+        carets = [line for line in ax.get_lines() if line.get_marker() == "v"]
+        assert len(carets) == len(zero_anomalies), (
+            "one caret per anomaly the log axis cannot draw"
+        )
+        # No clipped segment survives: every vlines collection on this axes has a
+        # positive lower bound, so nothing ends at the floor pretending to be a
+        # reading.
+        floor = entry.y_limits[0]
+        assert floor > 0.0
+        for collection in ax.collections:
+            for segment in collection.get_segments():
+                for _x, y in segment:
+                    assert y > 0.0, (
+                        f"a masked value was drawn as a real coordinate at {y}"
+                    )
+        # And the caret rides at a position the reader can see, carrying the same
+        # anomaly colour and the same single legend row.
+        legend = ax.get_legend()
+        labels = [text.get_text() for text in legend.get_texts()] if legend else []
+        assert labels.count(make_charts.ANOMALY_LEGEND_LABEL) == 1, labels
+        for line in carets:
+            assert list(line.get_ydata())[0] >= floor
+            assert list(line.get_ydata())[0] > 0.0
+    finally:
+        plt.close(fig)
+
+    # The linear chart is untouched by any of this: a zero day on a linear axis
+    # is drawn at face value, which is D-11.
+    linear_dir = tmp_path / "linear"
+    _write_zero_pair(linear_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
+    assert _run_charts(spec_path, linear_dir) == 0
+    linear_entry = _timeseries_entry_of(_plan(linear_dir, spec_path))
+    fig, ax = plt.subplots(figsize=make_charts.FIGURESIZE, dpi=make_charts.DPI)
+    try:
+        make_charts._draw_timeseries(linear_entry, ax, mdates)
+        assert not [line for line in ax.get_lines() if line.get_marker() == "v"], (
+            "a linear chart never uses the masked caret - the zero is drawable there"
+        )
+        zeros = [
+            point.views for point in linear_entry.points if point.views == 0
+        ]
+        assert len(zeros) == LOG_MASKED_DAYS
+    finally:
+        plt.close(fig)
+
+
 def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
     """05-06 inherits 05-05's clipping guard for the text it adds.
 
@@ -2165,7 +2342,7 @@ def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
-    document = _plan(out_dir, spec_path)
+    document = _plan(out_dir, spec_path, log_scale=True)
     targets = [_timeseries_entry_of(document), _overlay_entry_of(document)]
     for entry in targets:
         fig, ax = plt.subplots(figsize=make_charts.FIGURESIZE, dpi=make_charts.DPI)

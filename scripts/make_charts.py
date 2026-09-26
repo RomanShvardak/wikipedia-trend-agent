@@ -45,6 +45,27 @@ Y_HEADROOM_FACTOR = 1.05
 TIMESERIES_KIND = "timeseries"
 GROWTH_KIND = "growth"
 OVERLAY_KIND = "overlay"
+# D-15: the log regime is a CLI opt-in, never a threshold. RESEARCH Pitfall 3
+# measured an *automatic* log axis whose visible range began at 3.7 with both
+# zero days silently gone and no warning emitted - a chart that deletes exactly
+# the observations D-11 protects, on data the reader never chose to compare that
+# way. The regime is therefore a named flag, an explicit `nonpositive="mask"`
+# argument, and a counted disclosure.
+LOG_YSCALE = "log"
+LINEAR_YSCALE = "linear"
+# The floor of a log axis when EVERY plotted value is non-positive, so there is
+# no smallest positive reading to show. A DISPLAY bound, never a data claim.
+LOG_FALLBACK_LOWER_BOUND = 1.0
+# The disclosure D-15 requires on both the image and in the manifest. A constant
+# format string rather than a localized token: this text is the interface a
+# reader (and Phase 6) reads to learn what the axis did not draw, and a count
+# wrapped in an ambiguous language is exactly the ambiguity it exists to remove.
+LOG_NOTE_TEMPLATE = "log scale; {masked} non-positive day(s) masked and not drawn"
+# Where the disclosure sits and how it reads, matching the other in-plot text
+# tokens so a chart carries one visual language. Font size and colour are
+# display-only; no compared number passes through them.
+LOG_TEXT_FONT_SIZE = 8
+LOG_TEXT_COLOR = "#495057"
 # The overlay is owned by no single series, so its name is fixed rather than
 # derived from a series_id - which is also what keeps it from ever colliding
 # with a per-series name (T-5-09).
@@ -86,6 +107,10 @@ ANOMALY_ZORDER = 3
 # equality additionally gets a marker point.
 ANOMALY_MARKER = "o"
 ANOMALY_MARKER_SIZE = 4.0
+# The same idea for a D-15 log entry whose anomaly endpoint the axis cannot
+# express: a downward caret at the highest drawable value, so the picture says
+# "below the visible range" instead of drawing a stub clipped at the floor.
+ANOMALY_MASKED_MARKER = "v"
 # One token, used both as the legend entry and inside the subtitle, so a reader -
 # and a test - can look for the same word in both places.
 ANOMALY_LEGEND_LABEL = "anomaly"
@@ -293,7 +318,18 @@ class ChartEntry:
     gaps: tuple[DataGap, ...]
     anomalies: tuple[dict[str, object], ...]
     anomalies_drawn: int
+    # D-15: the scale regime this entry is drawn in. "linear" for every entry
+    # unless the caller passed --log-scale, and the growth chart is linear in
+    # either case - a percentage axis has no meaningful logarithmic form.
     yscale: str
+    # D-15: how many of this entry's own raw readings are non-positive, i.e. how
+    # many days this axis could not draw. Always emitted; 0 on every linear
+    # entry. The renderer prints the same number it records here, so the picture
+    # and the manifest cannot disagree about what the chart left out.
+    log_masked_points: int
+    # D-15: the visible disclosure, `None` on every linear entry. Omitted from
+    # the manifest rather than nulled (the charts.v1 no-null rule).
+    log_note: str | None
     y_limits: tuple[float, float]
     # D-10: the date-axis domain, read from the series' own metrics `period`
     # block, on the two kinds that have a date axis. `None` on the growth chart,
@@ -516,10 +552,42 @@ def _anomaly_list(
     return tuple(copied)
 
 
+def _nonpositive_count(values: Sequence[int | float]) -> int:
+    """How many of these readings a log axis cannot draw (D-15).
+
+    A logarithmic scale has no place for zero or a negative number, so on a log
+    chart every such reading is masked. The count is the disclosure's only
+    substance: a reader who is not told how many days the axis dropped cannot
+    tell a quiet series from a selectively drawn one.
+    """
+    return sum(1 for value in values if value <= 0)
+
+
+def _log_lower_bound(values: Sequence[int | float]) -> float:
+    """The display floor of a log axis: the smallest strictly positive reading.
+
+    A display bound and never a data claim - which is why the all-non-positive
+    case falls back to a literal 1.0 rather than to a computed value: with
+    nothing positive to show, any number here is arbitrary, and an arbitrary
+    number must be recognisable as one.
+    """
+    positives = [float(value) for value in values if value > 0]
+    if not positives:
+        return LOG_FALLBACK_LOWER_BOUND
+    return min(positives)
+
+
+def _log_note(masked: int) -> str:
+    """The exact disclosure string a log chart prints and charts.json publishes."""
+    return LOG_NOTE_TEMPLATE.format(masked=masked)
+
+
 def _timeseries_entry(
     node: Mapping[str, Any],
     observations: Sequence[analyze_trends.Observation],
     spec_index: int,
+    *,
+    log_scale: bool = False,
 ) -> ChartEntry:
     """Build the one timeseries entry a series owns; plan 05-04 adds the growth sibling."""
     series_id = _require_str(node, "series_id", "metrics.series entry")
@@ -532,8 +600,13 @@ def _timeseries_entry(
     gaps = tuple(
         DataGap(series_id, start, end) for start, end in calendar_gaps(points)
     )
+    masked = _nonpositive_count(raw_values) if log_scale else 0
+    ceiling = float(max(raw_values)) * Y_HEADROOM_FACTOR
     # D-14: the floor is the literal 0.0, never a computed value, so no axis can
-    # ever imply negative views.
+    # ever imply negative views. D-15 changes the REGIME, not that rule: a log
+    # axis cannot express a zero floor at all, which is why it is a separately
+    # labelled mode with its own disclosure rather than a variant of this one.
+    floor = _log_lower_bound(raw_values) if log_scale else 0.0
     return ChartEntry(
         kind=TIMESERIES_KIND,
         series_id=series_id,
@@ -553,8 +626,10 @@ def _timeseries_entry(
         # empty list for the same reason it draws no marker, so the identity
         # holds there too.
         anomalies_drawn=len(anomalies),
-        yscale="linear",
-        y_limits=(0.0, float(max(raw_values)) * Y_HEADROOM_FACTOR),
+        yscale=LOG_YSCALE if log_scale else LINEAR_YSCALE,
+        log_masked_points=masked,
+        log_note=_log_note(masked) if log_scale else None,
+        y_limits=(floor, ceiling),
         bars=(),
         note=None,
         subtitle=_subtitle(label, len(anomalies)),
@@ -683,7 +758,12 @@ def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
         # `anomalies_drawn == len(anomalies)` true for this kind as well.
         anomalies=(),
         anomalies_drawn=0,
-        yscale="linear",
+        # D-15: the flag reaches the timeseries and overlay axes only. The growth
+        # branch does not even read `yscale` - `test_growth_stays_linear_under_log_scale`
+        # asserts that structurally - so a percentage bar chart is never a log axis.
+        yscale=LINEAR_YSCALE,
+        log_masked_points=0,
+        log_note=None,
         y_limits=_growth_value_limits(bars),
         # No date axis on this chart, so there is no D-10 domain to publish.
         x_limits=None,
@@ -694,7 +774,7 @@ def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
 
 
 def _overlay_entry(
-    per_series: Sequence[ChartEntry], spec_language: str
+    per_series: Sequence[ChartEntry], spec_language: str, *, log_scale: bool = False
 ) -> ChartEntry:
     """Build the one comparison view a document publishes, last in charts[].
 
@@ -728,6 +808,13 @@ def _overlay_entry(
     # D-14 applied to the overlay as a timeseries axes - which is what it is.
     # One shared ceiling over every series, so the axis is comparable.
     largest = max(max(line.raw_values) for line in lines)
+    # D-15 on the comparison view: one shared regime, one shared disclosure, and
+    # the masked count is the union over every line - a line's non-positive days
+    # are absent from the SHARED axis, not just from its own plot, so counting
+    # them per line would under-report what this chart did not draw.
+    all_values = [value for line in lines for value in line.raw_values]
+    masked = _nonpositive_count(all_values) if log_scale else 0
+    floor = _log_lower_bound(all_values) if log_scale else 0.0
     return ChartEntry(
         kind=OVERLAY_KIND,
         series_id=None,
@@ -750,8 +837,10 @@ def _overlay_entry(
         gaps=gaps,
         anomalies=anomalies,
         anomalies_drawn=len(anomalies),
-        yscale="linear",
-        y_limits=(0.0, float(largest) * Y_HEADROOM_FACTOR),
+        yscale=LOG_YSCALE if log_scale else LINEAR_YSCALE,
+        log_masked_points=masked,
+        log_note=_log_note(masked) if log_scale else None,
+        y_limits=(floor, float(largest) * Y_HEADROOM_FACTOR),
         bars=(),
         note=OVERLAY_NOTE,
         subtitle=f"{OVERLAY_LABEL} - {OVERLAY_METHOD_PHRASE}"
@@ -766,6 +855,8 @@ def build_chart_plan(
     metrics_sha256: str,
     grouped: Mapping[str, Sequence[analyze_trends.Observation]],
     metrics_path: str,
+    *,
+    log_scale: bool = False,
 ) -> ChartDocument:
     """Decide every number that will be drawn, without importing a backend.
 
@@ -773,6 +864,10 @@ def build_chart_plan(
     `metrics.json` and never recomputed (ANAL-06 / CHRT-02). The single
     permitted derivation is the centered rolling median, and it never feeds a
     numeric label.
+
+    `log_scale` is keyword-only and defaults to False because D-15 makes the log
+    regime an explicit opt-in: a caller that does not name the flag gets the
+    linear axis, and no threshold anywhere in this module can change that.
     """
     language = _require_str(spec, "language", "spec")
     series_nodes = metrics["series"]
@@ -801,7 +896,11 @@ def build_chart_plan(
         # D-19: one PNG per (series_id, kind). The two per-series kinds are
         # emitted as siblings, adjacent, in metrics.series order - the growth
         # chart is not a separate list and never sorts away from its series.
-        charts.append(_timeseries_entry(node, observations, spec_index_by_id[series_id]))
+        charts.append(
+            _timeseries_entry(
+                node, observations, spec_index_by_id[series_id], log_scale=log_scale
+            )
+        )
         charts.append(_growth_entry(node, spec_index_by_id[series_id]))
     # D-01/D-19: the comparison view is a *separate* chart, appended last. It
     # never replaces or suppresses the per-series charts, because a per-series
@@ -809,7 +908,9 @@ def build_chart_plan(
     # *timeseries* entries only: a growth entry carries no daily series, so
     # including it would contribute an empty line to the shared axis.
     charts.append(
-        _overlay_entry([c for c in charts if c.kind == TIMESERIES_KIND], language)
+        _overlay_entry(
+            [c for c in charts if c.kind == TIMESERIES_KIND], language, log_scale=log_scale
+        )
     )
     return ChartDocument(
         contract_version=CHARTS_CONTRACT_VERSION,
@@ -931,7 +1032,12 @@ def _draw_gap_bands(
         )
 
 
-def _draw_anomaly_marks(ax: Any, anomalies: Sequence[Mapping[str, Any]], labelled: bool) -> None:
+def _draw_anomaly_marks(
+    ax: Any,
+    anomalies: Sequence[Mapping[str, Any]],
+    labelled: bool,
+    masked_anchor: float | None = None,
+) -> None:
     """D-08: one vertical segment per anomaly, between the contract's own numbers.
 
     The segment's two ends are `anomaly["median"]` and `anomaly["value"]` - read
@@ -942,10 +1048,40 @@ def _draw_anomaly_marks(ax: Any, anomalies: Sequence[Mapping[str, Any]], labelle
     `labelled` is True for the first marker on a chart and False for every one
     after it, so a chart with three anomalies names them once in the legend
     rather than three times. `anomalies: []` draws nothing and claims nothing.
+
+    `masked_anchor` is not None only on a log entry, and carries that entry's own
+    axis floor. It is what D-11 and D-15 collide on: a `views=0` day is data the
+    detector legitimately reports as an anomaly, and a logarithmic axis has no
+    place to put it. Drawing the segment anyway is worse than omitting it - the
+    axes clip it at the floor, and the resulting stub is indistinguishable from a
+    genuine reading that landed exactly on the floor. So a masked endpoint is
+    drawn as a downward caret AT the highest drawable endpoint instead, which
+    says "this day is below the visible range", and the log note says how many
+    days that is. The same anomaly colour and the same legend row are reused, so
+    a masked marker is still recognisably an anomaly marker and
+    `anomalies_drawn == len(anomalies)` keeps holding for every kind.
     """
     for index, anomaly in enumerate(anomalies):
         when = date.fromisoformat(anomaly["date"])
         label = ANOMALY_LEGEND_LABEL if (labelled and index == 0) else NO_LEGEND_LABEL
+        if masked_anchor is not None and (
+            anomaly["value"] <= 0 or anomaly["median"] <= 0
+        ):
+            # The highest endpoint the axis can actually show. With one masked
+            # endpoint this is the median, and with two it is the floor itself -
+            # either way it is a position the reader can see, carrying a marker
+            # whose direction states the real value is below it.
+            anchor = max(float(anomaly["median"]), float(masked_anchor))
+            ax.plot(
+                when,
+                anchor,
+                marker=ANOMALY_MASKED_MARKER,
+                ms=ANOMALY_MARKER_SIZE,
+                color=ANOMALY_COLOR,
+                zorder=ANOMALY_ZORDER,
+                label=label,
+            )
+            continue
         ax.vlines(
             when,
             anomaly["median"],
@@ -971,13 +1107,61 @@ def _draw_anomaly_marks(ax: Any, anomalies: Sequence[Mapping[str, Any]], labelle
             )
 
 
+def _apply_log_regime(ax: Any, entry: ChartEntry) -> None:
+    """D-15: put the entry's own scale regime on the axes, explicitly.
+
+    Two properties are load-bearing and neither is left to a default:
+
+    1. The regime comes from `entry.yscale`, so the only thing that can select
+       it is the `--log-scale` flag. No ratio, threshold or data-dependent test
+       reaches this function - that is what keeps RESEARCH Pitfall 3's automatic
+       switch, which deleted zero days without telling anyone, unreachable.
+    2. `nonpositive="mask"` is written out. matplotlib's default happens to be
+       `mask` today; a future `clip` would drop the same days in silence, and
+       nothing else in the suite could see the difference.
+    """
+    if entry.yscale != LOG_YSCALE:
+        return
+    ax.set_yscale("log", nonpositive="mask")
+
+
+def _draw_log_disclosure(ax: Any, entry: ChartEntry) -> None:
+    """Draw D-15's counted disclosure into the image, not only into the manifest.
+
+    A PNG that hid masked days without saying so is precisely the silent
+    distortion this phase exists to prevent, and a PNG travels: it can be
+    separated from its report and quoted on its own. The text sits at the
+    top-RIGHT in axes fractions because the top-left is already occupied - by
+    the legend on the timeseries and by the scales-differ note on the overlay -
+    and 05-04/05-05 both shipped clipped annotations from a bad anchor.
+    `test_log_disclosure_text_stays_inside_the_canvas` measures the result
+    against the figure, so the anchor is verified rather than trusted.
+    """
+    if not entry.log_note:
+        return
+    ax.annotate(
+        entry.log_note,
+        xy=(1.0, 1.0),
+        xycoords="axes fraction",
+        xytext=(-4, -8),
+        textcoords="offset points",
+        ha="right",
+        va="top",
+        fontsize=LOG_TEXT_FONT_SIZE,
+        color=LOG_TEXT_COLOR,
+    )
+
+
 def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     """Draw one series: a thin raw daily line under a bold 7-day median line.
 
     D-07 keeps the raw line visible so an anomaly marker lands on a line the
     reader can see. D-14's zero floor is a timeseries rule and is applied here,
-    off the entry's own limits.
+    off the entry's own limits - and D-15's log regime replaces that floor with
+    the smallest positive reading, which is the only honest floor a
+    logarithmic axis can have.
     """
+    _apply_log_regime(ax, entry)
     x_values, raw_values = _plotted_coordinates(
         entry.points, entry.raw_values, entry.gaps, mdates
     )
@@ -991,10 +1175,16 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     _draw_gap_bands(ax, entry.gaps, mdates, entry.x_limits or (
         entry.points[0].date, entry.points[-1].date
     ))
-    _draw_anomaly_marks(ax, entry.anomalies, labelled=True)
+    _draw_anomaly_marks(
+        ax,
+        entry.anomalies,
+        labelled=True,
+        masked_anchor=entry.y_limits[0] if entry.yscale == LOG_YSCALE else None,
+    )
     # D-14: an explicit zero floor, timeseries axes only. A growth chart must
     # never receive this call - it would erase a negative bar (RESEARCH
-    # Pitfall 1).
+    # Pitfall 1). On a log entry the plan's floor is the smallest positive
+    # reading rather than 0.0, because a logarithmic axis has no place for zero.
     ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
     # D-10: the axis spans the full calendar range the series reports, so the
     # scale itself has no hole; the absence is expressed as a break in the line
@@ -1005,18 +1195,23 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     ax.xaxis_date()
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    _draw_log_disclosure(ax, entry)
     ax.legend(loc="upper left", frameon=False, fontsize=8)
 
 
 def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     """Draw every series on one shared raw y-axis, plus the scales-differ note.
 
-    D-20 forbids a log or normalized scale here: that would invent a per-series
-    index with no source in metrics.json. The x-axis spans the union of the
-    lines' own reported calendar ranges (D-10) - bounds read off the plan, never
-    invented by matplotlib - and the y-axis is a zero-anchored timeseries axis
-    (D-14).
+    D-20 forbids a *normalized or rebased* axis here: that would invent a
+    per-series index with no source in metrics.json. It does not forbid D-15's
+    explicitly-labelled log regime, which rescales nothing - it only changes how
+    the reader's eye is spaced along the ONE shared axis, and it comes with the
+    counted disclosure below. The x-axis spans the union of the lines' own
+    reported calendar ranges (D-10) - bounds read off the plan, never invented
+    by matplotlib - and the y-axis is a zero-anchored timeseries axis (D-14),
+    or the smallest positive reading on a log entry.
     """
+    _apply_log_regime(ax, entry)
     for index, line in enumerate(entry.series_lines):
         x_values, raw_values = _plotted_coordinates(
             line.points, line.raw_values, line.gaps, mdates
@@ -1035,8 +1230,11 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     # Each line draws its own markers, so an anomaly stays attached to the series
     # it belongs to; the legend names them once for the whole chart.
     drew_any = False
+    masked_anchor = entry.y_limits[0] if entry.yscale == LOG_YSCALE else None
     for line in entry.series_lines:
-        _draw_anomaly_marks(ax, line.anomalies, labelled=not drew_any)
+        _draw_anomaly_marks(
+            ax, line.anomalies, labelled=not drew_any, masked_anchor=masked_anchor
+        )
         drew_any = drew_any or bool(line.anomalies)
     ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
     # D-10: the union of the lines' reported ranges, so the scale has no hole
@@ -1061,6 +1259,7 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
             fontsize=8,
             color="#495057",
         )
+    _draw_log_disclosure(ax, entry)
     ax.legend(loc="upper left", bbox_to_anchor=(0.0, 0.92), frameon=False, fontsize=8)
 
 
@@ -1240,12 +1439,19 @@ def _entry_payload(entry: ChartEntry) -> dict[str, object]:
         "language": entry.language,
         "filename": entry.filename,
         "yscale": entry.yscale,
+        # D-15: always emitted, 0 on a linear entry, so a consumer reads the
+        # masked count off the same field in both regimes rather than inferring
+        # it from a missing key. `log_note` follows the omission rule instead -
+        # there is nothing to say on a linear chart, so the key is absent.
+        "log_masked_points": entry.log_masked_points,
         "y_limits": [entry.y_limits[0], entry.y_limits[1]],
         "points": _plotted_point_count(entry),
         "gaps": [_gap_payload(gap) for gap in entry.gaps],
         "anomalies_drawn": entry.anomalies_drawn,
         "subtitle": entry.subtitle,
     }
+    if entry.log_note is not None:
+        payload["log_note"] = entry.log_note
     if entry.series_id is not None:
         payload["series_id"] = entry.series_id
     # Same omission rule as `series_id`: written only by the kinds that own it.
@@ -1280,6 +1486,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--spec", required=True, help="path to spec.json")
     parser.add_argument("--out", default="out", help="output directory (default: out)")
     parser.add_argument(
+        "--log-scale",
+        action="store_true",
+        help=(
+            "opt-in labelled log y-axis for the timeseries and comparison-view charts only; "
+            "growth bars stay linear, and non-positive days are masked and counted on the "
+            "chart and in charts.json"
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="logging-only debug diagnostics; adds no manifest field and changes no behavior",
@@ -1298,7 +1513,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
         metrics, metrics_sha256 = load_metrics(metrics_path)
-        document = build_chart_plan(spec, metrics, metrics_sha256, grouped, str(metrics_path))
+        document = build_chart_plan(
+            spec, metrics, metrics_sha256, grouped, str(metrics_path), log_scale=args.log_scale
+        )
         try:
             for entry in document.charts:
                 render_chart(entry, out_dir)
