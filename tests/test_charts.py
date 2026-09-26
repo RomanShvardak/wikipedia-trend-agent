@@ -1172,12 +1172,67 @@ def test_negative_growth_bar_stays_within_y_limits(tmp_out: Path) -> None:
     assert len(blob) > 1024, "the growth chart must not be empty or truncated"
 
 
-def test_growth_axes_never_receive_a_zero_floor() -> None:
-    """The growth branch names no axis-limit call at all - the prohibition as a call.
+def test_growth_y_limits_are_the_bounds_the_figure_used(tmp_out: Path) -> None:
+    """CR-01: charts.json's `y_limits` are the bounds the figure was drawn with.
 
-    Scoped to the GROWTH_KIND branch of `render_chart` (and the draw helper it
-    delegates to) rather than counted module-wide, so a legitimate
-    `set_ylim` on the timeseries or overlay path cannot misfire this guard.
+    CONTRACTS.md 7.2 defines the field as "the display bounds the renderer used",
+    and 7.3 rests on the manifest being a serialization of the same plan, so the
+    manifest cannot disagree with the picture. `test_negative_growth_bar_stays_
+    within_y_limits` binds only plan -> manifest; nothing bound plan -> axes, which
+    is how a `growth` chart came to publish bounds no renderer ever applied while
+    matplotlib autoscaled to bounds of its own. This closes all three links on the
+    shape that matters - a -22.0% decline, RESEARCH Pitfall 1's own number.
+    """
+    _write_growth_pair_with_pct(tmp_out, TRACER_SERIES_ID, "y1", -22.0, -4860)
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 0
+
+    document = _plan(tmp_out, FIXTURES_DIR / "spec.example.json")
+    entry = _growth_entry_of(document, TRACER_SERIES_ID)
+    manifest = json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
+    published = _published_growth_of(manifest, TRACER_SERIES_ID)
+
+    # Link 1, plan -> manifest (already asserted elsewhere, restated so this
+    # test cannot pass on a chain that was never connected).
+    assert published["y_limits"] == [entry.y_limits[0], entry.y_limits[1]]
+
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # Link 2, plan -> axes: read the figure's own limits back and require them to
+    # be the published pair, exactly, on the value axis (x, on the horizontal form).
+    fig, ax = plt.subplots(figsize=make_charts.FIGURESIZE, dpi=make_charts.DPI)
+    try:
+        make_charts._draw_growth(entry, ax)
+        drawn = [float(bound) for bound in ax.get_xlim()]
+    finally:
+        plt.close(fig)
+    assert drawn == [entry.y_limits[0], entry.y_limits[1]], (
+        "CONTRACTS.md 7.2 defines y_limits as the display bounds the renderer used; "
+        f"the figure used {drawn}, the manifest publishes "
+        f"{[entry.y_limits[0], entry.y_limits[1]]}"
+    )
+    # And naming the bounds must not have cost the decline: the bar is inside the
+    # axis the renderer set, so Pitfall 1 is still closed with the call in place.
+    assert drawn[0] <= -22.0 <= drawn[1], f"the -22.0% bar falls outside the drawn axis {drawn}"
+
+
+def test_growth_axes_never_receive_a_zero_floor() -> None:
+    """The growth value axis is set from `entry.y_limits` and from nothing else.
+
+    Scoped to the GROWTH_KIND branch of `render_chart` (and every private helper
+    it delegates to, to any depth) rather than counted module-wide, so a
+    legitimate `set_ylim` on the timeseries or overlay path cannot misfire this
+    guard.
+
+    The prohibition is not "no axis call" - it is "no axis call that could put a
+    zero floor under a negative bar, and no axis call that lets the figure drift
+    away from the bounds the manifest publishes". `set_ylim`, `set_xscale` and
+    `set_yscale` are therefore forbidden outright, and `set_xlim` is permitted
+    ONLY when both of its bounds are read off `entry.y_limits`; a literal
+    `set_xlim(0, None)` fails exactly as before.
     """
     tree = ast.parse(_module_source())
     render_functions = [
@@ -1186,7 +1241,11 @@ def test_growth_axes_never_receive_a_zero_floor() -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "render_chart"
     ]
     assert len(render_functions) == 1, "render_chart must be a single function"
-    forbidden = {"set_xlim", "set_ylim", "set_xscale"}
+    forbidden = {"set_ylim", "set_xscale", "set_yscale"}
+    # The one bounds call the growth value axis may make, named exactly. Anything
+    # else - a literal, a computed pad, `entry.y_limits[0]` alone - is a bound
+    # the manifest never published.
+    permitted = {"entry.y_limits[0]", "entry.y_limits[1]"}
 
     # The branch is located by the *identifier* `GROWTH_KIND`, so resolve that
     # identifier to its value in the module and require it to be the real kind
@@ -1240,18 +1299,31 @@ def test_growth_axes_never_receive_a_zero_floor() -> None:
             assert len(helpers) == 1, "the growth render path must be its own function"
             drawn_bodies.extend(helpers[0].body)
 
-    offending = [
-        f"{node.func.attr}() at line {node.lineno}"
-        for root in drawn_bodies
-        for node in ast.walk(root)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in forbidden
-    ]
+    offending: list[str] = []
+    xlim_calls: list[ast.Call] = []
+    for root in drawn_bodies:
+        for node in ast.walk(root):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            attr = node.func.attr
+            if attr in forbidden:
+                offending.append(f"{attr}() at line {node.lineno}")
+            elif attr == "set_xlim":
+                xlim_calls.append(node)
     assert not offending, (
-        "the growth branch must name no axis-limit or scale call - a zero floor "
-        f"here erases a negative bar: {offending}"
+        "the growth branch may name no scale call and no y-axis limit - a zero "
+        f"floor here erases a negative bar: {offending}"
     )
+    for call in xlim_calls:
+        sources = {
+            ast.unparse(argument)
+            for argument in (*call.args, *(keyword.value for keyword in call.keywords))
+        }
+        assert sources == permitted, (
+            "the growth value axis may only be set from entry.y_limits, so "
+            "charts.json publishes the bounds the figure used (CONTRACTS.md 7.2); "
+            f"found set_xlim({', '.join(sorted(sources))}) at line {call.lineno}"
+        )
 
     # The positive half: a zero floor on the *timeseries* path is D-14, and this
     # guard must not mistake it for a violation.

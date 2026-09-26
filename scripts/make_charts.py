@@ -1505,15 +1505,21 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
     `set_height` (the vertical-form call). The percentage is therefore the *x*
     (value) axis and the window is the y (category) axis.
 
-    The single most important property of this body is what it does NOT call:
-    there is no `set_xlim`, no `set_ylim` and no `set_xscale` here, so the value
-    axis can never receive a zero floor. On this horizontal form the footgun is
-    `set_xlim(left=0)`, which RESEARCH Pitfall 1 measured deleting a -22.0%
-    decline from the picture entirely. The bounds come from the plan's
-    `entry.y_limits`, which already contains 0.0 and any negative bar, and the
-    zero reference is drawn explicitly below so a decline reads as a decline.
+    The single most important property of this body is WHICH bounds it sets. The
+    value axis is named - from the plan, never from a literal - and nothing else
+    about it is touched: no category-axis limit, no logarithmic regime, and no
+    `set_xlim` that does not read `entry.y_limits`. On this horizontal form the
+    footgun is `set_xlim(left=0)`, which RESEARCH Pitfall 1 measured deleting a
+    -22.0% decline from the picture entirely, and matplotlib's autoscale is the
+    other half of the same failure in a quieter form: it draws bounds no manifest
+    ever published, so CONTRACTS.md 7.2 ("the display bounds the renderer used")
+    would be false on every run. Naming the plan's own bounds fixes both - 0.0 and
+    every plotted bar are inside `entry.y_limits` by construction
+    (`_growth_value_limits`), so a decline can never be clipped - and the zero
+    reference is drawn explicitly below so a decline reads as a decline.
     `test_growth_axes_never_receive_a_zero_floor` walks this branch by AST to
-    keep it that way.
+    keep it that way, and `test_growth_y_limits_are_the_bounds_the_figure_used`
+    binds the published number to the axes the figure actually got.
     """
     # D-16: the n/a marker and the volume unit are the chart's own words. They
     # are display text on a bar label, so they are localized like every other
@@ -1583,6 +1589,13 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
     # The zero reference, drawn explicitly: without it a small negative bar next
     # to a large positive one is easy to read as "no change".
     ax.axvline(0, color="#212529", lw=0.8)
+    # The published y_limits ARE the bounds this chart is drawn with, so
+    # charts.json describes the picture (CONTRACTS.md 7.2). The range always
+    # contains 0.0 and every plotted bar - _growth_value_limits guarantees it -
+    # so naming this call cannot clip a decline (RESEARCH Pitfall 1). Spelled out
+    # as two subscripts, the same form the timeseries and overlay axes use, so the
+    # AST guard can require these bounds by name.
+    ax.set_xlim(entry.y_limits[0], entry.y_limits[1])
 
 
 def render_chart(entry: ChartEntry, out_dir: Path) -> Path:
