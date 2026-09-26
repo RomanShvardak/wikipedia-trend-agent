@@ -95,6 +95,14 @@ def main(
                     file=sys.stderr,
                 )
                 return 2
+            if isinstance(exc.code, str) and exc.code.strip():
+                # A SystemExit carrying a MESSAGE is the stage handing the
+                # model an action ("set WTI_USER_AGENT to ..."). Python would
+                # have printed it had the exception reached the top level;
+                # catching it here would silently drop the only actionable
+                # line, which is the same defect as swallowing the fetch
+                # stage's 403 diagnostic.
+                print(exc.code, file=sys.stderr)
             print(f"run_all: stage {stage_name} failed: exited {exit_code}", file=sys.stderr)
             return exit_code
         if code != 0:

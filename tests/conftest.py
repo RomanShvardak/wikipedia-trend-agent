@@ -73,6 +73,12 @@ def tmp_out(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def asset_spec_path() -> Path:
+    """Path to the shipped example spec in `assets/` — the RUN-03 deliverable."""
+    return Path(__file__).resolve().parents[1] / "assets" / "example.intermittent-fasting.json"
+
+
+@pytest.fixture
 def live_spec_path() -> Path:
     """Path to the committed live-article spec fixture (probe-verified pl.wikipedia/Warszawa + en.wikipedia/Albert_Einstein)."""
     return FIXTURES_DIR / "spec.live.example.json"
