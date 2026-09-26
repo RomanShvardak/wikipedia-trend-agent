@@ -23,9 +23,18 @@ from __future__ import annotations
 import ast
 import json
 import re
+import sys
 from pathlib import Path
 
+# `tools/` is on the path HERE, locally, and not by relying on `test_eval.py`
+# having inserted it: pytest collects modules alphabetically, and a test module
+# that silently depends on another module's import side effect breaks the moment
+# one of them is deselected or renamed. Same two-line shape as the `scripts/`
+# shim in conftest.py, and for the same reason.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+
 import build_report
+import clean_clone_check
 import make_charts
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -310,3 +319,158 @@ def test_the_repository_is_not_published_by_this_plan() -> None:
     assert lines == ["matplotlib>=3.11"], (
         f"the runtime dependency budget changed: {lines}"
     )
+
+
+def test_the_readme_does_not_promise_a_network_free_install() -> None:
+    """The README must not claim the install half of the rehearsal is automated.
+
+    The split between the two rehearsal halves is a scope decision, and a README
+    that implied `pytest` performs a real install would be making a claim the
+    suite does not keep.
+    """
+    readme = _read(README)
+    assert "clean_clone_check.py --full" in readme, (
+        "the README does not document the owner-side rehearsal command"
+    )
+    tree = ast.parse(_read(SKILL_DIR / "tools" / "clean_clone_check.py"))
+    docstring = ast.get_docstring(tree) or ""
+    assert "pip install" in docstring, "the rehearsal tool does not document its install step"
+    assert "pytest" in docstring
+
+# Every file a clone must carry, as relative POSIX paths. Asserted as a
+# SUPERSET, not an equality, so adding a legitimately-needed file later does not
+# force an edit here.
+EXPECTED_CLONE_FILES = (
+    "SKILL.md",
+    "README.md",
+    "LICENSE",
+    ".gitignore",
+    "requirements.txt",
+    "pyproject.toml",
+    "scripts/common.py",
+    "scripts/fetch_pageviews.py",
+    "scripts/analyze_trends.py",
+    "scripts/make_charts.py",
+    "scripts/build_report.py",
+    "scripts/resolve_articles.py",
+    "scripts/run_all.py",
+    "tools/validate_answer.py",
+    "tools/clean_clone_check.py",
+    "references/CONTRACTS.md",
+    "references/INTERPRETATION.md",
+    "references/API_ACCESS.md",
+    "references/DATA_CAVEATS.md",
+    "assets/example.intermittent-fasting.json",
+    "assets/wikipedia-projects.json",
+)
+
+
+def _copy_clone(dest: Path) -> tuple[int, str]:
+    """Run the rehearsal in its default, no-network mode; return its output."""
+    code = clean_clone_check.main(["--check-only", "--dest", str(dest)])
+    assert code == 0, "the clean-clone copy mode failed"
+    return code, ""
+
+
+def test_the_clean_clone_file_set_excludes_every_generated_path(tmp_path: Path) -> None:
+    """The copy carries no generated path, and the SOURCE is left byte-identical.
+
+    The `CHANGED` half is the one that is usually assumed rather than proven: a
+    copy helper that resolved a path against the wrong root would happily
+    "succeed" while having moved the repository's own files around. So the
+    source file count and the `.gitignore` bytes are compared before and after.
+    """
+    def source_state() -> tuple[int, bytes]:
+        return (
+            sum(1 for path in SKILL_DIR.rglob("*") if path.is_file()),
+            (SKILL_DIR / ".gitignore").read_bytes(),
+        )
+
+    before = source_state()
+    _copy_clone(tmp_path / "clone")
+    assert source_state() == before, "the copy mutated the source tree"
+
+    copied = {
+        path.relative_to(tmp_path / "clone").as_posix()
+        for path in (tmp_path / "clone").rglob("*")
+        if path.is_file()
+    }
+    assert copied, "the copy is empty, so this proves nothing"
+    offenders = sorted(
+        relative
+        for relative in copied
+        if any(part in clean_clone_check.FORBIDDEN_SEGMENTS for part in Path(relative).parts)
+        or Path(relative).name.endswith(clean_clone_check.FORBIDDEN_SUFFIXES)
+    )
+    assert not offenders, f"the copy carries generated paths: {offenders}"
+
+
+def test_the_cloned_tree_carries_every_file_a_clone_needs(tmp_path: Path) -> None:
+    """Nothing a stranger needs is lost by the copy, and the naming rule survives it.
+
+    The `name` == directory-name assertion is the agentskills.io rule tested
+    AFTER a copy, which is where it would actually bite: a clone that renamed
+    the directory on the way through would load as nothing.
+    """
+    clone = tmp_path / "wikipedia-trend-agent"
+    _copy_clone(clone)
+
+    copied = {
+        path.relative_to(clone).as_posix() for path in clone.rglob("*") if path.is_file()
+    }
+    missing = sorted(set(EXPECTED_CLONE_FILES) - copied)
+    assert not missing, f"the clone is missing: {missing}"
+
+    for stage in ("scripts", "tests"):
+        for path in sorted((SKILL_DIR / stage).glob("*.py")):
+            relative = f"{stage}/{path.name}"
+            assert relative in copied, f"the clone is missing {relative}"
+    for path in sorted((SKILL_DIR / "tests" / "fixtures").rglob("*")):
+        if path.is_file():
+            relative = path.relative_to(SKILL_DIR).as_posix()
+            assert relative in copied, f"the clone is missing the fixture {relative}"
+
+    name_line = next(
+        line for line in (clone / "SKILL.md").read_text(encoding="utf-8").splitlines() if line.startswith("name:")
+    )
+    assert name_line.split(":", 1)[1].strip() == clone.name
+
+
+def test_the_rehearsal_full_mode_is_documented_not_run() -> None:
+    """The expensive half exists, is documented, and is deliberately not a unit test.
+
+    This is the honest encoding of the scope decision. A real `pip install`
+    inside a test is minutes of network and would break QA-01. A future phase
+    may add a nightly job that runs `--full`; this suite will not, and this
+    test is what makes that a stated decision rather than an oversight.
+    """
+    import inspect
+
+    docstring = clean_clone_check.__doc__ or ""
+    assert "pip install" in docstring, "the rehearsal tool does not document its install step"
+    assert "pytest" in docstring
+
+    source = Path(str(inspect.getfile(clean_clone_check))).read_text(encoding="utf-8")
+    assert '"--full"' in source, "the --full mode is not defined at all"
+
+    # AST, not a string search: the question is whether any test ACTUALLY passes
+    # --full to main(), and a substring search over this file would match its own
+    # assertion. Every call to the rehearsal tool in this module is found and
+    # its argument list inspected.
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    calls: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "main"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "clean_clone_check"
+        ):
+            calls.append(ast.dump(node))
+    assert calls, "no rehearsal call found, so this check proves nothing"
+    for dumped in calls:
+        assert "--full" not in dumped, (
+            "a test in test_publish.py passes --full to the rehearsal tool; the install "
+            "half is the owner's command and must never run inside the suite"
+        )
