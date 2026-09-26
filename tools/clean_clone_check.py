@@ -165,9 +165,23 @@ def run_full(dest: Path, file_count: int, patterns: Sequence[str]) -> int:
     python = _venv_python(dest)
     print(f"step 1/4 install: {python} -m pip install -r requirements.txt")
     try:
-        subprocess.run([sys.executable, "-m", "venv", str(dest / ".venv-rehearsal")], check=True)
-        subprocess.run([str(python), "-m", "pip", "install", "-r", "requirements.txt"], check=True)
-        subprocess.run([str(python), "-m", "pip", "install", "pytest"], check=True)
+        # `cwd=dest` on EVERY call, not just the ones with absolute paths.
+        # `-r requirements.txt` is relative, so without it pip resolves against
+        # whatever directory the owner happened to invoke the tool from - which
+        # on a first run is the repository, so the rehearsal would install the
+        # SOURCE tree's requirements and report a failure that is really a
+        # working-directory bug. Found by running this, not by reading it.
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(dest / ".venv-rehearsal")],
+            cwd=dest,
+            check=True,
+        )
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "-r", "requirements.txt"],
+            cwd=dest,
+            check=True,
+        )
+        subprocess.run([str(python), "-m", "pip", "install", "pytest"], cwd=dest, check=True)
         verdict.append(("install", True, str(python)))
     except (subprocess.CalledProcessError, OSError) as error:
         verdict.append(("install", False, str(error)))
