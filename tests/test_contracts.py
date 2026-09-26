@@ -644,3 +644,72 @@ def test_anomalies_metrics_fixture_matches_the_frozen_key_set(metrics) -> None:
         "the y1 window's raw and clean percentages must differ, which is the whole "
         "reason the never-recompute rule is testable on this fixture"
     )
+
+
+# The frozen report.v1 top-level surface: exactly these ten, no more.
+# Ratified by plan 06-01's Task 1 checkpoint:decision (D-18's successor), and
+# bound to the real emitter by the field-drift test 06-03 adds beside the
+# charts.v1 one - an undocumented field is drift Phase 7 would build on.
+REPORT_V1_TOP_LEVEL = frozenset(
+    {
+        "contract_version",
+        "spec_name",
+        "as_of",
+        "language",
+        "generated_from",
+        "metrics_sha256",
+        "charts_sha256",
+        "report_filename",
+        "metrics_shown",
+        "formats",
+    }
+)
+
+
+def test_report_v1_contract_section_is_complete() -> None:
+    """CONTRACTS.md section 8 exists and states the whole frozen report.v1 surface.
+
+    A deletion of section 8, or a rewrite that drops any one of these markers,
+    fails here. The `## Versioning` block this plan is discharging is
+    deliberately NOT re-asserted: it is the rule, not the contract.
+    """
+    text = CONTRACTS_DOC.read_text(encoding="utf-8")
+
+    for marker in (
+        # the section and its version
+        "## 8.",
+        "report.v1",
+        "report.md",
+        "report.manifest.json",
+        "contract_version",
+        "report_filename",
+        "metrics_shown",
+        "formats",
+        "charts_sha256",
+        "metrics_sha256",
+        "generated_from",
+        # the digests are integrity, never authentication
+        "integrity and staleness mechanism",
+        "without comparing timestamps",
+        "not a security control",
+        # the never-recompute rule
+        "clean.pct",
+        "avg_daily_views",
+        "not-computable",
+        # the six sections, in the frozen order
+        "Висновок",
+        "Метрики",
+        "Наскільки можна довіряти",
+        "Графіки",
+        "Обмеження та припущення",
+        "Наступний крок",
+        # the 2N+1 image inventory
+        "2N+1",
+        # atomicity, exit table, CLI, fixtures
+        "caller-serialized",
+        "last completed atomic replace wins",
+        "python scripts/build_report.py",
+        "--verbose",
+        "No test may reach the network",
+    ):
+        assert marker in text, f"report.v1 contract must document {marker!r}"

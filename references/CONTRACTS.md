@@ -1,10 +1,10 @@
-# Contracts — spec.json, metrics.json, resolved.v1 & charts.v1 (frozen, v0.1)
+# Contracts — spec.json, metrics.json, resolved.v1, charts.v1 & report.v1 (frozen, v0.1)
 
 This file is the single source of truth for the frozen I/O contracts of the
 `wikipedia-trend-agent` skill (ANAL-06). Every pipeline stage emits into and
 reads from exactly the fields documented here — nothing more, nothing less.
-Four contracts are frozen here: `spec.json` (§1), `metrics.json` (§2),
-`resolved.v1` (§6) and `charts.v1` (§7).
+Five contracts are frozen here: `spec.json` (§1), `metrics.json` (§2),
+`resolved.v1` (§6), `charts.v1` (§7) and `report.v1` (§8).
 
 The contract language is English; Ukrainian strings appear only as example
 values where a field carries human-readable text.
@@ -572,5 +572,232 @@ and changes no behavior.
 - `tests/fixtures/series.gaps.example.csv` — a per-series internal hole, which
   makes the `no data` band testable without the `out/series.csv` sort-boundary
   artifact.
+
+No test may reach the network; every transport is injected or forbidden.
+
+## 8. `report.md` & `report.manifest.json` — `report.v1` (report stage, Phase 6)
+
+`report.md` and `report.manifest.json` are a **separate stage contract**, and
+the report stage is a **reader**. It reads `metrics.json`, `charts.json` and
+`spec.json` and **never recomputes** a value (ANAL-06) — the rule `charts.v1`
+§7.3 froze for the chart stage, and §7.3's own sentence closes the loop: *a
+consumer inherits this rule*. It changes no frozen `§1`–`§7` field, and it opens
+`series.csv` at no point: every number the document displays was already
+published by an earlier stage, so there is nothing here for it to derive.
+
+### 8.1 Top-level fields
+
+| Field | Type | Description |
+|---|---|---|
+| `contract_version` | `"report.v1"` | Exact version; anything else is rejected. |
+| `spec_name` | string | The `name` of the spec the report was written for, copied verbatim from `metrics.json`'s own `spec_name`. |
+| `as_of` | string | `YYYY-MM-DD` — copied verbatim from `metrics.json`. |
+| `language` | string | The validated spec's `language` (the DOCUMENT language, not one series' language). |
+| `generated_from` | string | Path of the `metrics.json` this stage read. |
+| `metrics_sha256` | 64-char lowercase hex | SHA-256 of the **exact `metrics.json` bytes the stage read**. |
+| `charts_sha256` | 64-char lowercase hex | SHA-256 of the **exact `charts.json` bytes the stage read**. |
+| `report_filename` | string | The bare relative name `report.md` — no directory component, so §8.5's join needs no path work. |
+| `metrics_shown` | ordered array of strings | The metric paths the document rendered, grammar `series[i].field` and `series[i].growth.<window>.clean.pct` (§8.6). |
+| `formats` | ordered array of objects | One `{format, filename}` object per published rendering. v1 writes exactly `[{"format": "markdown", "filename": "report.md"}]`. |
+
+`formats` is an array of **objects**, not of bare strings, and that is the whole
+point of the shape: a v1.x PDF entry is one appended object and one more file,
+never a rename of the Markdown slot. `report_filename` is the bare relative name
+for the same reason — a consumer resolves it against the directory it was given.
+
+`metrics_sha256` and `charts_sha256` are an **integrity and staleness
+mechanism, not a security control**. A consumer compares them against the
+digests of the files it holds to decide whether the manifest still describes
+that content — which is how staleness is detected **without comparing
+timestamps**, since an mtime carries no information about *which* content was
+rendered. Nothing is authenticated by them, and no later phase may build access
+control on them. Both digests come from the **same one-pass read** that
+validated each document: a second read could read different bytes than the one
+that was validated, and the digest would then attest to content the report never
+saw.
+
+**Recorded deviation from ROADMAP SC#4's wording.** That criterion reads
+"when `metrics.json` is newer than the report". This contract detects staleness
+by **digest comparison, never by mtime**, and the reason is that an mtime
+comparison yields a false negative whenever a file is copied, checked out, or
+restored with new timestamps and identical content — the report would then be
+declared stale while describing exactly the right bytes. The rationale is
+§7.1's own, applied to the sibling manifest: an mtime carries no information
+about which content was rendered.
+
+### 8.2 The fixed section order
+
+The document carries exactly six sections, in this order and no other:
+
+| # | Heading (`uk`) | What it carries |
+|---|---|---|
+| 1 | `Висновок` | The per-series conclusion, each with its own window, percentage and volume base. |
+| 2 | `Метрики` | The metrics table, carrying `as_of` and the growth windows. |
+| 3 | `Наскільки можна довіряти` | The confidence level plus its reasons. |
+| 4 | `Графіки` | The `2N+1` image inventory (§8.5). |
+| 5 | `Обмеження та припущення` | The assumptions, notes and counts that bound the reading. |
+| 6 | `Наступний крок` | A fixed non-numeric localized token. |
+
+The order is **machine-checkable**: a test asserts each heading's index in the
+rendered document and requires them strictly increasing, not merely present. A
+set comparison would pass on a document whose sections were in the wrong order,
+which is the failure this clause exists to make impossible.
+
+The four headings `Висновок`, `Наскільки можна довіряти`,
+`Обмеження та припущення` and `Наступний крок` are the **exact strings** the
+roadmap's first success criterion names, character for character. The
+criterion describes two further sections without naming them; `Метрики` and
+`Графіки` are **this document's own naming** for those two. A developer who
+wants different wording changes the success criterion, not this table alone.
+
+### 8.3 The report's own words
+
+Two tables carry every word the document writes, and both are **fail-closed**:
+
+- `REPORT_TOKENS` — the section headings, table headers, labels and footer
+  phrases, keyed language → phrase. A language with **no table**, and a table
+  **missing one of `REQUIRED_REPORT_TOKENS`**, are the same defect: both are
+  refused with one model-readable line naming the language, and nothing is
+  written.
+- `REASON_TOKENS` — every `confidence_reasons` entry and every
+  `seasonality.note`, keyed language → the **verbatim English constant** from
+  `analyze_trends.py` → localized phrase. An unmapped reason is refused the same
+  way. The keys are imported **by reference**, so a constant renamed upstream
+  fails this completeness check instead of silently falling back to English.
+
+**English is never a fallback.** A Ukrainian report with one English heading is a
+bilingual artefact the reader did not ask for, and no test of the arithmetic
+would catch it — the numbers would all be right. This is the same argument
+`charts.v1` §7.4 carries for chart text, and the same refusal.
+
+Mapping an English reason string to a localized phrase is **not** a number
+derivation, and therefore does not breach §7.3's never-recompute rule: no value
+is recomputed, only a word is chosen.
+
+**The accepted-language intersection is named here, because it is not the union.**
+A supported report language is one `REPORT_TOKENS` covers **and**
+`make_charts.chart_tokens` accepts. The two sets are not equal in v1: the chart
+stage accepts `ja`, and this table does not. A `ja` spec therefore produces a
+valid `charts.json` — with a disclosed tofu-box font gap — and is then **refused
+at the report stage with exit 1 and nothing written**. That is the correct
+answer, and this paragraph is the named **Phase 7 constraint**: `run_all.py` must
+**not** treat a successful chart stage as a report-stage precondition, because
+the two stages do not accept the same language set in v1.
+
+### 8.4 Numbers, null growth, and the volume base
+
+Every displayed number is read **verbatim** from `metrics[...]` or
+`charts[...]`. **Formatting is permitted; deriving is not.** A grouping
+separator, a sign, a percent suffix and a fixed number of decimals are display
+choices over a value already read. A second mean, a re-estimated anomaly, a
+re-derived percentage and a re-ranked series are all derivations, and all are
+forbidden here for the reason §7.3 gives: the value the manifest already carries
+must never be derived a second time downstream.
+
+- A `clean.pct` is displayed and the raw `pct` **never** is, for exactly the
+  reason the growth chart plots only the clean variant: the raw value contains
+  the spike the clean variant removed, and printing both makes the excluded
+  anomaly look like part of the finding.
+- A `null` window renders as the localized **not-computable** token followed by
+  that window's own `reason` — **never `0`, never `0.0`, never an em-dash, never
+  an empty cell**. A `0` would read as "no growth" (ANAL-06), and an em-dash
+  would read as an absence the report never diagnosed. When the clean percentage
+  is the one being reported, the `reason` read is the one **inside `clean`**.
+- Every dynamic conclusion states **its window, its percentage, and the series'
+  own `avg_daily_views` as the stated volume base**. A percentage without its
+  base is not interpretable: `+5.7%` on 2 363 views/day and on 13 views/day are
+  different facts, and the report must not let a reader assume otherwise.
+- Percentages and counts are formatted with PEP 378's `,` and `+.1f` specs,
+  which are **not locale-aware** — deliberately. The digits a reader sees are
+  the digits the contract froze, in every language, and the module must
+  therefore **never import `locale`**.
+
+### 8.5 Images and the `2N+1` inventory
+
+The image section lists exactly `2N+1` entries — the whole of `charts.json`, in
+`charts.json`'s **published order**, with the overlay **last** (§7.2.0) — and
+re-sorts nothing. A consumer joins each `filename` onto the directory it was
+given. §7.2.1 already guarantees a bare relative name with no separator, no
+`..` and no drive letter, so this stage adds **no second path-safety check**;
+inventing a weaker one here would be a defect, not a defence.
+
+At N=1 the inventory is **3**, not 2: the overlay is published unconditionally
+(§7.2.0), so a one-series report that dropped it would carry a silent hole in
+its own inventory. The report therefore never filters, deduplicates or
+re-orders the list — it renders what the chart stage published.
+
+**Documented v1 gap:** v1 ships no HTML renderer, so raw HTML inside a
+spec-authored `label` is inert inside a plain-text Markdown file. It would be
+**live** in an HTML renderer. The gap is stated here rather than closed with a
+sanitizer, which would strip characters a legitimate label may legitimately
+contain and would have to be maintained against a renderer this version does
+not ship.
+
+### 8.6 `metrics_shown` and the fidelity rule
+
+`metrics_shown` is the **ordered** list of metric paths the document rendered,
+in the frozen grammar `series[i].field` and
+`series[i].growth.<window>.clean.pct`. It exists because the requirement that
+"every number from `metrics.json` appears in the Markdown" **cannot be
+satisfied literally**: `anomalies[]` can carry hundreds of per-day entries, and a
+one-page report that printed them would not be one page. The report prints the
+**count** and points at the chart that carries the detail.
+
+Publishing the pointer list turns "every required number is present" from a
+review habit into a **set comparison**. The reverse direction — that no number in
+the Markdown lacks a source in `metrics.json` — is a separate property and is
+tested by scanning the rendered text for numerals and matching each against the
+documents.
+
+### 8.7 Exit codes, atomicity, and publication
+
+| Situation | Manifest | Exit |
+|---|---|---|
+| all sections rendered | `report.v1` published | 0 |
+| invalid spec | nothing written | 2 |
+| missing/invalid `metrics.json`, `charts.json` or `spec.json`, a required display field absent, non-finite value, unsupported language, publication failure | prior bytes preserved, no staging file | 1 |
+
+**There is no `3` (partial) case**, for §7.5's reason: a report half-written is
+the same defect as a half-populated `charts.json`. A reader who finds four
+sections and a manifest naming six has been told something false about the
+other two, and has no way to tell which. So a document that cannot be completed
+fails the whole stage: `report.md` lands only after **every** section has been
+assembled.
+
+**Publication order:** `report.md` is written first and `report.manifest.json`
+only after it is in place, so a manifest never names a report that is not there.
+
+**Atomicity:** a same-directory staging file plus one `os.replace`, exactly as
+`common.dump_json` does it. A publication failure leaves the prior bytes
+untouched and no `report.md.*.tmp` behind.
+
+**Concurrency assumption:** atomic replacement prevents partial files and
+requests are serial within one process, but two independent processes targeting
+the same `--out` are not serialized by the report stage. They are
+**caller-serialized**: the caller must serialize them. Without that caller
+serialization, the **last completed atomic replace wins**.
+
+### 8.8 `report.v1` CLI contract
+
+```bash
+python scripts/build_report.py --spec out/spec.json --out out
+```
+
+Flags: `--spec` (required); `--out` (default `out`); and logging-only
+`--verbose`, which adds no manifest field and changes no behavior. These three
+flags are the **whole** surface, because every extra flag is a contract Phase 7's
+`run_all.py` must learn to pass.
+
+### 8.9 Report fixtures
+
+- `tests/fixtures/metrics.example.json` — the golden two-series metrics mirror.
+- `tests/fixtures/metrics.anomalies.example.json` — the spike-injected pair, so
+  a non-empty `anomalies[]` is renderable.
+- `tests/fixtures/spec.example.json` — the executable frozen spec, whose
+  `language` is the document language the token tables are resolved against.
+- The `charts.json` the test produces by running the **real** chart stage into
+  a temporary output directory, rather than a committed hand-written manifest: a
+  hand-written sibling manifest could drift from the emitter and the report
+  would pass against a document the chart stage never writes.
 
 No test may reach the network; every transport is injected or forbidden.
