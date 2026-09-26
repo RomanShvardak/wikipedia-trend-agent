@@ -509,7 +509,8 @@ class ChartEntry:
     y_limits: tuple[float, float]
     # D-10: the date-axis domain, read from the series' own metrics `period`
     # block, on the two kinds that have a date axis. `None` on the growth chart,
-    # whose x axis is a percentage axis - and never serialized either way.
+    # whose x axis is a percentage axis. Published in the manifest when it
+    # exists (05-07's ratification added it to the frozen charts.v1 surface).
     x_limits: tuple[date, date] | None
     bars: tuple[GrowthBar, ...]
     note: str | None
@@ -951,7 +952,8 @@ def _growth_entry(
         log_masked_points=0,
         log_note=None,
         y_limits=_growth_value_limits(bars),
-        # No date axis on this chart, so there is no D-10 domain to publish.
+        # No date axis on this chart, so there is no D-10 domain to publish -
+        # and the omission is by the `x_limits is not None` guard, not by kind.
         x_limits=None,
         bars=bars,
         note=None,
@@ -1690,6 +1692,15 @@ def _entry_payload(entry: ChartEntry) -> dict[str, object]:
     }
     if entry.log_note is not None:
         payload["log_note"] = entry.log_note
+    # D-10 domain bounds, published under the same omission rule as `note`: the
+    # guard is `x_limits is not None`, NOT a kind test. The growth chart has no
+    # date axis, so it has no domain, and the value test is what says so - a
+    # future fourth kind with a date axis would be published automatically. The
+    # 05-07 ratification gate added this key: it is already computed and already
+    # test-enforced on the plan object, and a number the code owns must not be
+    # derived a second time by Phase 6.
+    if entry.x_limits is not None:
+        payload["x_limits"] = [entry.x_limits[0].isoformat(), entry.x_limits[1].isoformat()]
     if entry.series_id is not None:
         payload["series_id"] = entry.series_id
     # Same omission rule as `series_id`: written only by the kinds that own it.

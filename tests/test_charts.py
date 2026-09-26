@@ -1758,6 +1758,49 @@ def test_gaps_are_per_series_and_rendered(tmp_path: Path) -> None:
     assert overlay.x_limits == pl.x_limits
 
 
+def test_x_limits_is_published_on_every_chart_that_has_a_date_axis(tmp_out: Path) -> None:
+    """05-07's ratified amendment: the D-10 domain reaches charts.json.
+
+    The value was already computed and already test-enforced on the plan object
+    (the D-10 assertions above); publishing it is what stops Phase 6 from
+    deriving the same number a second time from `period`. The guard is
+    `x_limits is not None`, NOT a kind test, so this asserts the observed
+    invariant (the two dated kinds carry it, the growth chart does not) without
+    promising the code a kind check it does not make.
+    """
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+
+    published = {entry["filename"]: entry for entry in manifest["charts"]}
+    dated = 0
+    for entry in document.charts:
+        item = published[entry.filename]
+        if entry.x_limits is None:
+            # The growth chart's x axis is a percentage axis: no domain exists,
+            # so the key is ABSENT - never a null the no-null rule forbids.
+            assert "x_limits" not in item, (
+                f"{entry.kind} has no date axis, so charts.json must omit x_limits "
+                f"entirely, not null it (05-02's no-null rule)"
+            )
+            continue
+        dated += 1
+        assert item["x_limits"] == [
+            entry.x_limits[0].isoformat(),
+            entry.x_limits[1].isoformat(),
+        ], (
+            f"{entry.filename}: charts.json must publish the plan object's own x_limits "
+            "verbatim, so no consumer re-derives the domain from period"
+        )
+        # Published as ISO dates a consumer can parse without a matplotlib import.
+        assert date.fromisoformat(item["x_limits"][0]) <= date.fromisoformat(
+            item["x_limits"][1]
+        )
+    assert dated == 3, (
+        f"the two dated kinds over two series must publish 3 domains, got {dated} - "
+        "a vacuous pass here would let the key silently vanish from every entry"
+    )
+
+
 def test_multi_series_csv_produces_no_spurious_band(tmp_out: Path) -> None:
     """The Pitfall 4 regression: a gapless two-series CSV yields zero gap records.
 
