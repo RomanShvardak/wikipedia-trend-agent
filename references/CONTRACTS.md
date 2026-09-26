@@ -779,7 +779,7 @@ documents.
 |---|---|---|
 | all sections rendered | `report.v1` published | 0 |
 | invalid spec | nothing written | 2 |
-| missing/invalid `metrics.json`, `charts.json` or `spec.json`, a required display field absent, non-finite value, unsupported language, publication failure | prior bytes preserved, no staging file | 1 |
+| missing/invalid `metrics.json`, `charts.json` or `spec.json`, a required display field absent, non-finite value, unsupported language, publication failure, or a `charts.json` per-entry field `render_report` reads that is missing, of the wrong type, or a numeric count carried as a string | prior bytes preserved, no staging file | 1 |
 
 **There is no `3` (partial) case**, for §7.5's reason: a report half-written is
 the same defect as a half-populated `charts.json`. A reader who finds four
@@ -787,6 +787,17 @@ sections and a manifest naming six has been told something false about the
 other two, and has no way to tell which. So a document that cannot be completed
 fails the whole stage: `report.md` lands only after **every** section has been
 assembled.
+
+**The stage's own guard is `load_charts`**: every per-entry field this stage
+reads is shape-checked in the same one-pass read that took the digest, so a
+malformed `charts.json` is a `report failed:` line naming the offending
+`where.key` and never a traceback. A count that arrives as a JSON **string** is
+refused rather than coerced — `int("3")` is a number no source document
+published, and the anti-invention check cannot see it because the string carries
+a numeral the documents also carry. Every refusal is a `ReportError` raised
+inside the one `try` this table already describes; the handler names the
+condition the contract names and is not a blanket catch, so a genuine bug still
+surfaces as one rather than as a tidy message.
 
 **Publication order:** `report.md` is written first and `report.manifest.json`
 only after it is in place, so a manifest never names a report that is not there.

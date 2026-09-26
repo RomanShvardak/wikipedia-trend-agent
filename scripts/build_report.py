@@ -477,6 +477,29 @@ def _require_number(container: Mapping[str, Any], key: str, where: str) -> int |
     return value
 
 
+def _require_gaps(entry: Mapping[str, Any], where: str) -> None:
+    """`charts.v1 §7.2`'s `gaps` list, and every member of it, shape-checked.
+
+    Four names per member, because `make_charts._gap_payload` emits exactly four
+    and §7.2 documents exactly four: `series_id` makes the absence attributable,
+    `start` and `end` bound it, and `days` is the inclusive count a reader would
+    count by hand. An absence with a nulled `days` is an absence with no length,
+    so it is refused rather than read as zero — and the per-member `where` is
+    `charts.charts[i].gaps[j]`, so the refusal names the offending MEMBER rather
+    than the list it sits in.
+    """
+    gaps = entry.get("gaps")
+    if not isinstance(gaps, list):
+        raise ReportError(f"{where}.gaps must be a list")
+    for index, gap in enumerate(gaps):
+        member = f"{where}.gaps[{index}]"
+        if not isinstance(gap, dict):
+            raise ReportError(f"{member} must be an object")
+        for key in ("series_id", "start", "end"):
+            _require_str(gap, key, member)
+        _require_number(gap, "days", member)
+
+
 def load_charts(path: str | Path) -> tuple[dict[str, object], str]:
     """Read, shape-check, and hash the local charts.json in a single pass.
 
@@ -490,6 +513,14 @@ def load_charts(path: str | Path) -> tuple[dict[str, object], str]:
     does NOT re-check them against `metrics.json`: a consumer reads the sibling
     manifest, and a second opinion about a frozen document is a second chance to
     disagree with it.
+
+    Every per-entry field `render_report` reads is shape-checked HERE, in the same
+    one-pass read that took the digest — the one place the stage is already reading
+    every byte of the document. Validating only `filename` while the renderer went
+    on to read six fields is what CR-02 was: `int("3")` turned a JSON string into
+    a published number, and a `gaps` of `"abc"` or of `[1, 2]` reached a
+    `TypeError` instead of a refusal. Shape-checking at the read means the
+    renderer downstream needs no `.get` defaults and no coercions at all.
     """
     charts_path = Path(path)
     try:
@@ -518,6 +549,19 @@ def load_charts(path: str | Path) -> tuple[dict[str, object], str]:
         if not isinstance(entry, dict):
             raise ReportError(f"{where} must be an object")
         _require_str(entry, "filename", where)
+        # The rest of what `render_report` reads. `label`, `anomalies_drawn` and
+        # `log_masked_points` are in charts.v1 §7.2.2's ALWAYS-EMITTED partition,
+        # so they are unconditionally present on a conforming document and each
+        # one is a number this stage displays. `note` is in the "owned by a kind
+        # or a mode" partition under the emitter guard `note is not None`, so
+        # absence is CORRECT and only a wrong type is a defect — requiring it
+        # would refuse every non-overlay entry, i.e. every conforming document.
+        _require_str(entry, "label", where)
+        _require_number(entry, "anomalies_drawn", where)
+        _require_number(entry, "log_masked_points", where)
+        _require_gaps(entry, where)
+        if "note" in entry:
+            _require_str(entry, "note", where)
     return document, hashlib.sha256(raw).hexdigest()
 
 
@@ -762,14 +806,16 @@ def render_report(
     lines.append(f"## {tokens['charts']}")
     lines.append("")
     for entry in chart_entries:
-        alt = f"{tokens['chart_image_alt']}: {md_cell(entry.get('label', ''))}".strip()
+        alt = f"{tokens['chart_image_alt']}: {md_cell(entry['label'])}".strip()
         lines.append(f"![{alt}]({entry['filename']})")
         # The overlay's own disclosure, quoted VERBATIM from the sibling
         # manifest rather than written out again here. charts.v1 §7.2.4 is the
         # reason the two strings differ in general: the manifest note is a stable
         # ASCII interface string, and a second hand-written copy of it is a
-        # second sentence that can drift from the first.
-        if entry.get("note"):
+        # second sentence that can drift from the first. Membership, not
+        # truthiness — a note that is present must be a string, and `load_charts`
+        # has already said so.
+        if "note" in entry:
             lines.append("")
             lines.append(str(entry["note"]))
     lines.append("")
@@ -788,21 +834,34 @@ def render_report(
     # that quietly dropped them without saying so is precisely the silent
     # distortion charts.v1 §7.4 exists to prevent.
     for entry in chart_entries:
-        gaps = entry.get("gaps") or []
-        gap_days = sum(int(gap.get("days", 0)) for gap in gaps)
+        gaps = entry["gaps"]
+        # WINDOWS #22, and this is NOT an endorsement of the line below: whether a
+        # total the chart manifest does not publish may be DERIVED here at all is an
+        # open §8.4 contract question this plan is forbidden to answer. What IS
+        # removed is the `int()` coercion and the `.get` default around it, so the
+        # derivation now reads a number the manifest published and nothing else.
+        # The derivation itself stays visible and unchanged, and the ledger entry
+        # stays open. Do NOT add a `gaps_days` key to the manifest.
+        gap_days = sum(gap["days"] for gap in gaps)
         # The `filename` is load-bearing, not decoration: a series' `timeseries`
         # and `growth` entries share one `label`, so a disclosure keyed on the
         # label alone printed the SAME line twice and a reader could not tell
         # which of the two charts it described. `filename` is unique across the
         # whole 2N+1 inventory and §7.2.1 already guarantees it is a safe bare
         # name, so it is both the disambiguator and the join key.
+        #
+        # Both counts go through `format_number`, the module's ONE number-to-string
+        # seam, and never through `int()`. A `str` can therefore never become a
+        # number here, and these are the same two values the anti-invention check
+        # is pointed at.
         lines.append(
-            f"- {md_cell(entry.get('label', ''))} "
+            f"- {md_cell(entry['label'])} "
             f"[{md_cell(entry['filename'])}] — "
-            f"{tokens['disclosure_gaps']}: {gap_days}; "
-            f"{tokens['disclosure_anomalies_drawn']}: {int(entry.get('anomalies_drawn', 0))}; "
+            f"{tokens['disclosure_gaps']}: {format_number(gap_days)}; "
+            f"{tokens['disclosure_anomalies_drawn']}: "
+            f"{format_number(entry['anomalies_drawn'])}; "
             f"{tokens['disclosure_log_masked_points']}: "
-            f"{int(entry.get('log_masked_points', 0))}"
+            f"{format_number(entry['log_masked_points'])}"
         )
     lines.append("")
 

@@ -1911,6 +1911,117 @@ def _unmapped_confidence_reason(out_dir: Path) -> None:
     _patch_json(out_dir.joinpath("metrics.json"), mutate)
 
 
+# --- 06-04 Task 2: the six `charts.json` per-entry fields `render_report` reads --
+#
+# `load_charts` validated ONE field per entry (`filename`) while `render_report`
+# read six, so a malformed count, a malformed `gaps` list and a malformed `note`
+# all reached the page. CR-02's exit-0 variant — `anomalies_drawn: "3"` coerced
+# by `int()` and published as the number 3, which no source document carried —
+# was invisible precisely because no test fed this stage such an input. Every
+# helper below mutates a REAL chart-stage run in a tmp dir, never a fixture.
+def _charts_gap_member(document: dict[str, Any]) -> dict[str, Any]:
+    """A gap member shaped exactly as `make_charts._gap_payload` emits it.
+
+    The chart stage's output for a `timeseries` entry with no absent days is
+    `gaps: []`, so the two `gaps` rows must BUILD a member before they can break
+    one — and the member's parts are read out of the entry the stage itself
+    published (`series_id`, and a date from its own `x_limits`) rather than
+    invented, so a row cannot accidentally test a shape the emitter never writes.
+    """
+    entry = document["charts"][0]
+    existing = entry.get("gaps")
+    assert isinstance(existing, list), (
+        f"the chart stage no longer publishes gaps: [] on a timeseries entry, got "
+        f"{existing!r}"
+    )
+    series_id = entry.get("series_id")
+    assert isinstance(series_id, str) and series_id, (
+        f"the first chart entry carries no series_id, so the gap member would have "
+        f"to be invented: {entry!r}"
+    )
+    domain = entry.get("x_limits")
+    assert isinstance(domain, list) and len(domain) == 2, (
+        f"the first chart entry published no date domain to take a real date from: "
+        f"{entry!r}"
+    )
+    start, end = domain
+    assert isinstance(start, str) and isinstance(end, str)
+    return {"series_id": series_id, "start": start, "end": end, "days": 1}
+
+
+def _charts_gap_days_null(out_dir: Path) -> None:
+    """A gap whose inclusive day count is null — an absence with no length."""
+
+    def mutate(document):
+        member = _charts_gap_member(document)
+        member["days"] = None
+        document["charts"][0]["gaps"] = [member]
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
+def _charts_gaps_not_objects(out_dir: Path) -> None:
+    """A `gaps` list whose members are not objects at all."""
+
+    def mutate(document):
+        document["charts"][0]["gaps"] = [1, 2]
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
+def _charts_gaps_not_a_list(out_dir: Path) -> None:
+    """A `gaps` field carrying a string, where a list is required."""
+
+    def mutate(document):
+        document["charts"][0]["gaps"] = "abc"
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
+def _charts_anomalies_drawn_not_a_number(out_dir: Path) -> None:
+    """An `anomalies_drawn` count that is a word."""
+
+    def mutate(document):
+        document["charts"][0]["anomalies_drawn"] = "many"
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
+def _charts_log_masked_points_null(out_dir: Path) -> None:
+    """A `log_masked_points` count that is null rather than 0."""
+
+    def mutate(document):
+        document["charts"][0]["log_masked_points"] = None
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
+def _charts_anomalies_drawn_a_string_number(out_dir: Path) -> None:
+    """CR-02's exit-0 variant: the JSON string `"3"` for a numeric count.
+
+    This is the row 06-VERIFICATION.md recorded as publishing the number 3 on the
+    page — a number no source document carried — while exiting 0. It is listed
+    separately from `..._not_a_number` on purpose: `"many"` is refused by any
+    reasonable check, whereas `"3"` is a numeral, so a check that only asked
+    "is this a number-looking thing" would let it through, and so would the
+    anti-invention sweep (the string carries a numeral the documents also carry).
+    """
+
+    def mutate(document):
+        document["charts"][0]["anomalies_drawn"] = "3"
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
+def _charts_note_not_a_string(out_dir: Path) -> None:
+    """A present `note` of the wrong type. Absence stays correct, not a defect."""
+
+    def mutate(document):
+        document["charts"][0]["note"] = 7
+
+    _patch_json(out_dir.joinpath("charts.json"), mutate)
+
+
 # One entry per row of the matrix. `id` is the row's own name so a failure reads
 # as a row name rather than as an index.
 FAIL_CLOSED_ROWS = (
@@ -1927,6 +2038,14 @@ FAIL_CLOSED_ROWS = (
     pytest.param(_wrong_charts_version, id="charts-wrong-contract-version"),
     pytest.param(_empty_charts, id="charts-empty"),
     pytest.param(_unmapped_confidence_reason, id="metrics-unmapped-confidence-reason"),
+    pytest.param(_charts_gap_days_null, id="charts-gap-days-null"),
+    pytest.param(_charts_gaps_not_objects, id="charts-gaps-not-objects"),
+    pytest.param(_charts_gaps_not_a_list, id="charts-gaps-not-a-list"),
+    pytest.param(_charts_anomalies_drawn_not_a_number, id="charts-anomalies-drawn-not-a-number"),
+    pytest.param(_charts_log_masked_points_null, id="charts-log-masked-points-null"),
+    pytest.param(
+        _charts_anomalies_drawn_a_string_number, id="charts-anomalies-drawn-a-string-number"
+    ),
 )
 
 
@@ -1961,6 +2080,87 @@ def test_fail_closed_matrix_rows_refuse_with_exit_one_and_write_nothing(
         f"row {mutate.__name__!r}: expected exactly one 'report failed:' line, got "
         f"{len(failures)}: {captured.err!r}"
     )
+    assert not out_dir.joinpath(build_report.REPORT_FILENAME).exists(), (
+        f"row {mutate.__name__!r}: report.md was written on a failed run"
+    )
+    assert not out_dir.joinpath(build_report.REPORT_MANIFEST_FILENAME).exists(), (
+        f"row {mutate.__name__!r}: report.manifest.json was written on a failed run"
+    )
+    assert _fixture_bytes() == before, "a matrix row mutated a committed fixture"
+
+
+# The six `charts.json` per-entry corruptions CR-02 named, each paired with the
+# exact `where.key` its refusal must name. This matrix exists BESIDE
+# `FAIL_CLOSED_ROWS` and is not redundant with it: that one proves the three
+# halves of §8.7's exit-1 row (code, one line, nothing written) but asserts
+# nothing about WHICH field the line names or about how the run failed. Those are
+# the two halves CR-02 actually turned on, because every one of the verifier's
+# five reproductions reached a `TypeError`, `AttributeError` or `ValueError`
+# instead of a refusal.
+#
+# The seventh row (a non-string `note`) is here and NOT in `FAIL_CLOSED_ROWS`, so
+# that tuple's count stays at exactly the gap's six. `note` is in charts.v1
+# §7.2.2's "owned by a kind or a mode" partition, so its ABSENCE is correct on
+# every conforming document and only a wrong type is a defect — which is why it
+# is a seventh case rather than a thirteenth required field.
+CHART_ENTRY_FAIL_CLOSED_ROWS = (
+    pytest.param(_charts_gap_days_null, "charts.charts[0].gaps[0].days"),
+    pytest.param(_charts_gaps_not_objects, "charts.charts[0].gaps[0]"),
+    pytest.param(_charts_gaps_not_a_list, "charts.charts[0].gaps"),
+    pytest.param(
+        _charts_anomalies_drawn_not_a_number, "charts.charts[0].anomalies_drawn"
+    ),
+    pytest.param(_charts_log_masked_points_null, "charts.charts[0].log_masked_points"),
+    pytest.param(
+        _charts_anomalies_drawn_a_string_number, "charts.charts[0].anomalies_drawn"
+    ),
+    pytest.param(_charts_note_not_a_string, "charts.charts[0].note"),
+)
+
+
+@pytest.mark.parametrize("mutate,expected_key", CHART_ENTRY_FAIL_CLOSED_ROWS)
+def test_chart_entry_shape_violations_fail_closed_without_a_traceback(
+    tmp_path: Path, capsys, mutate, expected_key
+) -> None:
+    """Every `charts.json` field this stage reads is a refusal, never a crash.
+
+    Five halves, and the last three are the ones CR-02 turned on. `main`'s
+    existing `except (ReportError, ChartError, AnalysisError)` is the whole
+    mechanism — this plan adds no `except` clause and no bare `except Exception`,
+    because §8.7 promises one model-readable line FOR THE CONDITION THE CONTRACT
+    NAMES, not a blanket catch that would also swallow a genuine bug as a tidy
+    message. These rows are what prove the existing handler is sufficient, rather
+    than a reading of the code that says so.
+
+    Naming the three exception types explicitly is what makes this a check on the
+    fix rather than on the exit code: before the shape checks, these inputs died
+    with exactly `TypeError`, `AttributeError` and `ValueError`, and an exit code
+    of 0 or 1 alone would not have told the two states apart.
+    """
+    before = _fixture_bytes()
+    out_dir = _prepared_report_dir(tmp_path, f"out.chartshape.{expected_key.rsplit('.', 1)[-1]}")
+    mutate(out_dir)
+
+    assert _run_report(out_dir) == 1, (
+        f"row {mutate.__name__!r}: a malformed {expected_key!r} must be exit 1"
+    )
+
+    err = capsys.readouterr().err
+    failures = [line for line in err.splitlines() if line.startswith("report failed:")]
+    assert len(failures) == 1, (
+        f"row {mutate.__name__!r}: expected exactly one 'report failed:' line, got "
+        f"{len(failures)}: {err!r}"
+    )
+    assert expected_key in failures[0], (
+        f"row {mutate.__name__!r}: the refusal must name {expected_key!r}; it said "
+        f"{failures[0]!r}"
+    )
+    assert "Traceback" not in err, f"a refusal must not print a traceback: {err!r}"
+    for exception in ("TypeError", "AttributeError", "ValueError"):
+        assert exception not in err, (
+            f"row {mutate.__name__!r}: stderr carries {exception!r}, so the input "
+            f"reached an uncaught coercion rather than a refusal: {err!r}"
+        )
     assert not out_dir.joinpath(build_report.REPORT_FILENAME).exists(), (
         f"row {mutate.__name__!r}: report.md was written on a failed run"
     )
