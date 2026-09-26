@@ -20,17 +20,32 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
+from collections.abc import Mapping, Sequence
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import analyze_trends
 import build_report
+import common
 import make_charts
+from test_contracts import _iter_values
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+# The committed document that reaches `confidence: "low"`, added by plan 06-02
+# Task 1. Both committed metrics fixtures score `high` on every series, so
+# without this one RPT-02's hypothesis framing is unreachable from committed
+# data and would ship tested only by an in-test edit. It pins a DOCUMENT STATE,
+# not a regeneration from any CSV: no `series.csv` reaches `low`, and this repo
+# treats an unreproducible committed fixture as a defect only when it is claimed
+# to be derived - which this one, by design, is not.
+LOW_CONFIDENCE_EXAMPLE = FIXTURES_DIR / "metrics.low-confidence.example.json"
 
 # The fixtures this stage reads or copies. Their bytes are compared before and
 # after every test, because a stage that rewrites its own golden input is a
@@ -146,6 +161,28 @@ def _copy_chart_inputs(out_dir: Path) -> None:
         out_dir.joinpath(target).write_bytes((FIXTURES_DIR / source).read_bytes())
 
 
+def _write_metrics(out_dir: Path, document: Mapping[str, Any] | str | bytes) -> Path:
+    """Write `document` as `metrics.json` inside `out_dir`, and return the path.
+
+    Bytes (or an already-serialized string) are written VERBATIM, which is what
+    lets a test hand the report stage a committed fixture's own bytes rather
+    than a re-serialization of the parsed document - a round-trip through
+    `json.dumps` would silently normalize nothing today but is one more
+    transformation between a committed fixture and the bytes a stage reads. A
+    mapping is serialized for the derived documents Tasks 2 and 3 build.
+
+    Always a file under `tmp_path`: no committed fixture is ever a write target.
+    """
+    path = out_dir / "metrics.json"
+    if isinstance(document, bytes):
+        path.write_bytes(document)
+    elif isinstance(document, str):
+        path.write_text(document, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 def _render_charts(tmp_out: Path) -> dict[str, Any]:
     """Run the REAL chart stage and return its parsed `charts.json`."""
     _copy_chart_inputs(tmp_out)
@@ -183,6 +220,22 @@ def _section_order(text: str, language: str) -> list[int]:
         text.index(tokens[key])
         for key in build_report.SECTION_TOKEN_KEYS
     ]
+
+
+def _trust_line(text: str, label: str) -> str | None:
+    """The one rendered «Наскільки можна довіряти» bullet for `label`, or None.
+
+    Keyed on the label followed by a colon, which is the renderer's own shape
+    for a trust bullet (`- {label}: {level} — {reasons}`), so the assertion is
+    about that one line rather than about the whole document. `md_cell` may have
+    escaped the label, so the caller passes the label already in its rendered
+    form; a label the renderer altered is a separate edge (the GFM-escaping
+    test), not this one.
+    """
+    prefix = f"- {label}:"
+    matches = [line for line in text.splitlines() if line.startswith(prefix)]
+    assert len(matches) <= 1, f"{len(matches)} trust lines for {label!r}: {matches!r}"
+    return matches[0] if matches else None
 
 
 def _one_series_spec(tmp_path: Path, *, assumptions: list[str] | None) -> tuple[Path, Path]:
@@ -450,5 +503,193 @@ def test_single_series_and_assumption_free_spec_render_every_section(tmp_path: P
     assert assumption_token not in text_empty, (
         "an empty assumptions list must render no assumption line"
     )
+
+    assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
+def _low_confidence_series(document: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Every series in `document` whose confidence is exactly `low`."""
+    return [node for node in document["series"] if node["confidence"] == "low"]
+
+
+def test_low_confidence_metrics_fixture_matches_the_frozen_key_set() -> None:
+    """The low-confidence document is the golden document, structurally.
+
+    Every key set is compared KEY-FOR-KEY against `metrics.example.json` rather
+    than against a count literal, so this tracks the frozen `metrics.v1` shape
+    instead of a number this plan would have to keep re-deriving - the same
+    comparison `test_contracts.py` makes for the spike-injected pair, and for
+    the same reason: a fixture that quietly grew or lost a field would leave
+    every other fixture test in the repo agreeing with a document no production
+    code writes.
+
+    The stronger claim is also pinned here, and it is the one that matters: the
+    fixture's `confidence_reasons` is re-derived through
+    `analyze_trends.score_confidence` from the fixture's OWN period, volume,
+    anomaly share and clean-y1 availability. A hand-written reason list is a
+    list no production code could have produced - the very fiction this test
+    exists to refuse.
+    """
+    before = _fixture_bytes()
+    assert LOW_CONFIDENCE_EXAMPLE.is_file(), (
+        f"the low-confidence metrics fixture must be committed at "
+        f"{LOW_CONFIDENCE_EXAMPLE.name} so RPT-02's hypothesis framing is "
+        f"reachable from committed data rather than only from an in-test edit"
+    )
+    snapshot = {**before, LOW_CONFIDENCE_EXAMPLE.name: LOW_CONFIDENCE_EXAMPLE.read_bytes()}
+
+    golden = json.loads((FIXTURES_DIR / "metrics.example.json").read_text(encoding="utf-8"))
+    low = json.loads(LOW_CONFIDENCE_EXAMPLE.read_text(encoding="utf-8"))
+
+    # Case 1 - the top-level key set, as a SET. No count literal anywhere here.
+    assert set(low) == set(golden), (
+        f"the low-confidence fixture's top-level keys must equal the golden's, "
+        f"differing on {sorted(set(low) ^ set(golden))}"
+    )
+
+    # Case 2 - the same series ids in the same order. CONTRACTS.md §3: ids mirror
+    # spec.series[] and a consumer must never see them reordered.
+    assert [node["series_id"] for node in low["series"]] == [
+        node["series_id"] for node in golden["series"]
+    ], "the low-confidence fixture must keep the golden's series ids in the golden's order"
+
+    for candidate, source in zip(low["series"], golden["series"]):
+        assert set(candidate) == set(source), (
+            f"{source['series_id']}: the low-confidence fixture's per-series key "
+            f"set must equal the golden's, differing on "
+            f"{sorted(set(candidate) ^ set(source))}"
+        )
+
+    # Case 3 - at least one series reaches `low`, and the reason list is the one
+    # score_confidence emits for that state, with the hypothesis reason LAST.
+    low_nodes = _low_confidence_series(low)
+    assert low_nodes, (
+        "the fixture exists to reach confidence: 'low'; no series in it does, so "
+        "the hypothesis framing is still untestable from committed data"
+    )
+    for node in low_nodes:
+        assert node["trend_direction"] in {"noise", "inconclusive"}, (
+            f"{node['series_id']}: ANAL-04 forbids an up/down direction on a "
+            f"low-confidence series, got {node['trend_direction']!r}"
+        )
+        clean_y1 = node["growth"]["y1"]["clean"]
+        # `monthly_30d` is re-derived exactly the way `analyze_trends.build_metrics`
+        # derives it - Fraction(total_views, period_days) * 30 - rather than from
+        # the rounded `avg_daily_views`, because the rubric is compared against the
+        # exact rational and a rounded proxy would put the fixture on the wrong side
+        # of the 1000-view boundary it is built to sit under.
+        level, reasons = analyze_trends.score_confidence(
+            node["period"]["days"],
+            Fraction(node["total_views"], node["period"]["days"]) * 30,
+            node["anomaly_share"],
+            clean_y1.get("pct") is not None,
+            None,
+        )
+        assert node["confidence"] == level, (
+            f"{node['series_id']}: the fixture says {node['confidence']!r} but "
+            f"score_confidence says {level!r} for its own period/volume/anomalies"
+        )
+        assert node["confidence_reasons"] == reasons, (
+            f"{node['series_id']}: the fixture's confidence_reasons is not the list "
+            f"score_confidence emits for this state, so no production code could "
+            f"have written it: {node['confidence_reasons']!r} != {reasons!r}"
+        )
+        assert node["confidence_reasons"][-1] == analyze_trends.LOW_CONFIDENCE_HYPOTHESIS_REASON, (
+            "a 'low' document without the hypothesis reason last is a state "
+            "score_confidence never emits"
+        )
+
+    # The fixture is worth its cost only if it also exercises the MIXED case: one
+    # series stated as a conclusion, the other as a hypothesis, in one document.
+    assert len(low_nodes) < len(low["series"]), (
+        "every series is 'low', so the contrast with a 'high'/'medium' conclusion "
+        "framing is untestable from this fixture"
+    )
+
+    # Case 4 - ANAL-06 on the new document: every null pct carries a non-empty
+    # reason at its own level AND inside `clean`, and no float is non-finite.
+    for node in low["series"]:
+        for window in analyze_trends.GROWTH_WINDOWS:
+            entry = node["growth"][window]
+            if entry.get("pct") is None:
+                reason = entry.get("reason")
+                assert isinstance(reason, str) and reason.strip(), (
+                    f"{node['series_id']}.{window}: a null pct with no reason of its "
+                    f"own is the ANAL-06 defect this repo exists to prevent"
+                )
+                clean_reason = entry["clean"].get("reason")
+                assert isinstance(clean_reason, str) and clean_reason.strip(), (
+                    f"{node['series_id']}.{window}.clean: a null clean.pct with no "
+                    f"reason is a bare 'n/a' on the page with nothing explaining it"
+                )
+    for value in _iter_values(low):
+        if isinstance(value, float):
+            assert math.isfinite(value), f"non-finite float in the fixture: {value!r}"
+
+    # Case 6 - reading a fixture must not change one.
+    assert snapshot == {
+        **{name: (FIXTURES_DIR / name).read_bytes() for name in COMMITTED_FIXTURES},
+        LOW_CONFIDENCE_EXAMPLE.name: LOW_CONFIDENCE_EXAMPLE.read_bytes(),
+    }, "reading the fixtures changed their bytes"
+
+
+def test_low_confidence_series_is_framed_as_a_hypothesis(tmp_out: Path) -> None:
+    """A `low` series is framed as a hypothesis; a `high` one is a conclusion.
+
+    Asserted on the RENDERED TEXT, never on a rendering, and against the
+    localized phrase bound to `analyze_trends.LOW_CONFIDENCE_HYPOTHESIS_REASON`
+    rather than against the English constant: a test asserting the constant
+    would pass while the report printed that constant verbatim inside a
+    Ukrainian document, which is exactly the bilingual artefact D-16 was written
+    to make impossible.
+    """
+    before = _fixture_bytes()
+    assert LOW_CONFIDENCE_EXAMPLE.is_file(), (
+        "the low-confidence metrics fixture must be committed before the "
+        "hypothesis framing can be tested from committed data"
+    )
+    low = json.loads(LOW_CONFIDENCE_EXAMPLE.read_text(encoding="utf-8"))
+    low_nodes = _low_confidence_series(low)
+    assert low_nodes, "the fixture must contain a low-confidence series"
+    concluded = [node for node in low["series"] if node["confidence"] != "low"]
+    assert concluded, "the fixture must also contain a concluded series for contrast"
+
+    # The real chart stage first, so `charts.json` is a conforming sibling
+    # manifest produced by the emitter rather than a hand-written one.
+    _copy_chart_inputs(tmp_out)
+    _write_metrics(tmp_out, LOW_CONFIDENCE_EXAMPLE.read_bytes())
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert make_charts.main(["--spec", str(spec_path), "--out", str(tmp_out)]) == 0
+
+    assert _run_report(tmp_out) == 0
+    text = tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+
+    language = str(json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))["language"])
+    hypothesis_token = build_report.report_tokens(language)["hypothesis"]
+    localized_hypothesis_reason = build_report.reason_token(
+        language, analyze_trends.LOW_CONFIDENCE_HYPOTHESIS_REASON
+    )
+
+    for node in low_nodes:
+        assert localized_hypothesis_reason in text, (
+            f"{node['series_id']}: the report must localize the hypothesis reason"
+        )
+        line = _trust_line(text, str(node["label"]))
+        assert line is not None, f"no «{node['series_id']}» trust line was rendered"
+        assert hypothesis_token in line, (
+            f"a 'low' series is stated as a conclusion: {line!r} carries no "
+            f"hypothesis token {hypothesis_token!r}"
+        )
+        assert localized_hypothesis_reason in line, (
+            f"the hypothesis framing does not name its reason on the same line: {line!r}"
+        )
+
+    for node in concluded:
+        line = _trust_line(text, str(node["label"]))
+        assert line is not None, f"no «{node['series_id']}» trust line was rendered"
+        assert hypothesis_token not in line, (
+            f"{node['series_id']} is {node['confidence']!r} and must be stated as a "
+            f"conclusion, yet its line carries the hypothesis framing: {line!r}"
+        )
 
     assert _fixture_bytes() == before, "the run mutated a committed fixture"
