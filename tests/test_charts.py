@@ -311,27 +311,60 @@ def _function_node(name: str) -> ast.FunctionDef:
     return found[0]
 
 
+def _reachable_bodies(tree: ast.Module, roots: list[ast.AST]) -> list[ast.AST]:
+    """Every statement reachable from `roots`, following private-helper calls to ANY depth.
+
+    A guard that reads one function's body stops guarding the moment the call
+    moves into a helper. That is not hypothetical: 05-06 lifted D-15's `set_yscale`
+    out of `_draw_overlay` into `_apply_log_regime`, and CR-03 measured a
+    `set_xlim(0, None)` one level below `_draw_growth` shipping with the whole
+    chart suite green while a -22.0% decline sat outside the drawn axis. So this
+    walk is a worklist with a `seen` set, not a fixed depth.
+
+    `roots` are statements, not a function, because a guard often scopes itself
+    to one *branch* of a dispatcher (`render_chart`'s growth arm) rather than to
+    a whole function. Private calls are followed by a bare `ast.Name` beginning
+    with `_`; attribute calls and non-underscore names are the module's own
+    vocabulary and are not followed, which is what keeps the walk inside this
+    package.
+    """
+    functions = {
+        node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    }
+    bodies: list[ast.AST] = list(roots)
+    queue: list[ast.AST] = list(roots)
+    seen: set[str] = set()
+    while queue:
+        root = queue.pop()
+        for node in ast.walk(root):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            name = node.func.id
+            if not name.startswith("_") or name in seen:
+                continue
+            helper = functions.get(name)
+            if helper is None:
+                continue
+            seen.add(name)
+            bodies.extend(helper.body)
+            queue.extend(helper.body)
+    return bodies
+
+
 def _scale_calls_in_render_path(function_name: str) -> list[dict[str, Any]]:
     """Every axis-scale call reachable from `function_name`, delegation followed.
 
     A guard that only reads one function's body stops guarding the moment the
     call moves into a helper - which is exactly what happened when 05-06 lifted
     D-15's `set_yscale` out of `_draw_overlay` into `_apply_log_regime`. So this
-    walk descends one level into any private helper the named function calls,
-    and reports each call's method name, its constant positional arguments and
-    its keyword arguments so an assertion can name a permitted exact call rather
-    than merely a permitted method.
+    walk follows every private helper the named function calls, to any depth, and
+    reports each call's method name, its constant positional arguments and its
+    keyword arguments so an assertion can name a permitted exact call rather than
+    merely a permitted method.
     """
     tree = ast.parse(_module_source())
     entry_point = _function_node(function_name)
-    bodies: list[Any] = list(entry_point.body)
-    for node in ast.walk(entry_point):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id.startswith("_")
-        ):
-            bodies.extend(_function_node(node.func.id).body)
+    bodies = _reachable_bodies(tree, list(entry_point.body))
     calls: list[dict[str, Any]] = []
     for root in bodies:
         for node in ast.walk(root):
@@ -1281,23 +1314,30 @@ def test_growth_axes_never_receive_a_zero_floor() -> None:
             growth_branches.extend(node.body)
     assert growth_branches, "render_chart must branch on the GROWTH_KIND entry"
 
-    # The branch delegates to a private draw helper; follow the delegation so the
-    # guard covers the code that actually issues matplotlib calls.
-    drawn_bodies: list[ast.AST] = list(growth_branches)
-    for node in growth_branches:
-        if (
-            isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "_draw_growth"
-        ):
-            helpers = [
-                item
-                for item in ast.walk(tree)
-                if isinstance(item, ast.FunctionDef) and item.name == "_draw_growth"
-            ]
-            assert len(helpers) == 1, "the growth render path must be its own function"
-            drawn_bodies.extend(helpers[0].body)
+    # The branch delegates to a private draw helper. Two things are asserted here
+    # and both were missing before CR-03: that the delegation is still resolved,
+    # and that the walk follows it to any depth. The one-level walk it replaces
+    # let a `set_xlim(0, None)` one helper down ship with all 73 chart tests green
+    # while the drawn axis was (0.0, 4.775) and a -22.0% decline was outside it.
+    followed = any(
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "_draw_growth"
+        for root in growth_branches
+        for node in ast.walk(root)
+    )
+    assert followed, (
+        "render_chart's growth branch must delegate to _draw_growth as a bare "
+        "call; if it does not, this guard is no longer covering the code it names"
+    )
+    drawn_bodies = _reachable_bodies(tree, list(growth_branches))
+    helpers = [
+        item
+        for item in ast.walk(tree)
+        if isinstance(item, ast.FunctionDef) and item.name == "_draw_growth"
+    ]
+    assert len(helpers) == 1, "the growth render path must be its own function"
 
     offending: list[str] = []
     xlim_calls: list[ast.Call] = []
@@ -1324,6 +1364,23 @@ def test_growth_axes_never_receive_a_zero_floor() -> None:
             "charts.json publishes the bounds the figure used (CONTRACTS.md 7.2); "
             f"found set_xlim({', '.join(sorted(sources))}) at line {call.lineno}"
         )
+
+    # The positive half, without which an emptied or renamed growth branch could
+    # satisfy every check above by drawing nothing at all. The timeseries side of
+    # this guard already had one; the growth side did not, and that asymmetry is
+    # exactly why mutant C survived it.
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "barh"
+        for node in ast.walk(helpers[0])
+    ), "the growth render path must still be the function that draws the bars"
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "axvline"
+        for node in ast.walk(helpers[0])
+    ), "the explicit zero reference must still be there - this guard is scoped"
 
     # The positive half: a zero floor on the *timeseries* path is D-14, and this
     # guard must not mistake it for a violation.
