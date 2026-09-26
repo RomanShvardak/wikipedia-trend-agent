@@ -1603,6 +1603,15 @@ def render_chart(entry: ChartEntry, out_dir: Path) -> Path:
     import matplotlib
 
     matplotlib.use("Agg")  # must precede pyplot: this machine defaults to tkagg
+    # Labels are spec/metrics-authored strings reaching a text engine. matplotlib
+    # parses a dollar-delimited pair in ANY Text as mathtext by default, so a
+    # dollar sign in a Wikipedia article title would silently replace the drawn
+    # title with rendered mathematics - a picture that disagrees with the label
+    # charts.json publishes - or abort the run with a raw ParseSyntaxException.
+    # Disabling the parser closes the class. This comment spells the character
+    # out because the module-source scan forbids a literal one, which is exactly
+    # that scan's blind spot: it cannot see a label, only this file.
+    matplotlib.rcParams["text.parse_math"] = False
     import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 

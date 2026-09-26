@@ -2878,6 +2878,11 @@ def test_the_render_path_writes_no_hardcoded_chart_words(tmp_path: Path) -> None
         # matplotlib keyword arguments and coordinate systems
         "upper left", "axes fraction", "offset points", "data", "left", "right",
         "top", "bottom", "center", "Agg", "log", "mask",
+        # matplotlib rcParam KEYS, never displayed: `text.parse_math` is the
+        # T-5-21 data-path control in `render_chart`, a settings key rather than
+        # a word on a chart. Listed as one exact string so the set stays closed -
+        # adding a key is a visible act, and a user-facing word still cannot.
+        "text.parse_math",
         # display constants that are not language: colours and a date format
         "#212529", "#4C6EF5", "#495057", "%Y-%m",
         # number and separator formats
@@ -3158,14 +3163,24 @@ def test_spec_problem_exits_two(tmp_path: Path) -> None:
 
 
 def test_usetex_is_never_enabled() -> None:
-    """T-5-21: no LaTeX, and no mathtext `$...$` around a user string.
+    """T-5-21 (module side): no LaTeX, and no mathtext `$...$` in the module text.
 
     A label is spec-authored text reaching a text engine. `text.usetex=True`
-    would hand it to a LaTeX shell pipeline, and a `$...$` pair in a label would
-    be interpreted as math - both are injection surfaces inside a renderer, and
-    neither raises: they produce a wrong or empty image. The module never
-    mentions `usetex` at all, which is the strongest form of the guarantee, and
-    the AST walk below pins the absence of any attribute assignment to it.
+    would hand it to a LaTeX shell pipeline - an injection surface inside a
+    renderer, and one that neither raises: it produces a wrong or empty image.
+
+    `usetex` is the half of T-5-21 that genuinely IS a module-side setting, so
+    a module-side control is the right control for it. The `$` half is NOT: the
+    `$` lives in `metrics.json`'s `label`, which this module never contains, so
+    no source scan can see it. That half is closed on the data path instead -
+    `text.parse_math = False` in `render_chart`, proved by
+    `test_a_dollar_in_a_label_never_reaches_the_math_parser`. The `$` scan below
+    is retained as a belt to those braces, not as the control.
+
+    The old third assertion here was `"rcParams" not in source`, which forbade
+    the very assignment that closes the data path. It is replaced by a check
+    aimed at `text.usetex` specifically, so the real guarantee survives the
+    re-targeting.
     """
     source = _module_source()
     assert "usetex" not in source, "the chart module must never mention text.usetex"
@@ -3192,11 +3207,133 @@ def test_usetex_is_never_enabled() -> None:
                 offending.append(f"line {node.lineno}")
     assert not offending, f"text.usetex must never be assigned: {offending}"
 
+    # Re-targeted in place of the old blanket `"rcParams" not in source`: an
+    # rcParams mutation is now REQUIRED (it is the data-path control), so what
+    # is forbidden is the one key that would re-enable a LaTeX pipeline.
+    rcparams_writes = sorted(
+        {
+            ast.literal_eval(target.slice)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Attribute)
+            and target.value.attr == "rcParams"
+            and isinstance(target.slice, ast.Constant)
+        }
+    )
+    assert rcparams_writes == ["text.parse_math"], (
+        "the render path may set exactly one rcParam - text.parse_math, the "
+        f"data-path control; found {rcparams_writes}"
+    )
+
     # And the positive half: labels really do reach the canvas through the
     # ordinary text paths, so the guarantee is about the text engine and not
     # about labels never being drawn.
     assert "set_title" in source and "ax.plot(" in source
-    assert "rcParams" not in source, "no rcParams mutation in the render path"
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Dollar $ Sign Topic", r"ratio $x$ alpha", r"bad $\frac{1$ math"],
+)
+def test_a_dollar_in_a_label_never_reaches_the_math_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """T-5-21 (data side): a spec-authored label reaches the canvas verbatim.
+
+    The `$` is in the DATA - `metrics.series[].label`, copied from
+    `spec.series[].label` - so the module-source scan above provably cannot see
+    it. The threat is real end-to-end: with the parser on, `'ratio $x$ alpha'`
+    rendered the drawn title as mathematics while `charts.json` published the
+    label byte-for-byte, and `'bad $\\frac{1$ math'` aborted the run with an
+    uncaught `ParseSyntaxException` traceback. Both are the same class: a picture
+    or a failure that disagrees with the label the manifest promises.
+
+    Each case runs the PRODUCTION CLI over a copied `metrics.json` whose only
+    edit is that one label. The assertion that matters is the last one:
+    `ax.title.get_text()` is read back off the axes production built and required
+    to equal the manifest's `subtitle`, which closes the class for every future
+    spec-authored string rather than for the three characters that happen to be
+    dangerous today.
+    """
+    out_dir = tmp_path / "dollar"
+    _copy_fixtures(out_dir, ALL_SERIES_IDS)
+    path = out_dir / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)["label"] = label
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0, (
+        f"a `$` in a label must not reach the math parser: {label!r}"
+    )
+
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    published = next(
+        item
+        for item in manifest["charts"]
+        if item["kind"] == make_charts.TIMESERIES_KIND
+        and item.get("series_id") == TRACER_SERIES_ID
+    )
+    # The manifest is faithful: the label it publishes is the label it was given,
+    # `$` and all, byte-for-byte.
+    assert published["label"] == label
+
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    document = _plan(out_dir, spec_path)
+    entry = next(
+        item
+        for item in document.charts
+        if item.kind == make_charts.TIMESERIES_KIND
+        and item.series_id == TRACER_SERIES_ID
+    )
+    assert entry.subtitle == published["subtitle"]
+
+    # Capture the axes production builds rather than re-drawing the chart here.
+    # `render_chart` creates and closes its own figure, so the only way to read
+    # back the title it actually set is to observe the figure it made. The
+    # recorder replaces only `subplots`; every draw and every text call below is
+    # production's, so this test cannot pass by restating the code it checks.
+    drawn_axes: list[Any] = []
+    original_subplots = plt.subplots
+
+    def _recording_subplots(*args: Any, **kwargs: Any) -> Any:
+        figure, axes = original_subplots(*args, **kwargs)
+        drawn_axes.append(axes)
+        return figure, axes
+
+    with monkeypatch.context() as patch:
+        patch.setattr(plt, "subplots", _recording_subplots)
+        make_charts.render_chart(entry, out_dir)
+    assert len(drawn_axes) == 1, "render_chart must build exactly one axes to read back"
+    title = drawn_axes[0].title
+    assert title.get_text() == published["subtitle"], (
+        "the drawn title must be the string the manifest publishes; drawn="
+        f"{title.get_text()!r} published={published['subtitle']!r}"
+    )
+    # The assertion that actually discriminates, and the reason `get_text()` above
+    # is not enough: `get_text()` returns the string AS SET, mathtext or not, so
+    # it cannot tell a plain title from one the engine parsed into mathematics.
+    # Measured: with the control removed, `'ratio $x$ alpha'` still exits 0 and
+    # still returns this same string - the difference is only in how it was
+    # rasterized. `get_parse_math()` reads the flag off the artist production
+    # actually built, which is the property the threat is about.
+    assert title.get_parse_math() is False, (
+        "the drawn title must not be mathtext-parsed: a spec-authored `$...$` pair "
+        "would replace the drawn title with rendered mathematics while charts.json "
+        "published the label verbatim. This artist was created with "
+        f"parse_math={title.get_parse_math()}"
+    )
+    for legend in drawn_axes[0].get_legend().get_texts():
+        assert legend.get_text() in (entry.label,) or legend.get_parse_math() is False, (
+            f"legend text {legend.get_text()!r} must not be mathtext-parsed either"
+        )
 
 
 def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
