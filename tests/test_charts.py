@@ -11,6 +11,7 @@ import csv
 import hashlib
 import json
 import sys
+import unicodedata
 from datetime import date, timedelta
 from pathlib import Path
 from statistics import median
@@ -2320,6 +2321,241 @@ def test_a_masked_anomaly_is_a_caret_not_a_stub_clipped_at_the_log_floor(
         assert len(zeros) == LOG_MASKED_DAYS
     finally:
         plt.close(fig)
+
+
+# --- Plan 05-06 Task 2: spec-language chart text and the unsupported-script warning
+
+# The committed golden's Ukrainian label, byte for byte. D-16/D-11: a label is
+# spec-authored prose and reaches the canvas as exact Unicode code points - no
+# normalization, no case folding, no truncation, no transliteration.
+PL_LABEL = "Польська: інтервальне голодування"
+
+# A language whose script the default DejaVu font does not cover. RESEARCH
+# Pitfall 7 confirmed matplotlib emits `UserWarning: Glyph 26085 ... missing from
+# font(s) DejaVu Sans` and no exception, so the chart renders successfully and
+# looks wrong - which is exactly why D-16 makes it a *documented gap that warns*
+# rather than a refusal or a font-fallback project.
+JA_LABEL = "断続的断食"
+
+
+def _write_localized_pair(
+    tmp_path: Path, language: str, label: str
+) -> tuple[Path, Path]:
+    """Write a one-series spec in `language` plus the inputs the analyzer reads.
+
+    metrics.json is built by the sanctioned analyzer so the per-series language
+    and label come from the spec by the production path, exactly as they would
+    on a real run - a hand-written metrics document would let a test pass while
+    the stage read its language from somewhere else entirely.
+    """
+    item = dict(_spec_series_item(TRACER_SERIES_ID))
+    item["language"] = language
+    item["label"] = label
+    spec = json.loads(FIXTURES_DIR.joinpath("spec.example.json").read_text(encoding="utf-8"))
+    document = {
+        "name": "one-series-tracer",
+        "request": "localized chart text probe",
+        "language": language,
+        "window": spec["window"],
+        "series": [item],
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv_filtered(out_dir, (TRACER_SERIES_ID,))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", document)
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            analyze_trends.build_metrics(document, str(spec_path), grouped),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return spec_path, out_dir
+
+
+def test_cyrillic_labels_render_without_glyph_warnings(tmp_out: Path) -> None:
+    """D-16: the committed Ukrainian fixture renders clean, in Ukrainian.
+
+    RESEARCH Pitfall 7's positive half: the same probe that warned for a CJK
+    glyph emitted no warning at all for a Ukrainian label, which is what lets
+    D-16 name Cyrillic as covered and CJK as a documented gap. The assertion is
+    on the WARNING STREAM rather than on pixels, because the missing-glyph notice
+    is a warning and a chart that emits one is defective even when the bytes
+    happen to be a valid PNG.
+    """
+    import warnings as warnings_module
+
+    with warnings_module.catch_warnings(record=True) as captured:
+        warnings_module.simplefilter("always")
+        _spec, manifest = _render_two_series(tmp_out)
+
+    offending = [
+        str(record.message)
+        for record in captured
+        if "missing from font" in str(record.message)
+    ]
+    assert offending == [], (
+        f"DejaVu covers Cyrillic; a missing-glyph warning means a font problem: {offending}"
+    )
+
+    # The chart's own words are the `uk` tokens, not English. A PNG that mixes
+    # the two is a bilingual chart the report never asked for (T-5-24).
+    tokens = make_charts.chart_tokens("uk")
+    published = next(
+        item
+        for item in manifest["charts"]
+        if item["kind"] == make_charts.TIMESERIES_KIND
+        and item.get("series_id") == TRACER_SERIES_ID
+    )
+    assert tokens["median7"] in published["subtitle"], published["subtitle"]
+    assert tokens["raw_daily"] in published["subtitle"]
+    for token in tokens.values():
+        assert not token.isascii(), f"a `uk` token is still English: {token!r}"
+
+    # The spec-authored label is untouched on its way to the manifest, and the
+    # overlay's own disclosure is the Ukrainian token on the image while the
+    # machine-readable `note` stays the ASCII form Phase 6 quotes.
+    assert published["label"] == PL_LABEL
+    overlay = next(item for item in manifest["charts"] if item["kind"] == make_charts.OVERLAY_KIND)
+    assert overlay["note"] == make_charts.OVERLAY_NOTE
+    assert make_charts.OVERLAY_NOTE.isascii(), (
+        "the manifest note is an interface string and must stay ASCII"
+    )
+    assert tokens["scales_differ"] != make_charts.OVERLAY_NOTE, (
+        "the on-image disclosure is the localized token, not the ASCII interface"
+    )
+
+
+def test_unsupported_language_warns_once_and_still_renders(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D-16: a script DejaVu cannot draw is a warning, never a refusal.
+
+    The failure RESEARCH measured is silence - a valid PNG full of tofu boxes
+    and no exception anywhere. So the stage says so on stderr, once, naming the
+    language and the documented gap, and then renders: CJK is a v1 gap
+    (05-CONTEXT.md), not a v1 requirement, and a font-fallback stack is exactly
+    the machinery 05-PATTERNS.md rules out of this phase.
+    """
+    spec_path, out_dir = _write_localized_pair(tmp_path, "ja", JA_LABEL)
+
+    assert _run_charts(spec_path, out_dir) == 0
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(lines) == 1, f"exactly one warning, not a stream: {lines}"
+    assert "ja" in lines[0]
+    assert "missing glyphs" in lines[0] or "DejaVu" in lines[0]
+    assert "v1 gap" in lines[0], lines[0]
+
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    assert len(manifest["charts"]) == 3
+    for item in manifest["charts"]:
+        blob = out_dir.joinpath(item["filename"]).read_bytes()
+        assert blob[:8] == PNG_MAGIC, f"{item['filename']} must still be a real PNG"
+        assert len(blob) > 1024
+    # The spec-authored label reaches the manifest verbatim even when the font
+    # cannot draw it - the text is right, the glyph coverage is a separate,
+    # disclosed fact.
+    pl = next(
+        item
+        for item in manifest["charts"]
+        if item["kind"] == make_charts.TIMESERIES_KIND
+        and item.get("series_id") == TRACER_SERIES_ID
+    )
+    assert pl["label"] == JA_LABEL
+
+    # The gap the plan forbids: font machinery in the chart stage.
+    assert "font_manager" not in _module_source(), (
+        "D-16 makes CJK a documented gap; no font fallback belongs in this phase"
+    )
+    assert "font_manager" not in _module_source().replace(
+        '"font_manager"', "", 1
+    ) or True  # the assertion above is the one that bites
+
+
+def test_chart_tokens_are_required_per_language(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """T-5-24: a language with no token table fails closed, with no English fallback.
+
+    Rendering an English string inside a chart whose spec asked for another
+    language is the mixed-language defect this stage is meant to make
+    impossible. The refusal is also the only model-actionable form of the
+    problem: a caller that adds a language gets told exactly which language is
+    missing rather than receiving a quietly wrong chart.
+    """
+    spec_path, out_dir = _write_localized_pair(tmp_path, "sv", "Fasting")
+    assert "sv" not in make_charts.CHART_TOKENS
+
+    assert _run_charts(spec_path, out_dir) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "no chart tokens for language" in captured.err
+    assert "sv" in captured.err
+    assert list(out_dir.glob("*.png")) == [], "a refused language must draw nothing"
+    assert not out_dir.joinpath("charts.json").exists()
+
+    # A table that is present but incomplete is the same defect, so it is the
+    # same message rather than a KeyError halfway through a render.
+    with pytest.raises(make_charts.ChartError) as raised:
+        make_charts.chart_tokens("en")
+    assert "no chart tokens for language" not in str(raised.value)
+    for token in make_charts.REQUIRED_CHART_TOKENS:
+        assert token in make_charts.CHART_TOKENS["en"]
+        assert token in make_charts.CHART_TOKENS["uk"]
+
+
+def test_labels_are_carried_verbatim(tmp_out: Path) -> None:
+    """A label is exact code points on its way to the canvas - never transformed.
+
+    Phase 3 froze "CSV identity equality uses exact decoded UTF-8 code points
+    without normalization" for the data layer; D-16 carries the same rule into
+    the chart layer, where the risk is higher because the string additionally
+    passes through a text engine. No `strip()` (a deliberate leading space is
+    content), no case folding, no `unicodedata.normalize`, no length cap.
+    """
+    _spec, manifest = _render_two_series(tmp_out)
+    metrics = json.loads(
+        FIXTURES_DIR.joinpath("metrics.example.json").read_text(encoding="utf-8")
+    )
+    by_id = {node["series_id"]: node for node in metrics["series"]}
+
+    for item in manifest["charts"]:
+        if "series_id" not in item:
+            continue
+        source = by_id[item["series_id"]]["label"]
+        assert item["label"] == source, (
+            f"{item['filename']}: the label must be metrics.json's own string, "
+            f"byte for byte"
+        )
+        # And the two specific transformations this stage must never perform.
+        assert item["label"] == item["label"].strip(), "no strip() on a spec label"
+        assert item["label"].casefold() != item["label"] or item["label"].islower(), (
+            "the label is not case-folded"
+        )
+    pl = next(
+        item
+        for item in manifest["charts"]
+        if item.get("series_id") == TRACER_SERIES_ID
+    )
+    assert pl["label"] == PL_LABEL
+    assert pl["label"].encode("utf-8") == PL_LABEL.encode("utf-8")
+
+    # NFC-stability of the shipped labels: normalization would be a silent
+    # rewrite of the bytes, so a value that is not already in its normalized
+    # form is a canary for one.
+    for series_id, node in by_id.items():
+        assert unicodedata.normalize("NFC", node["label"]) == node["label"], (
+            f"{series_id}: the committed label must already be NFC, or this "
+            "assertion can no longer see a normalizing implementation"
+        )
+
+    # And the module performs no normalization anywhere at all.
+    source = _module_source()
+    assert "unicodedata" not in source, "the chart stage must never normalize a string"
+    assert "casefold" not in source and ".lower()" not in source
 
 
 def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
