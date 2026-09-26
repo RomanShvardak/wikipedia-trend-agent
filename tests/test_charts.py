@@ -1923,3 +1923,269 @@ def test_gap_text_stays_inside_the_canvas_even_at_a_series_edge(tmp_path: Path) 
     finally:
         plt.close(fig)
 
+
+# --- Plan 05-06 Task 1: the opt-in log mode and its disclosure (D-15)
+
+# The two days the log tests set to `views=0`. D-11 keeps a zero a reading, and
+# D-15 says the log regime - which cannot draw a zero - must say how many it did
+# not draw rather than dropping the days in silence (RESEARCH Pitfall 3 measured
+# a log axis whose visible range began at 3.7 with both zero days gone and no
+# warning at all).
+LOG_ZERO_DATES = ("2025-01-15", "2025-01-16")
+LOG_MASKED_DAYS = len(LOG_ZERO_DATES)
+
+
+def _write_zero_pair(out_dir: Path, series_id: str, dates: tuple[str, ...]) -> Path:
+    """Copy the committed CSV, zero the named days of one series, rebuild metrics.
+
+    metrics.json is produced by the sanctioned analyzer rather than hand-edited:
+    a `views=0` day is a real observation, so the growth windows and the anomaly
+    detector must see the edited data, and only the analyzer is allowed to say
+    what they become.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = FIXTURES_DIR.joinpath("series.example.csv").read_text(encoding="utf-8").splitlines()
+    patched: list[str] = []
+    seen: set[str] = set()
+    for index, line in enumerate(rows):
+        if index > 0:
+            fields = line.split(",")
+            if fields[2] == series_id and fields[0] in dates:
+                fields[1] = "0"
+                line = ",".join(fields)
+                seen.add(fields[0])
+        patched.append(line)
+    assert seen == set(dates), f"expected {series_id} rows on {dates}, edited {sorted(seen)}"
+    out_dir.joinpath("series.csv").write_text("\n".join(patched) + "\n", encoding="utf-8")
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            analyze_trends.build_metrics(spec, str(spec_path), grouped),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return spec_path
+
+
+def _csv_nonpositive_count(path: Path, series_id: str) -> int:
+    """Recompute the masked count from the CSV, independently of the renderer.
+
+    The plan's whole point is that the number the chart prints is the number the
+    data supports. A test that read the count back out of the plan it is testing
+    would agree with any under-reporting renderer, so the expected value is
+    counted here from the file.
+    """
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return sum(
+            1
+            for row in csv.DictReader(handle)
+            if row["series_id"] == series_id and int(row["views"]) <= 0
+        )
+
+
+def _run_charts_with_flags(spec_path: Path, out_dir: Path, *flags: str) -> int:
+    return make_charts.main(
+        ["--spec", str(spec_path), "--out", str(out_dir), *flags]
+    )
+
+
+def test_log_mode_is_explicit_and_discloses_masked_points(tmp_path: Path) -> None:
+    """D-15: the log regime exists only when asked for, and always says what it hid.
+
+    Three assertions in one test because they are one rule: without the flag the
+    axis is linear and nothing is masked; with it the timeseries axis is log and
+    the masked count equals the number of non-positive readings the CSV actually
+    carries; and the same number is stated on the chart and in the manifest.
+    """
+    out_dir = tmp_path / "linear"
+    spec_path = _write_zero_pair(out_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
+    assert _csv_nonpositive_count(out_dir / "series.csv", TRACER_SERIES_ID) == LOG_MASKED_DAYS
+
+    assert _run_charts(spec_path, out_dir) == 0
+    linear_document = _plan(out_dir, spec_path)
+    linear_manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    for entry in linear_document.charts:
+        assert entry.yscale == "linear", f"{entry.kind} must stay linear without the flag"
+        assert entry.log_masked_points == 0
+        assert entry.log_note is None
+    for item in linear_manifest["charts"]:
+        assert item["yscale"] == "linear"
+        assert item["log_masked_points"] == 0
+        assert "log_note" not in item, "a linear chart states no log disclosure"
+
+    log_dir = tmp_path / "log"
+    assert _run_charts_with_flags(spec_path, log_dir, "--log-scale") == 0
+    log_document = _plan(log_dir, spec_path)
+    log_manifest = json.loads(log_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+
+    pl = _timeseries_entry_of(log_document)
+    assert pl.yscale == "log"
+    assert pl.log_masked_points == LOG_MASKED_DAYS, (
+        "the masked count must equal the non-positive readings in the CSV, "
+        "recomputed by the test rather than read back from the plan"
+    )
+    assert "2 non-positive" in (pl.log_note or ""), pl.log_note
+
+    # The overlay masks the union across its own lines, and the growth chart is
+    # never a log axis (D-15: growth bars stay linear).
+    overlay = _overlay_entry_of(log_document)
+    assert overlay.yscale == "log"
+    assert overlay.log_masked_points == sum(
+        _csv_nonpositive_count(log_dir / "series.csv", line.series_id)
+        for line in overlay.series_lines
+    )
+    assert "2 non-positive" in (overlay.log_note or "")
+
+    published = next(
+        item
+        for item in log_manifest["charts"]
+        if item["kind"] == make_charts.TIMESERIES_KIND
+        and item.get("series_id") == TRACER_SERIES_ID
+    )
+    assert published["yscale"] == "log"
+    assert published["log_masked_points"] == LOG_MASKED_DAYS
+    assert "2 non-positive" in published["log_note"]
+
+    # The disclosure is D-09's requirement applied to the scale regime: a PNG
+    # separated from the report must still say it did not draw two days.
+    for name in (f"chart_{TRACER_SERIES_ID}_timeseries.png", make_charts.OVERLAY_FILENAME):
+        blob = (log_dir / name).read_bytes()
+        assert blob[:8] == PNG_MAGIC, f"{name} must be a real PNG in log mode"
+        assert len(blob) > 1024
+
+
+def test_growth_stays_linear_under_log_scale(tmp_path: Path) -> None:
+    """D-15: the flag reaches the timeseries and overlay axes only.
+
+    A growth chart is a percentage axis: a log scale on it would erase a
+    negative bar exactly as RESEARCH Pitfall 1's zero floor did, and the flag is
+    documented as timeseries/overlay-only, so the guarantee is asserted on the
+    plan rather than left to a comment in the render branch.
+    """
+    out_dir = tmp_path / "log"
+    spec_path = _write_zero_pair(out_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
+    assert _run_charts_with_flags(spec_path, out_dir, "--log-scale") == 0
+
+    document = _plan(out_dir, spec_path)
+    growth_entries = [e for e in document.charts if e.kind == make_charts.GROWTH_KIND]
+    assert growth_entries, "the growth kind must still be asserted, or this is vacuous"
+    for entry in growth_entries:
+        assert entry.yscale == "linear", f"{entry.series_id} growth must never be a log axis"
+        assert entry.log_masked_points == 0
+        assert entry.log_note is None
+        # A percentage axis also keeps its literal zero floor, which a log axis
+        # could not express at all.
+        assert entry.y_limits[0] <= 0.0 <= entry.y_limits[1]
+
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    for item in manifest["charts"]:
+        if item["kind"] == make_charts.GROWTH_KIND:
+            assert item["yscale"] == "linear"
+            assert "log_note" not in item
+
+    # And the structural half: the growth render branch reads no scale decision
+    # at all, so the flag cannot reach it through a future edit either.
+    import ast as _ast
+
+    tree = _ast.parse(_module_source())
+    growth_helper = next(
+        node
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.FunctionDef) and node.name == "_draw_growth"
+    )
+    assert not [
+        node.func.attr
+        for node in _ast.walk(growth_helper)
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Attribute)
+        and node.func.attr.endswith("scale")
+    ], "the growth branch must name no scale call at all"
+    assert "yscale" not in _ast.unparse(growth_helper), (
+        "the growth branch must not even read entry.yscale"
+    )
+
+
+def test_log_mode_declares_nonpositive_masking_in_source() -> None:
+    """`nonpositive="mask"` is written out, never inherited from a default.
+
+    matplotlib's own default happens to be `mask` today; a version that changed
+    it to `clip` would drop the zeros without telling anyone, and nothing else in
+    the suite could see the difference. The literal is therefore a source-level
+    requirement, asserted against the module text.
+    """
+    source = _module_source()
+    assert 'nonpositive="mask"' in source, (
+        "the log axis must set nonpositive explicitly, never rely on a default"
+    )
+    # And the call that carries it must be the y-scale of a timeseries axes.
+    assert "set_yscale" in source
+
+
+def test_log_help_text_is_published_and_explicit() -> None:
+    """The flag declares its own regime: opt-in, masked, timeseries/overlay only.
+
+    Asserted against `_parser()` directly, the `test_contracts.py` idiom for the
+    resolver CLI - the published help text is the only place a caller learns
+    that a log chart is a different scale regime rather than a re-rendering of
+    the linear one.
+    """
+    help_text = make_charts._parser().format_help()
+    assert "--log-scale" in help_text
+    assert "opt-in" in help_text, "the help must say the regime is opt-in, never automatic"
+    assert "masked" in help_text, "the help must say non-positive days are masked"
+    assert "linear" in help_text, "the help must say the growth bars stay linear"
+
+    parsed = make_charts._parser().parse_args(["--spec", "s.json", "--log-scale"])
+    assert parsed.log_scale is True
+    assert make_charts._parser().parse_args(["--spec", "s.json"]).log_scale is False
+
+
+def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
+    """05-06 inherits 05-05's clipping guard for the text it adds.
+
+    The disclosure is 50 characters of prose; anchored at the wrong corner it
+    would run off the right edge of a 9-inch figure, and a half-printed count is
+    worse than no count at all - it is a wrong count. Reusing the
+    `get_window_extent()`-against-the-canvas mechanism from 05-05 rather than
+    re-deriving it keeps the defect class closed without a human.
+    """
+    out_dir = tmp_path / "log"
+    spec_path = _write_zero_pair(out_dir, TRACER_SERIES_ID, LOG_ZERO_DATES)
+    assert _run_charts_with_flags(spec_path, out_dir, "--log-scale") == 0
+
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    document = _plan(out_dir, spec_path)
+    targets = [_timeseries_entry_of(document), _overlay_entry_of(document)]
+    for entry in targets:
+        fig, ax = plt.subplots(figsize=make_charts.FIGURESIZE, dpi=make_charts.DPI)
+        try:
+            if entry.kind == make_charts.OVERLAY_KIND:
+                make_charts._draw_overlay(entry, ax, mdates)
+            else:
+                make_charts._draw_timeseries(entry, ax, mdates)
+            fig.canvas.draw()
+            width, height = fig.canvas.get_width_height()
+            drawn = [text.get_text() for text in ax.texts if entry.log_note in text.get_text()]
+            assert drawn == [entry.log_note], f"{entry.kind}: the disclosure must be drawn"
+            for artist in ax.texts:
+                left, bottom, right, top = artist.get_window_extent().bounds
+                assert left >= 0, f"{artist.get_text()!r} runs off the left edge ({left:.1f})"
+                assert right <= width, (
+                    f"{artist.get_text()!r} runs off the right edge ({right:.1f} of {width})"
+                )
+                assert top <= height, f"{artist.get_text()!r} runs off the top ({top:.1f})"
+                assert bottom >= 0, f"{artist.get_text()!r} runs off the bottom ({bottom:.1f})"
+        finally:
+            plt.close(fig)
+
