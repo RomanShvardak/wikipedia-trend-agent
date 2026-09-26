@@ -1,8 +1,10 @@
-# Contracts — spec.json & metrics.json (frozen, v0.1)
+# Contracts — spec.json, metrics.json, resolved.v1 & charts.v1 (frozen, v0.1)
 
 This file is the single source of truth for the frozen I/O contracts of the
 `wikipedia-trend-agent` skill (ANAL-06). Every pipeline stage emits into and
 reads from exactly the fields documented here — nothing more, nothing less.
+Four contracts are frozen here: `spec.json` (§1), `metrics.json` (§2),
+`resolved.v1` (§6) and `charts.v1` (§7).
 
 The contract language is English; Ukrainian strings appear only as example
 values where a field carries human-readable text.
@@ -181,6 +183,14 @@ classification for the requested chunk.
 - `tests/fixtures/metrics.example.json` — the golden `metrics.json` mirror
   (plan 02): 2 series, one demonstrating `pct: null` with a reason, clean
   variants per window.
+- `tests/fixtures/metrics.anomalies.example.json` and
+  `tests/fixtures/series.anomalies.example.csv` — the spike-injected pair: a
+  non-empty `anomalies[]` and the 19.6-raw / 16.7-clean divergence make the
+  mandatory anomaly overlay testable, and the overlay chart is the only
+  artifact that carries it.
+- `tests/fixtures/series.gaps.example.csv` — a per-series internal hole, so the
+  `no data` band is testable without the `out/series.csv` sort-boundary
+  artifact.
 - `tests/test_contracts.py` — enforcement: null-never-0-with-reason, finite
   numbers, enums, ranges, and the no-rollups rule.
 
@@ -342,5 +352,215 @@ PROJECT=QUERY` and `--select PROJECT=ARTICLE`; `--out` (default
 - `tests/fixtures/pageviews.200.json` / `pageviews.404.json` — AQS volume
   states used by the resolver evidence contract.
 - `assets/wikipedia-projects.json` — the versioned offline project allowlist.
+
+No test may reach the network; every transport is injected or forbidden.
+
+## 7. `charts.json` — `charts.v1` (chart stage, Phase 5)
+
+`charts.json` is a **separate stage contract**. It changes no frozen
+`spec.json`, `metrics.json` or `resolved.v1` field in §1–§6: the chart stage
+**renders** `metrics.json` and `series.csv` and **never recomputes** a value
+(ANAL-06). Every number and every label that reaches a chart is copied from a
+field this document already froze; the one permitted derivation is named
+explicitly in §7.3 and is a display curve, not a claim.
+
+### 7.1 Top-level fields
+
+| Field | Type | Description |
+|---|---|---|
+| `contract_version` | `"charts.v1"` | Exact version; anything else is rejected. |
+| `spec_name` | string | The `name` of the spec the charts were built from, copied from `metrics.json`'s own `spec_name`. |
+| `as_of` | string | `YYYY-MM-DD` — copied verbatim from `metrics.json`. |
+| `language` | string | The validated spec's `language` (the DOCUMENT language, not one series' language). |
+| `generated_from` | string | Path of the `metrics.json` this stage read. |
+| `metrics_sha256` | 64-char lowercase hex | SHA-256 of the **exact `metrics.json` bytes the stage read**. |
+| `charts` | ordered array | The chart inventory; one object per PNG (§7.2). |
+
+`metrics_sha256` is an **integrity and staleness mechanism, not a security
+control**. A consumer compares it against the digest of the `metrics.json` it
+holds to decide whether the manifest still describes that file — which is how
+staleness is detected **without comparing timestamps**, since an mtime carries
+no information about *which* content was rendered. Nothing is authenticated by
+it, and no later phase may build access control on it.
+
+### 7.2 Per-chart fields
+
+`kind` is exactly one of `timeseries`, `growth`, `overlay`.
+
+| Field | Type | Description |
+|---|---|---|
+| `kind` | enum | The chart form. |
+| `series_id` | string | The one series this chart shows; on the two per-series kinds only. |
+| `series_ids` | ordered array of strings | The overlay's full membership, in `metrics.json` order; on the overlay only. |
+| `spec_index` | integer | The series' position in `spec.series[]`; on the two per-series kinds only, so chart order is inspectable rather than merely implied by list position. |
+| `label` | string | The series' own `metrics.json` label, byte-for-byte. |
+| `language` | string | That series' `language` code. |
+| `filename` | string | A **bare relative name** — no directory separator, no `..`, no drive letter (§7.2.1). |
+| `yscale` | `"linear"` \| `"log"` | The regime this entry was drawn in. `"log"` only under the explicit `--log-scale` flag, and never on a `growth` entry. |
+| `y_limits` | `[number, number]` | The **display bounds the renderer used** for the axis carrying the plotted number — a display fact, not a data claim. On the horizontal `growth` form that axis is x, and the field keeps its contract name so one rule covers all three kinds rather than a second field name appearing here. |
+| `x_limits` | `[YYYY-MM-DD, YYYY-MM-DD]` | The date-axis domain, read from the series' own `metrics.json` `period` block. Absent on a chart with no date axis (§7.2.2). |
+| `points` | integer | How many observations this chart drew. On the overlay it is the **sum over its lines**; on `growth` it is `0`, because a bar chart draws no daily series and does not borrow its sibling's count. |
+| `gaps` | array of objects | Each `{series_id, start, end, days}` — a tagged absent-day range, `days` inclusive. Never empty-by-absence: written even when `[]`. |
+| `anomalies_drawn` | integer | How many anomaly markers this chart drew. |
+| `bars` | array of objects | `growth` only (§7.2.3). |
+| `note` | string | A stable ASCII interface string (§7.2.4). |
+| `subtitle` | string | The chart's own method disclosure, composed from the document language's tokens. |
+| `log_masked_points` | integer | How many of this entry's own readings were non-positive and therefore not drawable on a log axis. Always written, and `0` on a linear entry. |
+| `log_note` | string | The visible log disclosure; present **exactly** when `yscale` is `"log"`. |
+
+**The overlay's per-series render data is not published.** The overlay declares
+its membership through `series_ids` and through the per-series entries it
+references; a nested `series_lines` would duplicate `metrics.json` inside the
+manifest for no consumer. A test asserts no entry ever carries a `series_lines`
+key, so the render-only boundary stays a boundary.
+
+#### 7.2.1 The deterministic filename rule
+
+`filename` is `chart_<series_id>_<kind>.png` for the two per-series kinds, and
+the fixed `chart_overlay.png` for the overlay — the overlay's name is not
+derived from a `series_id`, which is also what keeps it from colliding with a
+per-series name. A `series_id` that is not `[A-Za-z0-9._-]+` is **refused**
+before a filename is built, so a chart name can never escape the output
+directory. A consumer embeds a chart by joining this name onto the directory it
+was given; no path traversal is possible from a conforming manifest.
+
+#### 7.2.2 The per-entry key-set rule
+
+The 18 names above are a **union across kinds**, not a per-entry key list. No
+single entry carries all 18, and each name is partitioned three ways:
+
+| Partition | Names | Guarantee |
+|---|---|---|
+| **Always emitted (11)** | `kind`, `label`, `language`, `filename`, `yscale`, `y_limits`, `points`, `gaps`, `anomalies_drawn`, `subtitle`, `log_masked_points` | Present on every entry, whatever the kind and whatever the flags. `gaps` is written even when it is `[]` and `log_masked_points` even when it is `0`, so a consumer asks "does this chart have gaps?" and "was anything masked?" without a key-absent special case. |
+| **Owned by a kind or a mode (6)** | `series_id`, `spec_index`, `bars`, `series_ids`, `note`, `log_note` | `series_id`/`spec_index` on the two per-series kinds — the overlay belongs to no single `spec.series[]` position, so it publishes neither; `bars` on `growth`; `series_ids` and `note` on `overlay`; `log_note` exactly when `yscale` is `"log"`. |
+| **Owned by a value (1)** | `x_limits` | Present when the entry has a date axis. In practice that is `timeseries` and `overlay` and not `growth`, but the **emitter's guard is `x_limits is not None`, not a kind test** — a future kind with a date axis would be published automatically, and this document states the observed invariant rather than a guarantee the code does not make. |
+
+The same care applies to `note`: its emitter guard is `note is not None`, and
+`note` is overlay-only **in practice**, not by a kind test.
+
+The reason the sets partition is the **no-null rule**: a key whose value is
+null, or is meaningless for that kind, is **omitted** rather than written as
+`null`. A consumer therefore distinguishes "absent" from "zero" by reading the
+key's own type, never by finding a `null` in the document. The same rule holds
+inside a `bars[]` object: `pct`, `abs` and `reason` are omitted when the clean
+percentage is not computable, and the explicit `bar_null` boolean is how a
+consumer reads "not computable" from a field rather than from an absence.
+
+#### 7.2.3 The `bars[]` object (7 names, same freeze)
+
+| Field | Type | Description |
+|---|---|---|
+| `window` | string | The growth window: `m3`, `y1` or `y2`. |
+| `label` | string | The window's human-readable name, e.g. `"1 year"`. |
+| `pct` | finite number | The **clean** relative change — `growth.<window>.clean.pct`, never the raw `pct` (§7.3). Omitted when not computable. |
+| `abs` | integer | The clean absolute change, same units as `avg_daily_views`. Omitted when not computable. |
+| `base_avg_daily_views` | number | The volume base the contract already froze: `metrics.json`'s own `avg_daily_views` (§7.3). |
+| `reason` | string | Present exactly when `pct` is absent; the contract's own `reason` for the null window (§2.1). |
+| `bar_null` | boolean | Always written. `true` marks the explicit "hatched n/a" bar. |
+
+#### 7.2.4 The manifest `note` and the on-image disclosure are not the same string
+
+The manifest `note` is a **stable ASCII interface string** — the same constant
+regardless of the spec's language, because a machine quotes it verbatim. The
+equivalent disclosure drawn **on the image** is the localized token for the
+document's language, because a reader needs it in their own words. A consumer
+must not assume the two strings are equal, and a test asserts the asymmetry.
+
+### 7.3 The never-recompute rule
+
+This is the load-bearing clause of `charts.v1`. **Every plotted and labelled
+value is copied from `metrics.json` or `series.csv`.**
+
+- A growth bar carries `growth.<window>.clean.pct` and `clean.abs` — never the
+  raw `pct`/`abs`, and never a percentage recomputed from the CSV. The 19.6-raw
+  / 16.7-clean divergence in the committed anomalies fixture is exactly the
+  difference a recomputation would erase.
+- The volume base is the contract's `avg_daily_views`, never a mean
+  recomputed from `series.csv`.
+- The anomaly overlay uses each `anomalies[]` entry's own `median` and `value`
+  as the segment endpoints. Nothing rescales, narrows or re-derives them.
+- The date domain is the series' own `period` block, published as `x_limits`.
+- The **single permitted derivation** is the centered **7-day rolling median**
+  over the plotted series, which exists to draw `series.csv`. It is a display
+  curve: it may never feed a numeric label or any manifest value.
+- A `views=0` row in `series.csv` is **data** and is drawn. An absent calendar
+  day is expressed only as a line break plus a `gaps` record; it is never
+  imputed, zero-filled or bridged.
+
+A consumer inherits this rule. A number the manifest already carries must never
+be derived a second time downstream.
+
+### 7.4 Axis, scale, and null rendering policy
+
+- The y-axis is anchored at **`0`** on the `timeseries` and `overlay` axes with
+  no exception.
+- Growth axes **never receive a zero floor**, because `clean.pct` may be
+  negative and a zero floor clipped a measured −22.0% decline out of the picture
+  entirely — a falling topic drawn as a small rising one. The bounds always
+  *contain* 0.0, and an explicit zero reference line keeps a decline legible.
+- A `null` growth renders as a **hatched grey bar marked `n/a`** carrying the
+  window's contract `reason`. It is never omitted and never zero, and a
+  `pct: 0.0` is a solid bar structurally distinct from it.
+- A log axis exists **only** under the explicit `--log-scale` flag, applies only
+  to the `timeseries` and `overlay` axes, sets `nonpositive="mask"` explicitly
+  rather than inheriting matplotlib's default, and discloses
+  `log_masked_points` **both in the manifest and as visible chart text**. A
+  regime change the reader did not ask for is a different chart, not a better
+  one, so no threshold in the data can select it.
+- **Documented v1 gap:** the bundled DejaVu font covers Latin and Cyrillic. A
+  non-Latin script such as CJK renders as tofu with a single stderr warning
+  naming the language; there is no font fallback in v1.
+
+### 7.5 Exit codes, atomicity, and publication
+
+| Situation | Manifest | Exit |
+|---|---|---|
+| all charts rendered | `charts.v1` published | 0 |
+| invalid spec | nothing written | 2 |
+| missing/invalid `series.csv` or `metrics.json`, unsafe `series_id`, non-finite value, publication failure | prior bytes preserved, no staging file | 1 |
+
+**There is no `3` (partial) case.** §4 defines 3 for a stage that completes some
+units and fails others; this stage has no such outcome, because a
+half-populated `charts.json` is worse than none at all — a reader who finds
+four PNGs and a manifest naming five has been told something false about the
+fifth. So a series that cannot be charted fails the whole stage: the manifest is
+published only after **every** render has returned.
+
+**Atomicity:** a same-directory staging file plus one `os.replace`. A
+publication failure leaves the prior manifest bytes untouched and no
+`.charts.json.*.tmp` behind.
+
+**Concurrency assumption:** atomic replacement prevents partial files and
+requests are serial within one process, but two independent processes targeting
+the same `--out` are not serialized by the chart stage. They are
+**caller-serialized**: the caller must serialize them. Without that caller
+serialization, the **last completed atomic replace wins**.
+
+### 7.6 `charts.v1` CLI contract
+
+```bash
+# run 1 — the normal run
+python scripts/make_charts.py --spec out/spec.json --out out
+
+# run 2 — the same data with the opt-in log regime
+python scripts/make_charts.py --spec out/spec.json --out out --log-scale
+```
+
+Flags: `--spec` (required); `--out` (default `out`); `--log-scale` (opt-in log
+y-axis for the `timeseries` and `overlay` charts only, with a counted masked-
+points disclosure); and logging-only `--verbose`, which adds no manifest field
+and changes no behavior.
+
+### 7.7 Chart fixtures
+
+- `tests/fixtures/series.example.csv` — the committed two-series daily input
+  the golden `metrics.example.json` was derived from.
+- `tests/fixtures/series.anomalies.example.csv` and
+  `tests/fixtures/metrics.anomalies.example.json` — the spike-injected pair
+  whose non-empty `anomalies[]` and 19.6-raw / 16.7-clean divergence make the
+  mandatory overlay branch and the clean-growth copy testable.
+- `tests/fixtures/series.gaps.example.csv` — a per-series internal hole, which
+  makes the `no data` band testable without the `out/series.csv` sort-boundary
+  artifact.
 
 No test may reach the network; every transport is injected or forbidden.

@@ -87,8 +87,9 @@ LOG_TEXT_COLOR = "#495057"
 # with a per-series name (T-5-09).
 OVERLAY_FILENAME = "chart_overlay.png"
 REASON_NA_LABEL = "n/a"  # D-04: a null growth renders as a labelled n/a bar
-# Provisional until plan 05-07 ratifies the charts.v1 field list in
-# CONTRACTS.md §7 (D-18).
+# Ratified as the CONTRACTS.md §7 `charts.v1` surface by plan 05-07's
+# checkpoint:decision gate, amended to publish `x_limits` as an 18th per-chart
+# key. The "provisional" status is what that gate existed to discharge (D-18).
 CHARTS_CONTRACT_VERSION = "charts.v1"
 # D-09: the method disclosure a chart carries so it stays self-describing when
 # it travels on its own. The wording is composed from the chart's own language
