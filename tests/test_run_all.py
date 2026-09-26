@@ -179,6 +179,15 @@ def test_the_example_asset_runs_the_whole_pipeline_with_no_network(
     already documents.
     """
     spec = json.loads(asset_spec_path.read_text(encoding="utf-8"))
+    # RUN-03 was relaxed from three example specs to ONE, so the DIRECTORY is
+    # asserted, not just the file: a second hand-written variant would parse
+    # perfectly and this is the only assertion that can see it.
+    example_specs = sorted(
+        path.name
+        for path in asset_spec_path.parent.glob("example.*.json")
+        if path.is_file()
+    )
+    assert example_specs == [asset_spec_path.name]
     stub, expected_calls = _scripted_transport(transport_stub, asset_spec_path)
     repo_cache_before = _repo_cache_bytes()
 
