@@ -782,6 +782,61 @@ def _manifest(
     }
 
 
+def report_is_stale(out_dir: str | Path) -> bool:
+    """Is the report in `out_dir` no longer rendered from the documents on disk?
+
+    **A digest comparison, and a recorded deviation from the roadmap's wording.**
+    ROADMAP Phase 6 success criterion 4 describes staleness as "when
+    `metrics.json` is newer than the report"; this function compares the
+    SHA-256 of the two input documents' BYTES against the `metrics_sha256` and
+    `charts_sha256` the manifest already publishes. The reconciliation is
+    CONTRACTS.md §7.1's, applied to the sibling manifest, where a file's
+    modification time was rejected with the sentence that an mtime carries no
+    information about *which* content was rendered; §8.1 records the same
+    deviation for this stage. A timestamp comparison fails in both directions:
+    it reports "fresh" for a report rendered from entirely different content the
+    moment that content is copied or checked out with a new timestamp, and it
+    reports "stale" for byte-identical content that merely moved. So a consumer
+    here decides from WHICH CONTENT was rendered, never from when a file was
+    touched, and the module test
+    `test_report_module_never_reads_a_timestamp` enforces that mechanically
+    rather than trusting this docstring.
+
+    The two digests are consumed, never recomputed from a second read: the
+    manifest's own values are the whole comparison, so this seam reads the
+    inputs exactly once and cannot attest to content a different read saw. And
+    they are an **integrity and staleness mechanism only** — they detect that
+    content changed, they authenticate nothing, and no later phase may gate
+    access on them (§8.1's own sentence).
+
+    Every unanswerable state returns True rather than raising. A consumer asking
+    "is this report current?" must get an answer when the answer is plainly no:
+    a missing, unreadable, malformed, non-object or key-incomplete manifest, and
+    a missing or unreadable input, all mean the manifest cannot be shown to
+    describe what is on disk. Raising would push that decision back onto a
+    caller, and a caller that guesses is how a stale report gets presented as
+    current.
+    """
+    directory = Path(out_dir)
+    try:
+        manifest = json.loads((directory / REPORT_MANIFEST_FILENAME).read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    if not isinstance(manifest, dict):
+        return True
+    recorded = (manifest.get("metrics_sha256"), manifest.get("charts_sha256"))
+    if not all(isinstance(value, str) for value in recorded):
+        return True
+    for name, expected in zip(("metrics.json", "charts.json"), recorded):
+        try:
+            raw = (directory / name).read_bytes()
+        except OSError:
+            return True
+        if hashlib.sha256(raw).hexdigest() != expected:
+            return True
+    return False
+
+
 def _parser() -> argparse.ArgumentParser:
     """Exactly three flags. A fourth would be a contract Phase 7 must learn to pass."""
     parser = argparse.ArgumentParser(description=__doc__)

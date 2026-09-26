@@ -1963,3 +1963,209 @@ def test_reason_token_refuses_an_unmapped_reason() -> None:
         )
 
 
+# --- 06-03 Task 1: staleness is a DIGEST comparison, never a timestamp ---------
+#
+# RPT-03's claim, and the one place where the roadmap and the frozen contract
+# disagree: ROADMAP SC#4 words staleness as "`metrics.json` is newer than the
+# report", and §8.1 rejected that wording in the document. The tests below pin
+# the mechanism the contract froze, and the second one makes the rejection
+# mechanical rather than aspirational.
+
+# The exact strings the AST-free source guard below looks for. They are the
+# attribute names a file-modification-time check would reach for, and the
+# module's own docstrings must not contain them either - so the prose in
+# `report_is_stale` describes a file's modification time in WORDS and never
+# quotes an identifier, or this test would fail on its own documentation.
+TIMESTAMP_API_STRINGS = ("st_mtime", "getmtime", "st_ctime", "os.stat")
+
+
+def test_staleness_is_decided_by_digest_not_by_timestamp(tmp_out: Path) -> None:
+    """A consumer answers "is this report current?" from CONTENT, not from age.
+
+    The decisive case is in the middle: `metrics.json` is re-serialized with
+    identical values and different indentation, so every number the report would
+    render is unchanged and only the BYTES differ. A digest comparison reports
+    stale, which is correct - the manifest attests to specific bytes and those
+    are not the bytes on disk. A timestamp comparison would say nothing at all
+    here, and worse, would say "fresh" for a report rendered from entirely
+    different content the moment that content was copied or checked out with a
+    new mtime.
+    """
+    before = _fixture_bytes()
+    _text, _metrics, _charts, _manifest = _render_two_series(tmp_out)
+
+    metrics_path = tmp_out / "metrics.json"
+    charts_path = tmp_out / "charts.json"
+    original_metrics = metrics_path.read_bytes()
+    original_charts = charts_path.read_bytes()
+
+    assert not build_report.report_is_stale(tmp_out), (
+        "a report rendered from exactly the documents on disk is not stale"
+    )
+
+    # The manifest describes the INPUTS, so report.md's own bytes cannot decide
+    # the answer. A consumer holding a report it is about to overwrite is asking
+    # whether the INPUTS moved, not whether the output is younger than itself.
+    report_path = tmp_out / build_report.REPORT_FILENAME
+    report_path.write_bytes(b"a different document entirely")
+    assert not build_report.report_is_stale(tmp_out), (
+        "report.md's own bytes decided the answer; the manifest's digests describe "
+        "the inputs this report was rendered from, not the report itself"
+    )
+
+    # Same values, different bytes: the case a timestamp cannot see at all.
+    document = json.loads(original_metrics.decode("utf-8"))
+    reformatted = json.dumps(document, ensure_ascii=False, indent=4).encode("utf-8")
+    assert reformatted != original_metrics, (
+        "the re-serialization produced identical bytes, so the 'values equal, bytes "
+        "differ' case this test exists for was not actually constructed"
+    )
+    metrics_path.write_bytes(reformatted)
+    assert build_report.report_is_stale(tmp_out), (
+        "metrics.json was rewritten with different bytes and the report was still "
+        "called current; the digest comparison is what §8.1 froze"
+    )
+
+    # Restoring the exact bytes restores the answer - so the check is a function
+    # of the content and of nothing else.
+    metrics_path.write_bytes(original_metrics)
+    assert not build_report.report_is_stale(tmp_out), (
+        "the original metrics.json bytes were restored and the report is still "
+        "reported stale, so something other than the digest is being compared"
+    )
+
+    # A missing input is stale, whichever of the two it is.
+    metrics_path.unlink()
+    assert build_report.report_is_stale(tmp_out), (
+        "metrics.json is absent, so the report cannot describe what is on disk"
+    )
+    metrics_path.write_bytes(original_metrics)
+    charts_path.unlink()
+    assert build_report.report_is_stale(tmp_out), (
+        "charts.json is absent, so the report cannot describe what is on disk"
+    )
+    charts_path.write_bytes(original_charts)
+
+    # charts_sha256 is a live half of the check, not decoration: changing
+    # charts.json alone must be enough.
+    charts_document = json.loads(original_charts.decode("utf-8"))
+    charts_path.write_text(
+        json.dumps(charts_document, ensure_ascii=False, indent=4), encoding="utf-8"
+    )
+    assert build_report.report_is_stale(tmp_out), (
+        "charts.json alone was rewritten and the report was still called current; "
+        "charts_sha256 is not part of the decision"
+    )
+
+    assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
+def test_report_module_never_reads_a_timestamp() -> None:
+    """The report module contains no file-timestamp API, and does compute a digest.
+
+    Two halves, and the second is the load-bearing one. A module that simply
+    never computed a digest would satisfy the first half perfectly, so the
+    no-timestamp rule would pass on an implementation that had quietly stopped
+    answering the question at all. Asserting both - the function exists, the
+    digest is really taken, and no timestamp API appears anywhere in the source -
+    is what makes the absence an enforced mechanism rather than a description.
+
+    Substring matching is adequate here and the reasoning matters: a *parsed*
+    walk would need to know which attribute is being read to call it a timestamp
+    read, and a reader can also arrive at one through `Path.touch`, `copy2` or
+    `shutil`. The source-level ban is the blunt instrument that cannot be
+    defeated by any spelling, and it is exactly the claim the docstring makes.
+    """
+    source = _module_source()
+
+    for forbidden in TIMESTAMP_API_STRINGS:
+        assert forbidden not in source, (
+            f"build_report's source contains {forbidden!r}. Staleness is a digest "
+            "comparison (CONTRACTS.md 8.1): a file's modification time says when "
+            "a file was touched, not which content was rendered, and it yields a "
+            "false negative on any copy, checkout or restore"
+        )
+
+    assert "def report_is_stale(" in source, (
+        "build_report has no report_is_stale seam, so the no-timestamp rule above "
+        "is guarding nothing - a module that answers no question satisfies it"
+    )
+    assert "hashlib.sha256" in source, (
+        "build_report computes no digest, so the absence of a timestamp API proves "
+        "only that nothing is compared at all"
+    )
+
+
+# Each row destroys the manifest in one specific way, and each row asserts the
+# answer in a False -> True -> False arc. The arc is the whole point: every
+# branch here answers True, so a row that only asserted True would be satisfied
+# by an implementation that returned True unconditionally - a staleness check
+# that calls everything stale is not a staleness check.
+UNUSABLE_MANIFEST_ROWS = (
+    pytest.param(lambda p: p.unlink(), id="manifest-absent"),
+    pytest.param(lambda p: p.write_bytes(b"{ not json"), id="manifest-malformed"),
+    pytest.param(lambda p: p.write_bytes(b"[1, 2, 3]"), id="manifest-not-an-object"),
+    pytest.param(
+        lambda p: _drop_manifest_key(p, "metrics_sha256"), id="manifest-no-metrics-digest"
+    ),
+    pytest.param(
+        lambda p: _drop_manifest_key(p, "charts_sha256"), id="manifest-no-charts-digest"
+    ),
+    pytest.param(
+        lambda p: _drop_manifest_key(p, "metrics_sha256", value=17),
+        id="manifest-digest-not-a-string",
+    ),
+)
+
+
+def _drop_manifest_key(
+    path: Path, key: str, *, value: object = "__DELETE__"
+) -> None:
+    """Delete one manifest key, or set it to a non-string, in place."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if value == "__DELETE__":
+        document.pop(key, None)
+    else:
+        document[key] = value
+    path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("break_manifest", UNUSABLE_MANIFEST_ROWS)
+def test_report_is_stale_answers_true_for_an_unusable_manifest(
+    tmp_path: Path, break_manifest
+) -> None:
+    """A manifest that cannot answer the question is answered "stale", not raised.
+
+    Five ways a manifest arrives unusable - absent, not JSON, not an object, and
+    carrying either digest in a state that cannot be compared - plus a
+    non-string digest, which is what a hand-edited or half-written manifest
+    looks like. Every one of them means the manifest cannot be shown to describe
+    the files beside it, and a consumer needs an answer in that case rather than
+    an exception it would have to guess the meaning of.
+    """
+    out_dir = tmp_path / "out.unusable"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _render_two_series(out_dir)
+    manifest_path = out_dir / build_report.REPORT_MANIFEST_FILENAME
+    original = manifest_path.read_bytes()
+
+    assert not build_report.report_is_stale(out_dir), (
+        "a freshly published report is not stale - if this row cannot reach a "
+        "False answer, the True below proves nothing"
+    )
+
+    break_manifest(manifest_path)
+
+    assert build_report.report_is_stale(out_dir) is True, (
+        f"row {break_manifest!r}: an unusable manifest must read as stale"
+    )
+
+    # ...and the same directory reads as current again once the manifest is whole,
+    # so the answer moved because of the manifest and not because of a latch.
+    manifest_path.write_bytes(original)
+    assert build_report.report_is_stale(out_dir) is False, (
+        f"row {break_manifest!r}: restoring the intact manifest did not restore the "
+        "answer, so the check is not a function of the manifest's usability"
+    )
+
+
