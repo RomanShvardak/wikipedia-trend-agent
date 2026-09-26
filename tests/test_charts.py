@@ -11,6 +11,7 @@ import csv
 import hashlib
 import json
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -1572,3 +1573,353 @@ def test_chart_subtitle_and_legend_name_their_method(tmp_path: Path) -> None:
             entry.subtitle for entry in document.charts if entry.filename == item["filename"]
         ), "the manifest must publish the subtitle the image carries"
         assert item["subtitle"]
+
+
+# --- Plan 05-05 Task 2: calendar gaps as a break and a labelled band (D-10..D-13)
+
+GAP_START = "2025-05-10"
+GAP_END = "2025-05-14"
+GAP_DAYS = 5
+
+
+def _gap_objects(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every gap record the manifest publishes, across every entry."""
+    return [gap for entry in manifest["charts"] for gap in entry["gaps"]]
+
+
+def _run_gap_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """Materialize the committed gap pair and run the CLI over it."""
+    out_dir = tmp_path / "gaps"
+    _write_gaps_pair(out_dir)
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0
+    return out_dir, spec_path
+
+
+def test_gaps_are_per_series_and_rendered(tmp_path: Path) -> None:
+    """D-12/D-13: one series' internal hole is that series' band, and only that one.
+
+    RESEARCH Pitfall 4 measured the failure this guards: `series.csv` is sorted
+    by `(series_id, date)`, so a gap walk over the raw file order reports the
+    sort boundary between two complete series as a 365-day absence.
+    """
+    out_dir, spec_path = _run_gap_pair(tmp_path)
+    document = _plan(out_dir, spec_path)
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+
+    pl = _timeseries_entry_of(document, TRACER_SERIES_ID)
+    cs = _timeseries_entry_of(document, GAP_SERIES_ID)
+    assert pl.gaps == (), "the complete series must have no gap at all"
+    assert len(cs.gaps) == 1, "the holed series has exactly one internal gap"
+    gap = cs.gaps[0]
+    assert gap.series_id == GAP_SERIES_ID
+    assert gap.start.isoformat() == GAP_START
+    assert gap.end.isoformat() == GAP_END
+    assert gap.days == GAP_DAYS
+
+    objects = _gap_objects(manifest)
+    assert len(objects) == 2, "one record on the holed series' own entry and on the overlay"
+    assert {record["series_id"] for record in objects} == {GAP_SERIES_ID}
+    for record in objects:
+        assert set(record) == {"series_id", "start", "end", "days"}
+        assert record["start"] == GAP_START
+        assert record["end"] == GAP_END
+        assert record["days"] == GAP_DAYS
+        assert record["days"] == (
+            date.fromisoformat(record["end"]) - date.fromisoformat(record["start"])
+        ).days + 1
+
+    # The chart the band belongs to is a real PNG, and so is the one that has no
+    # band to draw.
+    for record in objects:
+        blob = out_dir.joinpath(f"chart_{GAP_SERIES_ID}_timeseries.png").read_bytes()
+        assert blob[:8] == PNG_MAGIC
+        assert len(blob) > 1024, "the gapped chart must not be empty or truncated"
+    published = next(
+        item
+        for item in manifest["charts"]
+        if item["kind"] == make_charts.TIMESERIES_KIND
+        and item.get("series_id") == GAP_SERIES_ID
+    )
+    assert published["gaps"] == objects[0:1] or published["gaps"] == [objects[0]]
+
+    # D-10: the x-axis spans the series' own full calendar range, so the absence
+    # is expressed as a break in the line, never as a compressed axis.
+    assert pl.x_limits == (date(2024, 9, 23), date(2026, 9, 20))
+    assert cs.x_limits == pl.x_limits
+    overlay = _overlay_entry_of(document)
+    assert overlay.x_limits == pl.x_limits
+
+
+def test_multi_series_csv_produces_no_spurious_band(tmp_out: Path) -> None:
+    """The Pitfall 4 regression: a gapless two-series CSV yields zero gap records.
+
+    This is the exact shape that previously reported a fictitious 365-day hole:
+    both series complete, concatenated in `(series_id, date)` order. If gap
+    detection ever walks the file order instead of one series' own dates, this
+    fails.
+    """
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+
+    for entry in document.charts:
+        assert entry.gaps == (), (
+            f"{entry.kind}/{entry.series_id}: a complete series has no gap, and the "
+            "boundary between two series is not one"
+        )
+    assert _gap_objects(manifest) == []
+    for line in _overlay_entry_of(document).series_lines:
+        assert line.gaps == ()
+
+
+def test_absent_day_breaks_the_line_and_is_not_bridged(tmp_path: Path) -> None:
+    """D-12: an absent calendar day is a break, never a bridge.
+
+    A bridging implementation inserts the five missing days (or interpolates
+    across them), so the point count is the assertion that bites: the holed
+    series must be exactly five observations short of the complete one.
+    """
+    out_dir, spec_path = _run_gap_pair(tmp_path)
+    document = _plan(out_dir, spec_path)
+    pl = _timeseries_entry_of(document, TRACER_SERIES_ID)
+    cs = _timeseries_entry_of(document, GAP_SERIES_ID)
+
+    assert len(cs.points) == len(pl.points) - GAP_DAYS
+    missing = (date.fromisoformat(GAP_START), date.fromisoformat(GAP_END))
+    for point in cs.points:
+        assert not (missing[0] <= point.date <= missing[1]), (
+            f"no plotted point may exist inside the declared absence: {point.date}"
+        )
+    # The plotted sequences stay aligned with the points, and neither the raw nor
+    # the median line was padded to cover the hole.
+    assert len(cs.raw_values) == len(cs.points)
+    assert len(cs.median_values) == len(cs.points)
+    # And the line really is broken: the render path injects one NaN per absent
+    # day into BOTH sequences, which is the only permitted way to express one.
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    try:
+        make_charts._draw_timeseries(cs, ax, mdates)
+        raw, median_line = ax.get_lines()[0], ax.get_lines()[1]
+        raw_ydata = list(raw.get_ydata())
+        median_ydata = list(median_line.get_ydata())
+        assert len(raw_ydata) == len(cs.points) + GAP_DAYS, (
+            "the raw sequence must carry one NaN per absent day"
+        )
+        assert len(median_ydata) == len(cs.points) + GAP_DAYS
+        nan_positions = [
+            index for index, value in enumerate(raw_ydata) if value != value  # NaN != NaN
+        ]
+        assert len(nan_positions) == GAP_DAYS
+        bands = [patch for patch in ax.patches if patch.get_label() == make_charts.GAP_BAND_LABEL]
+        assert len(bands) == 1, "exactly one 'no data' band for the one gap"
+    finally:
+        plt.close(fig)
+
+
+def test_zero_views_row_is_plotted_not_dropped(tmp_path: Path) -> None:
+    """D-11: a `views=0` row is a reading, not an absence to be second-guessed.
+
+    This is the null-vs-zero boundary rendered. A zero is a real observation, so
+    it stays a plotted point at y=0 and is covered by no gap object; dropping it
+    or turning it into a break would let the chart invent a data outage that
+    fetch_pageviews.py never reported.
+    """
+    out_dir = tmp_path / "zero"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = FIXTURES_DIR.joinpath("series.example.csv").read_text(encoding="utf-8").splitlines()
+    patched: list[str] = []
+    seen = 0
+    for index, line in enumerate(rows):
+        if index > 0 and line.startswith("2025-01-15,") and ",pl-post-przerywany," in line:
+            fields = line.split(",")
+            fields[1] = "0"
+            line = ",".join(fields)
+            seen += 1
+        patched.append(line)
+    assert seen == 1, f"expected exactly one pl row on 2025-01-15, found {seen}"
+    out_dir.joinpath("series.csv").write_text("\n".join(patched) + "\n", encoding="utf-8")
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+    metrics = analyze_trends.build_metrics(spec, str(spec_path), grouped)
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    assert _run_charts(spec_path, out_dir) == 0
+
+    document = _plan(out_dir, spec_path)
+    entry = _timeseries_entry_of(document, TRACER_SERIES_ID)
+    zero_points = [point for point in entry.points if point.date == date(2025, 1, 15)]
+    assert len(zero_points) == 1, "the zero day must still be a plotted point"
+    assert zero_points[0].views == 0
+    assert zero_points[0].views in entry.raw_values
+    assert entry.gaps == (), "a zero is a reading; it is never a gap"
+    for gap in _gap_objects(json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))):
+        assert not (
+            date.fromisoformat(gap["start"]) <= date(2025, 1, 15) <= date.fromisoformat(gap["end"])
+        ), "no gap object may cover a real zero reading"
+
+    # The unpatched series is untouched, so the edit was local to one cell.
+    cs = _timeseries_entry_of(document, GAP_SERIES_ID)
+    assert [point.views for point in cs.points if point.date == date(2025, 1, 15)] != [0]
+
+
+def test_gap_annotation_text_is_in_the_manifest(tmp_path: Path) -> None:
+    """D-13: the band carries the exact text a reader sees, asserted against a literal.
+
+    "no data <start>..<end>" is the string that stops a break being read as the
+    end of the history, so its format is pinned rather than pattern-matched: a
+    separator change or a dropped range is a defect a reader would see and a
+    loose assertion would not.
+    """
+    out_dir, spec_path = _run_gap_pair(tmp_path)
+    document = _plan(out_dir, spec_path)
+    cs = _timeseries_entry_of(document, GAP_SERIES_ID)
+    gap = cs.gaps[0]
+
+    assert gap.label == f"no data {GAP_START}..{GAP_END}"
+    assert gap.label == "no data 2025-05-10..2025-05-14"
+    assert make_charts.gap_annotation_text(
+        date.fromisoformat(GAP_START), date.fromisoformat(GAP_END)
+    ) == "no data 2025-05-10..2025-05-14"
+    assert make_charts.GAP_BAND_LABEL == "no data"
+
+    # The render path draws the band's own text, so the plan object and the image
+    # cannot disagree about what the absence is called.
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    try:
+        make_charts._draw_timeseries(cs, ax, mdates)
+        drawn = [text.get_text() for text in ax.texts]
+        assert "no data 2025-05-10..2025-05-14" in drawn, drawn
+        legend = ax.get_legend()
+        labels = [text.get_text() for text in legend.get_texts()] if legend else []
+        assert make_charts.GAP_BAND_LABEL in labels, labels
+    finally:
+        plt.close(fig)
+
+    # Every published record carries the full quadruple, and no gap object is
+    # ever nulled under the manifest's no-null rule.
+    for record in _gap_objects(
+        json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    ):
+        assert record["series_id"]
+        assert record["start"] and record["end"]
+        assert isinstance(record["days"], int) and record["days"] > 0
+
+
+def test_truncated_median_window_at_a_series_edge_is_not_a_gap(tmp_out: Path) -> None:
+    """A short local window is not an absence: the underlying days are present.
+
+    `rolling_median_7` truncates its window at the first and last point of a
+    series. Under D-12 that must produce no break and no band, because the days
+    behind the short window ARE in series.csv.
+    """
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    for entry in document.charts:
+        assert entry.gaps == ()
+        assert len(entry.median_values) == len(entry.points) or entry.kind == make_charts.GROWTH_KIND
+    assert _gap_objects(manifest) == []
+    first = _timeseries_entry_of(document, TRACER_SERIES_ID)
+    assert len(first.median_values) == len(first.points)
+
+
+def test_gap_text_stays_inside_the_canvas_even_at_a_series_edge(tmp_path: Path) -> None:
+    """A band at the very start or end of a history must not push its label off the image.
+
+    This is a legibility defect turned into a structural guard. The first render
+    of the "no data <range>" annotation centred the text on its band, so a hole
+    in the first sixteen days ran "no data 2024-09-24..2024-10-09" off the LEFT
+    edge of the PNG and a hole in the last sixteen ran the other one off the
+    RIGHT. Both shipped through a green suite: the only thing that could see it
+    was opening the image, which is why this test now measures the text's own
+    window extent against the figure's and needs no human.
+    """
+    out_dir = tmp_path / "edges"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = list(csv.DictReader(FIXTURES_DIR.joinpath("series.example.csv").open(encoding="utf-8")))
+    final_day = date(2026, 9, 20)
+    first_day = date(2024, 9, 23)
+    early = {first_day + timedelta(days=offset) for offset in range(1, 17)}
+    late = {final_day - timedelta(days=offset) for offset in range(1, 17)}
+    kept = [
+        row
+        for row in rows
+        if not (
+            row["series_id"] == GAP_SERIES_ID
+            and date.fromisoformat(row["date"]) in early | late
+        )
+    ]
+    with out_dir.joinpath("series.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["date", "views", "series_id", "project", "article"],
+            lineterminator="\r\n",
+        )
+        writer.writeheader()
+        writer.writerows(kept)
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            analyze_trends.build_metrics(spec, str(spec_path), grouped),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    assert _run_charts(spec_path, out_dir) == 0
+
+    document = _plan(out_dir, spec_path)
+    cs = _timeseries_entry_of(document, GAP_SERIES_ID)
+    assert len(cs.gaps) == 2, "a hole at each end of the history"
+    assert cs.gaps[0].start == date(2024, 9, 24)
+    assert cs.gaps[1].end == date(2026, 9, 19)
+
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=make_charts.FIGURESIZE, dpi=make_charts.DPI)
+    try:
+        make_charts._draw_timeseries(cs, ax, mdates)
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        assert [text.get_text() for text in ax.texts] == [
+            "no data 2024-09-24..2024-10-09",
+            "no data 2026-09-04..2026-09-19",
+        ]
+        for artist in ax.texts:
+            left, bottom, right, top = artist.get_window_extent().bounds
+            assert left >= 0, f"{artist.get_text()!r} runs off the left edge ({left:.1f})"
+            assert right <= width, f"{artist.get_text()!r} runs off the right edge ({right:.1f} of {width})"
+            assert top <= height, f"{artist.get_text()!r} runs off the top ({top:.1f} of {height})"
+            assert bottom >= 0, f"{artist.get_text()!r} runs off the bottom ({bottom:.1f})"
+        # And one legend row, not one per band: two identical "no data" entries
+        # is noise, and the count of absences is already in the manifest.
+        legend = ax.get_legend()
+        labels = [text.get_text() for text in legend.get_texts()] if legend else []
+        assert labels.count(make_charts.GAP_BAND_LABEL) == 1, labels
+    finally:
+        plt.close(fig)
+

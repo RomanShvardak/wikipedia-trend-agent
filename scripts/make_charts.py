@@ -19,7 +19,7 @@ import sys
 import textwrap
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -93,6 +93,18 @@ ANOMALY_METHOD_PHRASE = "anomaly markers"
 # matplotlib's documented way to keep a handle out of the legend without building
 # a proxy artist: the extra series after the first carries this label instead.
 NO_LEGEND_LABEL = "_nolegend_"
+# D-12/D-13: a gapped period is a grey band plus the text a reader needs to tell
+# an absence from the end of the history. RESEARCH verified a labelled `axvspan`
+# produces a real legend entry.
+GAP_BAND_COLOR = "#ADB5BD"
+GAP_BAND_ALPHA = 0.30
+GAP_BAND_LABEL = "no data"
+GAP_TEXT_COLOR = "#495057"
+GAP_TEXT_FONT_SIZE = 7
+# A band whose right edge lies within this fraction of the plot width anchors its
+# text inward from the band's own end, so a hole at the very start or the very
+# end of a history cannot push its own label off the canvas.
+GAP_LABEL_EDGE_FRACTION = 0.25
 # A distinct colour per series, so two lines in the comparison view never share
 # one. Read off the entry's own position, never from a matplotlib cycle that
 # could resynchronize between charts.
@@ -155,6 +167,68 @@ class SeriesPoint:
     views: int | float
 
 
+def gap_annotation_text(start: date, end: date) -> str:
+    """D-13: the exact string a reader sees under a gapped period.
+
+    Named as a function so the format is asserted against one literal rather
+    than pattern-matched at the call site - the text is the reader's only
+    evidence that a break is an absence and not the end of the history.
+    """
+    return f"no data {start.isoformat()}..{end.isoformat()}"
+
+
+@dataclass(frozen=True, slots=True)
+class DataGap:
+    """One absent calendar-day range, tagged with the series that lacks those days.
+
+    D-12: a gap exists only where a calendar day is absent from series.csv
+    entirely. The tag is what lets the comparison view say WHICH series is
+    missing days - an untagged band on a two-line overlay would be an
+    unattributed absence, which is the misreading D-13 exists to prevent.
+    """
+
+    series_id: str
+    start: date
+    end: date
+
+    @property
+    def days(self) -> int:
+        """The inclusive day count, `end - start + 1`."""
+        return (self.end - self.start).days + 1
+
+    @property
+    def label(self) -> str:
+        """The band's own annotation, so plan and image cannot disagree."""
+        return gap_annotation_text(self.start, self.end)
+
+
+def calendar_gaps(points: Sequence[SeriesPoint]) -> tuple[tuple[date, date], ...]:
+    """Every range of calendar days absent from one series' own rows (D-12).
+
+    Scoped strictly to the series handed in, and RESEARCH Pitfall 4 is why that
+    is load-bearing rather than incidental. `series.csv` is sorted by
+    `(series_id, date)`, so the last date of one series is immediately followed
+    by the first date of the next: walking the raw file order reports a 365-day
+    "gap" between two completely healthy series, and a year-long grey band is
+    painted across a chart that has no absence at all.
+
+    Each emitted pair is `(first missing day, last missing day)` - the absent
+    days themselves, not the two present days bracketing them. A truncated
+    rolling-median window at a series edge is NOT a gap: the underlying days are
+    present, only the local window is short.
+
+    The result is sorted and de-duplicated, so two callers cannot disagree about
+    ordering and a repeated range cannot be counted twice.
+    """
+    ordered = sorted(point.date for point in points)
+    found: set[tuple[date, date]] = set()
+    for previous, current in zip(ordered, ordered[1:]):
+        if current - previous == timedelta(days=1):
+            continue
+        found.add((previous + timedelta(days=1), current - timedelta(days=1)))
+    return tuple(sorted(found))
+
+
 @dataclass(frozen=True, slots=True)
 class GrowthBar:
     """One growth window's plotted value, copied from metrics.json (D-02/D-03)."""
@@ -181,10 +255,17 @@ class SeriesLine:
     points: tuple[SeriesPoint, ...]
     raw_values: tuple[int | float, ...]
     median_values: tuple[float, ...]
+    # The line's own absent-day ranges, scoped to this series (D-12). Render-only
+    # like every field here; the view publishes the tagged union, never a second
+    # copy of the per-line geometry.
+    gaps: tuple[DataGap, ...]
     # The line's own anomalies, verbatim from its metrics series. Render-only,
     # like every field here: on the comparison view a marker belongs to a line,
     # so each line carries its own rather than the view carrying one flat pool.
     anomalies: tuple[dict[str, object], ...]
+    # The line's own reported calendar range; the view's axis is the union of
+    # these, so an absence never compresses the scale (D-10).
+    x_limits: tuple[date, date]
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,11 +290,15 @@ class ChartEntry:
     points: tuple[SeriesPoint, ...]
     raw_values: tuple[int | float, ...]
     median_values: tuple[float, ...]
-    gaps: tuple[tuple[date, date], ...]
+    gaps: tuple[DataGap, ...]
     anomalies: tuple[dict[str, object], ...]
     anomalies_drawn: int
     yscale: str
     y_limits: tuple[float, float]
+    # D-10: the date-axis domain, read from the series' own metrics `period`
+    # block, on the two kinds that have a date axis. `None` on the growth chart,
+    # whose x axis is a percentage axis - and never serialized either way.
+    x_limits: tuple[date, date] | None
     bars: tuple[GrowthBar, ...]
     note: str | None
     subtitle: str
@@ -345,6 +430,34 @@ def _spec_series_index(spec: Mapping[str, Any]) -> dict[str, int]:
     return index_by_id
 
 
+def _iso_date_or_none(value: Any) -> date | None:
+    """Parse a contract `YYYY-MM-DD` string, or return None rather than raising."""
+    if not isinstance(value, str) or len(value) != 10:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _period_bounds(node: Mapping[str, Any], points: Sequence[SeriesPoint]) -> tuple[date, date]:
+    """D-10: the date-axis domain - the series' reported period, not its extremes.
+
+    "Zero-fill" means the axis has no hole, so the domain is the full calendar
+    range even across an absence; the line itself still stops where the data
+    stops. `period` is the contract's own statement of that range, so reading it
+    is a copy rather than a re-derivation; the first and last plotted points are
+    the fallback, and they can only ever be narrower than the truth, never wider.
+    """
+    period = node.get("period")
+    if isinstance(period, Mapping):
+        start = _iso_date_or_none(period.get("start"))
+        end = _iso_date_or_none(period.get("end"))
+        if start is not None and end is not None and end >= start:
+            return (start, end)
+    return (points[0].date, points[-1].date)
+
+
 def _anomaly_list(
     node: Mapping[str, Any], points: Sequence[SeriesPoint], series_id: str
 ) -> tuple[dict[str, object], ...]:
@@ -414,6 +527,11 @@ def _timeseries_entry(
     points = tuple(SeriesPoint(observation.date, observation.views) for observation in observations)
     raw_values = tuple(point.views for point in points)
     anomalies = _anomaly_list(node, points, series_id)
+    # D-12: the gap walk runs on THIS series' own points, never on the
+    # concatenated file order (RESEARCH Pitfall 4).
+    gaps = tuple(
+        DataGap(series_id, start, end) for start, end in calendar_gaps(points)
+    )
     # D-14: the floor is the literal 0.0, never a computed value, so no axis can
     # ever imply negative views.
     return ChartEntry(
@@ -428,7 +546,7 @@ def _timeseries_entry(
         points=points,
         raw_values=raw_values,
         median_values=tuple(rolling_median_7(raw_values)),
-        gaps=(),
+        gaps=gaps,
         anomalies=anomalies,
         # The single definition of this field, for every entry of every kind: it
         # counts the list it travels with. The growth entry below carries an
@@ -440,6 +558,7 @@ def _timeseries_entry(
         bars=(),
         note=None,
         subtitle=_subtitle(label, len(anomalies)),
+        x_limits=_period_bounds(node, points),
     )
 
 
@@ -566,6 +685,8 @@ def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
         anomalies_drawn=0,
         yscale="linear",
         y_limits=_growth_value_limits(bars),
+        # No date axis on this chart, so there is no D-10 domain to publish.
+        x_limits=None,
         bars=bars,
         note=None,
         subtitle=f"{label} - {GROWTH_METHOD_PHRASE}",
@@ -592,11 +713,18 @@ def _overlay_entry(
             points=entry.points,
             raw_values=entry.raw_values,
             median_values=entry.median_values,
+            gaps=entry.gaps,
             anomalies=entry.anomalies,
+            x_limits=entry.x_limits or (entry.points[0].date, entry.points[-1].date),
         )
         for entry in per_series
     )
     anomalies = tuple(anomaly for line in lines for anomaly in line.anomalies)
+    # D-10 on the comparison view: the domain is the union of the lines' own
+    # reported ranges, so one series' absence never compresses another's scale.
+    gaps = tuple(gap for line in lines for gap in line.gaps)
+    start = min(line.x_limits[0] for line in lines)
+    end = max(line.x_limits[1] for line in lines)
     # D-14 applied to the overlay as a timeseries axes - which is what it is.
     # One shared ceiling over every series, so the axis is comparable.
     largest = max(max(line.raw_values) for line in lines)
@@ -617,7 +745,9 @@ def _overlay_entry(
         points=(),
         raw_values=(),
         median_values=(),
-        gaps=(),
+        # The tagged union of the lines' own absences, so a reader of the
+        # comparison view is never left guessing which series is missing days.
+        gaps=gaps,
         anomalies=anomalies,
         anomalies_drawn=len(anomalies),
         yscale="linear",
@@ -626,6 +756,7 @@ def _overlay_entry(
         note=OVERLAY_NOTE,
         subtitle=f"{OVERLAY_LABEL} - {OVERLAY_METHOD_PHRASE}"
         + (f" / {ANOMALY_METHOD_PHRASE}" if anomalies else ""),
+        x_limits=(start, end),
     )
 
 
@@ -691,6 +822,115 @@ def build_chart_plan(
     )
 
 
+def _day_sequence(start: date, end: date) -> list[date]:
+    """Every calendar day from `start` to `end`, inclusive."""
+    return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
+
+
+def _plotted_coordinates(
+    points: Sequence[SeriesPoint],
+    values: Sequence[int | float],
+    gaps: Sequence[DataGap],
+    mdates: Any,
+) -> tuple[list[float], list[int | float]]:
+    """The x positions and y values to draw, with a NaN standing in for each absence.
+
+    D-12/D-13: a NaN is the only permitted expression of a missing calendar day.
+    matplotlib breaks a line at a NaN with no interpolation, so the reader sees
+    the break; a bridging implementation would draw a straight line across the
+    hole, which is the same fabrication `null != 0` exists to prevent. The NaNs
+    are render-only - they are never written to the manifest, never labelled and
+    never counted as observations.
+
+    `values` are the series' own real values, copied element for element. A
+    `views=0` row passes through untouched (D-11): a zero is a reading, and
+    only an ABSENT day is a NaN here.
+    """
+    x_numbers: list[float] = []
+    y_values: list[int | float] = []
+    gap_index = 0
+    for point, value in zip(points, values):
+        # Emit every absence that closes before this point, in order. A point can
+        # never fall inside its own series' gap - those days are absent by
+        # definition - so this is the only place a NaN belongs.
+        while gap_index < len(gaps) and gaps[gap_index].end < point.date:
+            for day in _day_sequence(gaps[gap_index].start, gaps[gap_index].end):
+                x_numbers.append(mdates.date2num(day))
+                y_values.append(float("nan"))
+            gap_index += 1
+        x_numbers.append(mdates.date2num(point.date))
+        y_values.append(value)
+    return x_numbers, y_values
+
+
+def _gap_label_anchor(
+    start_number: float, end_number: float, domain_start: float, domain_span: float
+) -> tuple[float, str]:
+    """Where the band's text sits, and how it hangs off that point.
+
+    A band near either edge of the plot anchors INWARD on the band itself; a band
+    in the middle is centred on it. This is 05-04's clipping failure turned into
+    a rule: the first render of this annotation ran "no data 2024-09-24..2024-10-09"
+    off the left edge of the image and "no data 2026-09-04..2026-09-19" off the
+    right, because both were centred on a band that sat almost at the axis end.
+    No structural assertion could see it - only opening the PNG did.
+    """
+    end_fraction = (end_number - domain_start) / domain_span
+    if end_fraction < GAP_LABEL_EDGE_FRACTION:
+        return end_number, "left"
+    if end_fraction > 1.0 - GAP_LABEL_EDGE_FRACTION:
+        return start_number, "right"
+    return (start_number + end_number) / 2.0, "center"
+
+
+def _draw_gap_bands(
+    ax: Any, gaps: Sequence[DataGap], mdates: Any, domain: tuple[date, date]
+) -> None:
+    """D-13: a labelled grey band plus its date range, once per distinct absence.
+
+    The band is what stops a break being read as the end of the history, and the
+    text is what says which days are missing. `axvspan` is de-duplicated by
+    range: when two series are absent over the same days the view draws one band
+    at one alpha, and the manifest keeps both tagged records so the attribution
+    survives. Only the first band is labelled - two identical "no data" legend
+    rows on a chart with two absences is noise, and the count of absences is
+    already in the manifest.
+    """
+    domain_start = mdates.date2num(domain[0])
+    domain_span = mdates.date2num(domain[1]) - domain_start
+    drawn: set[tuple[date, date]] = set()
+    labelled = False
+    for gap in gaps:
+        if (gap.start, gap.end) in drawn:
+            continue
+        drawn.add((gap.start, gap.end))
+        start_number = mdates.date2num(gap.start)
+        end_number = mdates.date2num(gap.end)
+        ax.axvspan(
+            start_number,
+            end_number,
+            color=GAP_BAND_COLOR,
+            alpha=GAP_BAND_ALPHA,
+            label=GAP_BAND_LABEL if not labelled else NO_LEGEND_LABEL,
+        )
+        labelled = True
+        anchor, alignment = _gap_label_anchor(start_number, end_number, domain_start, domain_span)
+        # The y anchor is an axes fraction and the alignment flips with the
+        # band's position, so the text stays inside the plot wherever the band
+        # falls - the clipping failure 05-04 hit with the n/a reason.
+        ax.annotate(
+            gap.label,
+            xy=(anchor, 0.0),
+            xycoords=("data", "axes fraction"),
+            xytext=(0, 4),
+            textcoords="offset points",
+            ha=alignment,
+            va="bottom",
+            fontsize=GAP_TEXT_FONT_SIZE,
+            color=GAP_TEXT_COLOR,
+        )
+
+
 def _draw_anomaly_marks(ax: Any, anomalies: Sequence[Mapping[str, Any]], labelled: bool) -> None:
     """D-08: one vertical segment per anomaly, between the contract's own numbers.
 
@@ -738,18 +978,30 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     reader can see. D-14's zero floor is a timeseries rule and is applied here,
     off the entry's own limits.
     """
-    x_values = mdates.date2num([point.date for point in entry.points])
-    ax.plot(x_values, entry.raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=RAW_LINE_LABEL)
-    ax.plot(
-        x_values, entry.median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
+    x_values, raw_values = _plotted_coordinates(
+        entry.points, entry.raw_values, entry.gaps, mdates
     )
+    _, median_values = _plotted_coordinates(
+        entry.points, entry.median_values, entry.gaps, mdates
+    )
+    ax.plot(x_values, raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=RAW_LINE_LABEL)
+    ax.plot(
+        x_values, median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
+    )
+    _draw_gap_bands(ax, entry.gaps, mdates, entry.x_limits or (
+        entry.points[0].date, entry.points[-1].date
+    ))
     _draw_anomaly_marks(ax, entry.anomalies, labelled=True)
     # D-14: an explicit zero floor, timeseries axes only. A growth chart must
     # never receive this call - it would erase a negative bar (RESEARCH
     # Pitfall 1).
     ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
-    # D-10: the axis spans the full calendar range; only rows present in
-    # series.csv are plotted, and a views=0 row is drawn at face value (D-11).
+    # D-10: the axis spans the full calendar range the series reports, so the
+    # scale itself has no hole; the absence is expressed as a break in the line
+    # plus a band, never as a compressed axis. Only rows present in series.csv
+    # are plotted, and a views=0 row is drawn at face value (D-11).
+    assert entry.x_limits is not None, "a timeseries chart always has a date axis"
+    ax.set_xlim(mdates.date2num(entry.x_limits[0]), mdates.date2num(entry.x_limits[1]))
     ax.xaxis_date()
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
@@ -766,15 +1018,20 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     (D-14).
     """
     for index, line in enumerate(entry.series_lines):
-        x_values = mdates.date2num([point.date for point in line.points])
+        x_values, raw_values = _plotted_coordinates(
+            line.points, line.raw_values, line.gaps, mdates
+        )
         ax.plot(
             x_values,
-            line.raw_values,
+            raw_values,
             lw=0.9,
             alpha=0.8,
             color=OVERLAY_COLOR_CYCLE[index % len(OVERLAY_COLOR_CYCLE)],
             label=line.label,
         )
+    _draw_gap_bands(
+        ax, entry.gaps, mdates, entry.x_limits or (entry.points[0].date, entry.points[-1].date)
+    )
     # Each line draws its own markers, so an anomaly stays attached to the series
     # it belongs to; the legend names them once for the whole chart.
     drew_any = False
@@ -782,6 +1039,10 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
         _draw_anomaly_marks(ax, line.anomalies, labelled=not drew_any)
         drew_any = drew_any or bool(line.anomalies)
     ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
+    # D-10: the union of the lines' reported ranges, so the scale has no hole
+    # even where a series is absent.
+    assert entry.x_limits is not None, "the comparison view always has a date axis"
+    ax.set_xlim(mdates.date2num(entry.x_limits[0]), mdates.date2num(entry.x_limits[1]))
     ax.xaxis_date()
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
@@ -937,6 +1198,23 @@ def _bar_payload(bar: GrowthBar) -> dict[str, object]:
     return payload
 
 
+def _gap_payload(gap: DataGap) -> dict[str, object]:
+    """Serialize one absent-day range under the charts.v1 no-null rule.
+
+    `series_id` is what makes the record attributable: on the comparison view the
+    same range can be absent for one series and present for the other, and an
+    untagged band would claim an absence nobody had. `days` is `end - start + 1`,
+    the inclusive count a reader would count by hand. No field here is ever
+    nulled - an absence is a fact with four parts, not a missing key.
+    """
+    return {
+        "series_id": gap.series_id,
+        "start": gap.start.isoformat(),
+        "end": gap.end.isoformat(),
+        "days": gap.days,
+    }
+
+
 def _plotted_point_count(entry: ChartEntry) -> int:
     """How many observations this chart draws.
 
@@ -964,7 +1242,7 @@ def _entry_payload(entry: ChartEntry) -> dict[str, object]:
         "yscale": entry.yscale,
         "y_limits": [entry.y_limits[0], entry.y_limits[1]],
         "points": _plotted_point_count(entry),
-        "gaps": [[start.isoformat(), end.isoformat()] for start, end in entry.gaps],
+        "gaps": [_gap_payload(gap) for gap in entry.gaps],
         "anomalies_drawn": entry.anomalies_drawn,
         "subtitle": entry.subtitle,
     }
