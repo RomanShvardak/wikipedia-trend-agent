@@ -175,6 +175,10 @@ class PropertyResult:
     passed: bool
     detail: str = ""
     offending_token: str | None = None
+    # True when the property PASSED because there was nothing to check. A vacuous
+    # pass is printed as a NOTE so it is visible in the transcript rather than
+    # indistinguishable from a real one.
+    vacuous: bool = False
     excerpt: str = ""
 
 
@@ -384,6 +388,7 @@ def check_low_is_hypothesis(text: str, metrics: dict[str, Any]) -> PropertyResul
             name="low_is_hypothesis",
             passed=True,
             detail="no low-confidence series to check",
+            vacuous=True,
         )
 
     sentences = [part.strip() for part in _SENTENCE_SPLIT.split(text) if part.strip()]
@@ -653,6 +658,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"PASS {result.name}")
         else:
             print(f"FAIL {result.name}: {result.detail}")
+    for result in report.results:
+        if result.vacuous:
+            print(f"NOTE {result.name}: {result.detail}")
 
     for result in failures:
         stub = _write_stub(report, result, Path(args.out))
