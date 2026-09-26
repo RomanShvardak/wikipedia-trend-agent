@@ -191,6 +191,12 @@ classification for the requested chunk.
 - `tests/fixtures/series.gaps.example.csv` — a per-series internal hole, so the
   `no data` band is testable without the `out/series.csv` sort-boundary
   artifact.
+- `tests/fixtures/metrics.low-confidence.example.json` - the document that
+  reaches `confidence: "low"`, so the hypothesis framing is testable from
+  committed data rather than only from an in-test edit (plan 06-02). It pins a
+  document state, NOT a regeneration: no committed `series.csv` scores `low`,
+  and its `confidence_reasons` is re-derived through
+  `analyze_trends.score_confidence` by the test rather than asserted by hand.
 - `tests/test_contracts.py` — enforcement: null-never-0-with-reason, finite
   numbers, enums, ranges, and the no-rollups rule.
 

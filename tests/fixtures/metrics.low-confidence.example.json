@@ -1,0 +1,135 @@
+{
+  "spec_name": "intermittent_fasting_pl_cs",
+  "as_of": "2026-09-20",
+  "generated_from": "tests/fixtures/spec.example.json",
+  "series": [
+    {
+      "series_id": "pl-post-przerywany",
+      "project": "pl.wikipedia",
+      "article": "Post_przerywany",
+      "label": "Польська: інтервальне голодування",
+      "language": "pl",
+      "total_views": 2394,
+      "avg_daily_views": 26.6,
+      "period": {
+        "start": "2026-06-23",
+        "end": "2026-09-20",
+        "days": 90
+      },
+      "growth": {
+        "m3": {
+          "pct": null,
+          "abs": null,
+          "start": "2026-06-22",
+          "end": "2026-09-20",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
+        },
+        "y1": {
+          "pct": null,
+          "abs": null,
+          "start": "2025-09-21",
+          "end": "2026-09-20",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
+        },
+        "y2": {
+          "pct": null,
+          "abs": null,
+          "start": "2024-09-21",
+          "end": "2026-09-20",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
+        }
+      },
+      "anomaly_share": 0.0,
+      "trend_direction": "inconclusive",
+      "confidence": "low",
+      "confidence_reasons": [
+        "period below 91 days",
+        "monthly 30-day views below 1000",
+        "no anomalies detected",
+        "clean 1-year growth unavailable",
+        "low confidence: treat the reading as a hypothesis"
+      ],
+      "seasonality": {
+        "months": [],
+        "note": "fewer than two aligned 365-day halves are available"
+      },
+      "anomalies": []
+    },
+    {
+      "series_id": "cs-pust-prerusovany",
+      "project": "cs.wikipedia",
+      "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
+      "label": "Чеська: інтервальне голодування",
+      "language": "cs",
+      "total_views": 992628,
+      "avg_daily_views": 1363.5,
+      "period": {
+        "start": "2024-09-23",
+        "end": "2026-09-20",
+        "days": 728
+      },
+      "growth": {
+        "m3": {
+          "pct": 5.7,
+          "abs": 91,
+          "start": "2026-06-22",
+          "end": "2026-09-20",
+          "clean": {
+            "pct": 5.7,
+            "abs": 91
+          }
+        },
+        "y1": {
+          "pct": 30.8,
+          "abs": 364,
+          "start": "2025-09-21",
+          "end": "2026-09-20",
+          "clean": {
+            "pct": 30.8,
+            "abs": 364
+          }
+        },
+        "y2": {
+          "pct": null,
+          "abs": null,
+          "start": "2024-09-21",
+          "end": "2026-09-20",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
+        }
+      },
+      "anomaly_share": 0.0,
+      "trend_direction": "up",
+      "confidence": "high",
+      "confidence_reasons": [
+        "period at least 91 days",
+        "monthly 30-day views at least 10000",
+        "no anomalies detected"
+      ],
+      "seasonality": {
+        "months": [],
+        "note": "no recurring peak months identified"
+      },
+      "anomalies": []
+    }
+  ]
+}

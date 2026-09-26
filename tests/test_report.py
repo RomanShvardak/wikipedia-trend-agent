@@ -222,18 +222,36 @@ def _section_order(text: str, language: str) -> list[int]:
     ]
 
 
-def _trust_line(text: str, label: str) -> str | None:
+def _section_body(text: str, language: str, key: str) -> str:
+    """The rendered body of one frozen section, from its heading to the next `## `.
+
+    Scoped rather than whole-document on purpose: «Обмеження та припущення»
+    renders a `- {label}: {seasonality note}` bullet in the same shape as a
+    «Наскільки можна довіряти» bullet, so a whole-document search for
+    `- {label}:` finds two lines and cannot say which section either is in.
+    """
+    tokens = build_report.report_tokens(language)
+    start = text.index(f"## {tokens[key]}")
+    remainder = text[start + 1 :]
+    end = remainder.find("\n## ")
+    return remainder if end == -1 else remainder[:end]
+
+
+def _trust_line(text: str, label: str, language: str) -> str | None:
     """The one rendered «Наскільки можна довіряти» bullet for `label`, or None.
 
     Keyed on the label followed by a colon, which is the renderer's own shape
-    for a trust bullet (`- {label}: {level} — {reasons}`), so the assertion is
-    about that one line rather than about the whole document. `md_cell` may have
-    escaped the label, so the caller passes the label already in its rendered
-    form; a label the renderer altered is a separate edge (the GFM-escaping
-    test), not this one.
+    for a trust bullet (`- {label}: {level} — {reasons}`), and searched ONLY
+    inside the trust section - see `_section_body`. The label is passed in its
+    rendered form; a label the renderer escaped is a separate edge (the
+    GFM-escaping test), not this one.
     """
     prefix = f"- {label}:"
-    matches = [line for line in text.splitlines() if line.startswith(prefix)]
+    matches = [
+        line
+        for line in _section_body(text, language, "trust").splitlines()
+        if line.startswith(prefix)
+    ]
     assert len(matches) <= 1, f"{len(matches)} trust lines for {label!r}: {matches!r}"
     return matches[0] if matches else None
 
@@ -674,7 +692,7 @@ def test_low_confidence_series_is_framed_as_a_hypothesis(tmp_out: Path) -> None:
         assert localized_hypothesis_reason in text, (
             f"{node['series_id']}: the report must localize the hypothesis reason"
         )
-        line = _trust_line(text, str(node["label"]))
+        line = _trust_line(text, str(node["label"]), language)
         assert line is not None, f"no «{node['series_id']}» trust line was rendered"
         assert hypothesis_token in line, (
             f"a 'low' series is stated as a conclusion: {line!r} carries no "
@@ -685,7 +703,7 @@ def test_low_confidence_series_is_framed_as_a_hypothesis(tmp_out: Path) -> None:
         )
 
     for node in concluded:
-        line = _trust_line(text, str(node["label"]))
+        line = _trust_line(text, str(node["label"]), language)
         assert line is not None, f"no «{node['series_id']}» trust line was rendered"
         assert hypothesis_token not in line, (
             f"{node['series_id']} is {node['confidence']!r} and must be stated as a "
