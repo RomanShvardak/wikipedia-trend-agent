@@ -4,20 +4,37 @@ The fixture plus these tests pin the ANAL-06 single source of truth:
 the full D-03 field set, `pct: null` never-0 semantics (a null pct always
 carries a reason), enums/ranges, and the no-cross-series-rollups rule.
 
-No network and no matplotlib/pandas/requests/numpy anywhere in this file.
-Imports `common` through the conftest.py sys.path shim (plan 01 artifact).
+Plan 05-07 added the `charts.v1` section: a document-completeness test, a
+field-drift test bound to the real renderer, and a cross-fixture key-set test
+for the spike-injected metrics fixture. The drift test genuinely renders, so
+this file now imports `make_charts` — whose matplotlib import lives INSIDE its
+render function, so the module-level import below pulls no rendering backend,
+and the assertions are on the manifest document and the fixture shape only,
+never on a PNG's bytes or pixels.
+
+No network anywhere, and no direct pandas/requests/numpy import.
+Imports `common` and `make_charts` through the conftest.py sys.path shim
+(plan 01 artifact).
 """
 from __future__ import annotations
 
+import json
 import math
+from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import make_charts
 import resolve_articles
 from common import load_spec
 
 METRICS_EXAMPLE = Path(__file__).resolve().parent / "fixtures" / "metrics.example.json"
+METRICS_ANOMALIES_EXAMPLE = (
+    Path(__file__).resolve().parent / "fixtures" / "metrics.anomalies.example.json"
+)
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 CONTRACTS_DOC = Path(__file__).resolve().parents[1] / "references" / "CONTRACTS.md"
 SKILL_DOC = Path(__file__).resolve().parents[1] / "SKILL.md"
 
@@ -283,3 +300,347 @@ def test_frozen_spec_and_metrics_fixture_key_sets_remain_unchanged(
     )
     assert set(metrics) == {"spec_name", "as_of", "generated_from", "series"}
     assert metrics["spec_name"] == spec["name"]
+
+
+# --- Plan 05-07 Task 3: charts.v1 is a frozen contract, so freeze it here ---
+
+
+def _render_two_series_manifest(tmp_out: Path) -> dict[str, Any]:
+    """Render the committed two-series fixture into tmp_out and return charts.json.
+
+    The fixtures are inputs, never scratch files, so the committed
+    `series.example.csv` and `metrics.example.json` are copied verbatim: the
+    two-series golden already matches `spec.example.json` exactly, so no
+    filtering is needed and the manifest this test reads is the one a real
+    `make_charts.py` run against the golden inputs produces.
+    """
+    tmp_out.joinpath("series.csv").write_bytes(
+        FIXTURES_DIR.joinpath("series.example.csv").read_bytes()
+    )
+    tmp_out.joinpath("metrics.json").write_bytes(
+        FIXTURES_DIR.joinpath("metrics.example.json").read_bytes()
+    )
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert make_charts.main(["--spec", str(spec_path), "--out", str(tmp_out)]) == 0
+    return json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
+
+
+# The frozen charts.v1 top-level surface: exactly these seven, no more.
+CHARTS_V1_TOP_LEVEL = {
+    "contract_version",
+    "spec_name",
+    "as_of",
+    "language",
+    "generated_from",
+    "metrics_sha256",
+    "charts",
+}
+
+# The frozen per-chart union, as a CEILING. No single entry carries all 18; the
+# names partition 11 always-emitted / 6 kind-or-mode-conditional / 1
+# value-conditional, and this set is the union of those partitions.
+CHARTS_V1_UNION = {
+    # always emitted (11)
+    "kind",
+    "label",
+    "language",
+    "filename",
+    "yscale",
+    "y_limits",
+    "points",
+    "gaps",
+    "anomalies_drawn",
+    "subtitle",
+    "log_masked_points",
+    # owned by a kind or a mode (6)
+    "series_id",
+    "spec_index",
+    "bars",
+    "series_ids",
+    "note",
+    "log_note",
+    # owned by a value (1) - present iff the entry has a date axis
+    "x_limits",
+}
+
+# 05-02 froze the no-null rule, and the three partitions fall straight out of
+# it: a key whose value is null or meaningless for that kind is OMITTED, so a
+# test that demanded all 18 on every entry would fail a correct emitter on its
+# first default run. Each partition therefore asserts only what the phase's own
+# emission rules establish, and names the rule in its failure message.
+CHARTS_V1_ALWAYS = {
+    "kind",
+    "label",
+    "language",
+    "filename",
+    "yscale",
+    "y_limits",
+    "points",
+    "gaps",
+    "anomalies_drawn",
+    "subtitle",
+    "log_masked_points",
+}
+CHARTS_V1_PER_KIND = {
+    # 05-02 forbids emitting a null, and 05-03 gives the overlay
+    # series_id = None and no single spec.series[] position, so the overlay
+    # publishes neither key.
+    "timeseries": {"series_id", "spec_index"},
+    # 05-02 leaves bars = () on the non-growth kinds and 05-04 populates it
+    # only for growth, so it is absent elsewhere rather than null.
+    "growth": {"series_id", "spec_index", "bars"},
+    # series_ids/note are overlay-only for the same null-omission reason;
+    # the emitter guards note with `note is not None`, not a kind test.
+    "overlay": {"series_ids", "note"},
+}
+
+
+def test_charts_v1_contract_section_is_complete() -> None:
+    """CONTRACTS.md section 7 exists and states the whole frozen surface.
+
+    A deletion of section 7, or a rewrite that drops any one of these markers,
+    fails here. The `## Versioning` block this plan is discharging is
+    deliberately NOT re-asserted here: it is the rule, not the contract.
+    """
+    text = CONTRACTS_DOC.read_text(encoding="utf-8")
+
+    for marker in (
+        # the section and its version
+        "## 7. `charts.json` — `charts.v1`",
+        "charts.v1",
+        "contract_version",
+        "metrics_sha256",
+        "generated_from",
+        # the three kinds and the inventory
+        "timeseries",
+        "growth",
+        "overlay",
+        "2N+1",
+        # the deterministic filename rule
+        "chart_<series_id>_<kind>.png",
+        "chart_overlay.png",
+        "series_lines",
+        # the never-recompute rule
+        "avg_daily_views",
+        "clean.pct",
+        "anomalies[]",
+        "7-day rolling median",
+        "never recomputes",
+        # axis / null / log disclosure
+        "nonpositive=\"mask\"",
+        "log_masked_points",
+        "log_note",
+        "bar_null",
+        "x_limits",
+        # the 18-key partition, stated as a partition
+        "Always emitted (11)",
+        "Owned by a kind or a mode (6)",
+        "Owned by a value (1)",
+        # integrity wording, atomicity, exit table, CLI, fixtures
+        "integrity and staleness mechanism",
+        "caller-serialized",
+        "last completed atomic replace wins",
+        "--log-scale",
+        "No test may reach the network",
+    ):
+        assert marker in text, f"charts.v1 contract must document {marker!r}"
+
+
+def test_charts_json_emits_only_documented_fields(tmp_out: Path, metrics) -> None:
+    """A rendered manifest matches CONTRACTS.md section 7's documented field list.
+
+    Binds the document to the real renderer, and fails in BOTH drift
+    directions: an emitted field section 7 does not document, and a
+    documented field the emitter stops writing. Asserted on the manifest
+    document only - never on PNG bytes or pixels, which are not a stable
+    surface across matplotlib/freetype versions.
+    """
+    manifest = _render_two_series_manifest(tmp_out)
+
+    # Exactly the seven documented top-level keys: no eighth field.
+    assert set(manifest) == CHARTS_V1_TOP_LEVEL, (
+        f"charts.json top-level keys must be exactly {sorted(CHARTS_V1_TOP_LEVEL)}, "
+        f"got {sorted(manifest)} - an undocumented field is drift the next phase "
+        "would build on"
+    )
+    assert manifest["contract_version"] == "charts.v1"
+
+    charts = manifest["charts"]
+    for entry in charts:
+        kind = entry["kind"]
+        # Drift OUT of the document: the union is the ceiling of what any
+        # conforming entry may ever carry, so this half is unconditional.
+        assert set(entry) <= CHARTS_V1_UNION, (
+            f"{kind} {entry.get('filename')}: keys outside the documented 18-name "
+            f"union: {sorted(set(entry) - CHARTS_V1_UNION)}"
+        )
+        assert {"kind", "filename"} <= set(entry), (
+            f"{entry.get('filename')}: kind and filename identify a chart and are "
+            "never optional"
+        )
+        assert "series_lines" not in entry, (
+            "the overlay's per-series render data is render-only (05-03) and must "
+            "never reach charts.json"
+        )
+
+        # Drift OUT of the emitter: presence, but only where the phase's own
+        # emission rules require it. Each omission is named so a future reader
+        # can see why the key is not demanded unconditionally.
+        required = CHARTS_V1_ALWAYS | CHARTS_V1_PER_KIND[kind]
+        assert required <= set(entry), (
+            f"{kind} {entry.get('filename')}: documented keys this kind must carry "
+            f"are missing: {sorted(required - set(entry))}"
+        )
+        if entry["yscale"] == "log":
+            # 05-06: log_note is present exactly when the axis is log.
+            assert "log_note" in entry, (
+                f"{entry.get('filename')}: yscale is log, so log_note must be present"
+            )
+        else:
+            # 05-06 makes log_note a `str | None` that the manifest omits when
+            # null, so a default (linear) run carries it nowhere. Asserting its
+            # presence unconditionally would reject a correct emitter.
+            assert "log_note" not in entry, (
+                f"{entry.get('filename')}: yscale is {entry['yscale']!r}, so log_note "
+                "must be omitted rather than nulled (the charts.v1 no-null rule)"
+            )
+        # 05-07: x_limits is guarded by `x_limits is not None`, not by kind.
+        # The dated kinds carry the D-10 domain; the growth chart has no date
+        # axis and therefore no domain to publish.
+        if kind == "growth":
+            assert "x_limits" not in entry, (
+                "the growth chart's x axis is a percentage axis, so it has no "
+                "date domain and x_limits must be omitted, not nulled"
+            )
+        else:
+            domain = entry["x_limits"]
+            assert isinstance(domain, list) and len(domain) == 2, (
+                f"{entry.get('filename')}: x_limits must publish exactly two bounds, "
+                f"got {domain!r}"
+            )
+            assert all(isinstance(bound, str) for bound in domain), (
+                f"{entry.get('filename')}: x_limits bounds must be ISO date strings, "
+                f"got {domain!r} - a consumer must parse them without a matplotlib import"
+            )
+            start, end = (date.fromisoformat(bound) for bound in domain)
+            assert start <= end, (
+                f"{entry.get('filename')}: x_limits runs backwards, {domain!r}"
+            )
+
+        # The bar object is frozen to the same seven names.
+        for bar in entry.get("bars", []):
+            assert set(bar) <= {
+                "window",
+                "label",
+                "pct",
+                "abs",
+                "base_avg_daily_views",
+                "reason",
+                "bar_null",
+            }, f"undocumented growth-bar key: {sorted(bar)}"
+            assert {"window", "label", "base_avg_daily_views", "bar_null"} <= set(bar), (
+                f"a bar must always carry its window, label, base and null marker, "
+                f"got {sorted(bar)}"
+            )
+            if bar["bar_null"]:
+                # A null growth is marked, never zero, and always says why.
+                assert "pct" not in bar and "reason" in bar, (
+                    "a bar_null bar carries no pct and must carry the contract reason"
+                )
+            else:
+                assert "pct" in bar, "a non-null bar must carry its clean percentage"
+
+    # The 2N+1 inventory, against the golden fixture's own series count.
+    series_count = len(metrics["series"])
+    assert len(charts) == 2 * series_count + 1, (
+        f"section 7's 2N+1 rule requires {2 * series_count + 1} charts for "
+        f"{series_count} series, got {len(charts)}"
+    )
+    assert charts[-1]["kind"] == make_charts.OVERLAY_KIND, (
+        "the overlay is published last, so a consumer can render it as the "
+        "headline without sorting"
+    )
+    # Every published filename names a PNG that exists, one for one.
+    published = {entry["filename"] for entry in charts}
+    on_disk = {png.name for png in tmp_out.glob("*.png")}
+    assert published == on_disk, (
+        f"charts.json names PNGs that do not match the output directory: "
+        f"{sorted(published ^ on_disk)}"
+    )
+    for entry in charts:
+        assert "/" not in entry["filename"] and ".." not in entry["filename"], (
+            f"filename must be a bare relative name, got {entry['filename']!r}"
+        )
+
+
+def test_anomalies_metrics_fixture_matches_the_frozen_key_set(metrics) -> None:
+    """The spike-injected metrics fixture is the golden one, structurally.
+
+    The two differ only in the anomaly-dependent values. Every key set is
+    compared KEY-FOR-KEY against the golden rather than against a count
+    literal, so this tracks the frozen `metrics.v1` contract instead of a
+    number this plan would have to keep re-deriving.
+    """
+    anomalies = load_spec(METRICS_ANOMALIES_EXAMPLE)
+
+    # Same top-level shape as the golden - no field added or dropped.
+    assert set(anomalies) == set(metrics), (
+        f"the anomalies fixture's top-level keys must equal the golden's, got "
+        f"{sorted(set(anomalies) ^ set(metrics))}"
+    )
+
+    # Same series ids in the same order: CONTRACTS.md section 3 - the ids mirror
+    # spec.series[] and consumers must never reorder them.
+    assert [node["series_id"] for node in anomalies["series"]] == [
+        node["series_id"] for node in metrics["series"]
+    ], "the anomalies fixture must keep the golden's series ids in the golden's order"
+
+    for candidate, golden in zip(anomalies["series"], metrics["series"]):
+        assert set(candidate) == set(golden), (
+            f"{golden['series_id']}: the anomalies fixture's per-series key set must "
+            f"equal the golden's, differing on {sorted(set(candidate) ^ set(golden))}"
+        )
+
+    # The same null-never-0 discipline the golden is held to, reusing the same
+    # helper rather than writing a second mechanism.
+    for series in anomalies["series"]:
+        for name in GROWTH_WINDOWS:
+            window = series["growth"][name]
+            _assert_pct_value(window, f"{series['series_id']}.{name}")
+            clean = window.get("clean")
+            if isinstance(clean, dict) and "pct" in clean:
+                _assert_pct_value(clean, f"{series['series_id']}.{name}.clean")
+
+    # No NaN/Infinity float and no "None"/"nan" string - the same walk
+    # test_no_nan_or_inf performs over the golden.
+    for value in _iter_values(anomalies):
+        if isinstance(value, float):
+            assert math.isfinite(value), f"non-finite float in the anomalies fixture: {value!r}"
+        elif isinstance(value, str):
+            assert value not in {"None", "nan"} and "Infinity" not in value, (
+                f"the anomalies fixture leaked {value!r}"
+            )
+
+    # What makes this fixture worth having: the cs series is untouched and so is
+    # byte-identical to the golden, while the pl series carries a real anomaly
+    # the golden's empty list could never make testable.
+    by_id = {node["series_id"]: node for node in anomalies["series"]}
+    golden_by_id = {node["series_id"]: node for node in metrics["series"]}
+    assert by_id["cs-pust-prerusovany"] == golden_by_id["cs-pust-prerusovany"], (
+        "the cs series must be byte-identical to the golden's - the two fixtures "
+        "differ only in the anomaly-dependent values"
+    )
+    assert by_id["pl-post-przerywany"]["anomalies"], (
+        "the pl series must carry a non-empty anomalies[] or the mandatory overlay "
+        "branch is untestable"
+    )
+    assert golden_by_id["pl-post-przerywany"]["anomalies"] == [], (
+        "the golden fixture is expected to have no anomalies; if it now does, the "
+        "pair no longer isolates the anomaly-dependent values"
+    )
+    # The raw/clean divergence that a recomputation would erase.
+    pl = by_id["pl-post-przerywany"]["growth"]["y1"]
+    assert pl["pct"] != pl["clean"]["pct"], (
+        "the y1 window's raw and clean percentages must differ, which is the whole "
+        "reason the never-recompute rule is testable on this fixture"
+    )

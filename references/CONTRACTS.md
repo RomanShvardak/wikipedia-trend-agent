@@ -414,6 +414,16 @@ references; a nested `series_lines` would duplicate `metrics.json` inside the
 manifest for no consumer. A test asserts no entry ever carries a `series_lines`
 key, so the render-only boundary stays a boundary.
 
+#### 7.2.0 The `2N+1` inventory rule
+
+For **N** series the stage publishes exactly **`2N+1`** charts: one `timeseries`
+and one `growth` per series, plus one `overlay` — which is **always** published,
+including at N=1, because a one-series comparison view is still the view a
+reader embeds as the headline. `charts[]` is ordered by `spec.series[]` order,
+with the `timeseries` and `growth` entries of a series adjacent and the overlay
+**last**. Each `filename` in the array names a PNG that exists in the output
+directory, one for one, so a consumer can join the two without a lookup table.
+
 #### 7.2.1 The deterministic filename rule
 
 `filename` is `chart_<series_id>_<kind>.png` for the two per-series kinds, and
