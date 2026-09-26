@@ -73,6 +73,26 @@ OVERLAY_LABEL = "all series compared"
 # that carries no median line would be the exact misrepresentation this phase
 # exists to prevent.
 OVERLAY_METHOD_PHRASE = "raw daily; shared y-axis"
+# D-08: the anomaly marker's geometry. Both endpoints are the anomalies[] entry's
+# own `median` and `value`; nothing here re-derives, rescales or narrows them.
+# RESEARCH Pattern 4 recorded that a real capture produced
+# `{"date": "2025-09-21", "value": 2586, "median": 2189.5}` - a float median,
+# because `statistics.median` returns a float on an even-length local window.
+ANOMALY_COLOR = "#E8590C"
+ANOMALY_LINE_WIDTH = 1.6
+ANOMALY_ZORDER = 3
+# A `value == median` entry is a zero-length segment, which draws nothing at all.
+# A claimed anomaly that renders as an absence is a lie by omission, so the
+# equality additionally gets a marker point.
+ANOMALY_MARKER = "o"
+ANOMALY_MARKER_SIZE = 4.0
+# One token, used both as the legend entry and inside the subtitle, so a reader -
+# and a test - can look for the same word in both places.
+ANOMALY_LEGEND_LABEL = "anomaly"
+ANOMALY_METHOD_PHRASE = "anomaly markers"
+# matplotlib's documented way to keep a handle out of the legend without building
+# a proxy artist: the extra series after the first carries this label instead.
+NO_LEGEND_LABEL = "_nolegend_"
 # A distinct colour per series, so two lines in the comparison view never share
 # one. Read off the entry's own position, never from a matplotlib cycle that
 # could resynchronize between charts.
@@ -161,6 +181,10 @@ class SeriesLine:
     points: tuple[SeriesPoint, ...]
     raw_values: tuple[int | float, ...]
     median_values: tuple[float, ...]
+    # The line's own anomalies, verbatim from its metrics series. Render-only,
+    # like every field here: on the comparison view a marker belongs to a line,
+    # so each line carries its own rather than the view carrying one flat pool.
+    anomalies: tuple[dict[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,9 +316,16 @@ def series_filename(series_id: str, kind: str) -> str:
     return f"chart_{series_id}_{kind}.png"
 
 
-def _subtitle(label: str) -> str:
-    """D-09: the chart names its own method, next to the spec-authored label."""
-    return f"{label} - {METHOD_PHRASE}"
+def _subtitle(label: str, anomalies_drawn: int = 0) -> str:
+    """D-09: the chart names its own method, next to the spec-authored label.
+
+    `anomalies_drawn` decides whether the anomaly token appears: a chart that
+    draws no marker must not claim one, and a chart that draws them must say so.
+    """
+    phrase = METHOD_PHRASE
+    if anomalies_drawn:
+        phrase = f"{METHOD_PHRASE} / {ANOMALY_METHOD_PHRASE}"
+    return f"{label} - {phrase}"
 
 
 def _spec_series_index(spec: Mapping[str, Any]) -> dict[str, int]:
@@ -314,6 +345,64 @@ def _spec_series_index(spec: Mapping[str, Any]) -> dict[str, int]:
     return index_by_id
 
 
+def _anomaly_list(
+    node: Mapping[str, Any], points: Sequence[SeriesPoint], series_id: str
+) -> tuple[dict[str, object], ...]:
+    """Copy metrics.json's `anomalies[]` onto a chart verbatim, after four guards.
+
+    D-08: the drawn marker's two endpoints are this entry's own `median` and its
+    own `value`, so nothing here transforms them - and nothing downstream may
+    either. The chart layer therefore introduces no statistic: no re-estimated
+    z-score, no recomputed MAD, no narrowed median.
+
+    The four refusals each block a claim the picture could not otherwise support:
+    - a missing or non-object entry, so a half-read anomaly is never drawn as a
+      partial marker;
+    - a date that is not literally `YYYY-MM-DD`. Python 3.11's
+      `date.fromisoformat` also accepts the basic "20250512" form, so the shape
+      cannot be delegated to it - this mirrors `analyze_trends._parse_iso_date`.
+    - a `value`/`median` that is not a number, so the axis cannot be handed
+      something it would silently coerce.
+    - a date the series has no row for (T-5-17): a marker over a day the chart
+      does not draw is a claim the picture cannot back.
+
+    `value` and `median` are kept as `int | float` exactly as read. `median` is
+    typed that way in 05-02 and stays that way here: `statistics.median` returns
+    a float for an even-length window, and narrowing one would silently move a
+    drawn coordinate.
+    """
+    raw = node.get("anomalies")
+    if not isinstance(raw, list):
+        raise ChartError(f"anomalies must be a list for series: {series_id}")
+    present = {point.date for point in points}
+    copied: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ChartError(f"anomaly must be an object for series: {series_id}")
+        for field in ("date", "value", "median"):
+            if field not in item:
+                raise ChartError(f"anomaly is missing {field!r} for series: {series_id}")
+        text = item["date"]
+        if not isinstance(text, str) or len(text) != 10 or text[4] != "-" or text[7] != "-":
+            raise ChartError(f"anomaly date is not YYYY-MM-DD: {text!r}")
+        try:
+            when = date.fromisoformat(text)
+        except ValueError as error:
+            raise ChartError(f"anomaly date is not YYYY-MM-DD: {text!r}") from error
+        for field in ("value", "median"):
+            number = item[field]
+            if isinstance(number, bool) or not isinstance(number, (int, float)):
+                raise ChartError(
+                    f"anomaly {field} must be a number for series: {series_id}"
+                )
+        if when not in present:
+            raise ChartError(f"anomaly date is not present in series.csv: {text}")
+        # A shallow copy, so the plan cannot be mutated through the caller's
+        # document while the rendered numbers are already decided.
+        copied.append(dict(item))
+    return tuple(copied)
+
+
 def _timeseries_entry(
     node: Mapping[str, Any],
     observations: Sequence[analyze_trends.Observation],
@@ -324,6 +413,7 @@ def _timeseries_entry(
     label = _require_str(node, "label", "metrics.series entry")
     points = tuple(SeriesPoint(observation.date, observation.views) for observation in observations)
     raw_values = tuple(point.views for point in points)
+    anomalies = _anomaly_list(node, points, series_id)
     # D-14: the floor is the literal 0.0, never a computed value, so no axis can
     # ever imply negative views.
     return ChartEntry(
@@ -339,14 +429,19 @@ def _timeseries_entry(
         raw_values=raw_values,
         median_values=tuple(rolling_median_7(raw_values)),
         gaps=(),
-        anomalies=(),
-        anomalies_drawn=0,
+        anomalies=anomalies,
+        # The single definition of this field, for every entry of every kind: it
+        # counts the list it travels with. The growth entry below carries an
+        # empty list for the same reason it draws no marker, so the identity
+        # holds there too.
+        anomalies_drawn=len(anomalies),
         yscale="linear",
         y_limits=(0.0, float(max(raw_values)) * Y_HEADROOM_FACTOR),
         bars=(),
         note=None,
-        subtitle=_subtitle(label),
+        subtitle=_subtitle(label, len(anomalies)),
     )
+
 
 
 def _growth_bars(
@@ -463,6 +558,10 @@ def _growth_entry(node: Mapping[str, Any], spec_index: int) -> ChartEntry:
         raw_values=(),
         median_values=(),
         gaps=(),
+        # D-08 is a timeseries/overlay rule. A growth chart summarises windows, so
+        # a daily spike drawn there would be a category error; leaving the list
+        # empty (rather than filtering it at the manifest) is what keeps
+        # `anomalies_drawn == len(anomalies)` true for this kind as well.
         anomalies=(),
         anomalies_drawn=0,
         yscale="linear",
@@ -480,7 +579,9 @@ def _overlay_entry(
 
     D-20: one shared *raw* y-axis, never a normalized or rebased one. Each line
     reuses its series' own already-built values, so the comparison view cannot
-    introduce a number with no source in metrics.json.
+    introduce a number with no source in metrics.json. The same reasoning gives
+    the comparison view the union of its lines' anomalies: an anomaly belongs to
+    a series, and the view's own count is the length of the list it holds.
     """
     if not per_series:
         raise ChartError("the overlay needs at least one per-series chart")
@@ -491,9 +592,11 @@ def _overlay_entry(
             points=entry.points,
             raw_values=entry.raw_values,
             median_values=entry.median_values,
+            anomalies=entry.anomalies,
         )
         for entry in per_series
     )
+    anomalies = tuple(anomaly for line in lines for anomaly in line.anomalies)
     # D-14 applied to the overlay as a timeseries axes - which is what it is.
     # One shared ceiling over every series, so the axis is comparable.
     largest = max(max(line.raw_values) for line in lines)
@@ -515,13 +618,14 @@ def _overlay_entry(
         raw_values=(),
         median_values=(),
         gaps=(),
-        anomalies=(),
-        anomalies_drawn=0,
+        anomalies=anomalies,
+        anomalies_drawn=len(anomalies),
         yscale="linear",
         y_limits=(0.0, float(largest) * Y_HEADROOM_FACTOR),
         bars=(),
         note=OVERLAY_NOTE,
-        subtitle=f"{OVERLAY_LABEL} - {OVERLAY_METHOD_PHRASE}",
+        subtitle=f"{OVERLAY_LABEL} - {OVERLAY_METHOD_PHRASE}"
+        + (f" / {ANOMALY_METHOD_PHRASE}" if anomalies else ""),
     )
 
 
@@ -587,6 +691,46 @@ def build_chart_plan(
     )
 
 
+def _draw_anomaly_marks(ax: Any, anomalies: Sequence[Mapping[str, Any]], labelled: bool) -> None:
+    """D-08: one vertical segment per anomaly, between the contract's own numbers.
+
+    The segment's two ends are `anomaly["median"]` and `anomaly["value"]` - read
+    by subscript, exactly as metrics.json wrote them, and coerced to nothing. A
+    re-estimated z-score here would let the picture disagree with the document
+    the report is built from, which is the failure this phase exists to prevent.
+
+    `labelled` is True for the first marker on a chart and False for every one
+    after it, so a chart with three anomalies names them once in the legend
+    rather than three times. `anomalies: []` draws nothing and claims nothing.
+    """
+    for index, anomaly in enumerate(anomalies):
+        when = date.fromisoformat(anomaly["date"])
+        label = ANOMALY_LEGEND_LABEL if (labelled and index == 0) else NO_LEGEND_LABEL
+        ax.vlines(
+            when,
+            anomaly["median"],
+            anomaly["value"],
+            color=ANOMALY_COLOR,
+            lw=ANOMALY_LINE_WIDTH,
+            zorder=ANOMALY_ZORDER,
+            label=label,
+        )
+        # A zero-length segment draws nothing. The detector cannot emit one at
+        # MAD_K = 3.5, but a hand-built document can, and a claimed anomaly that
+        # renders as an absence is a lie by omission - so the marker point rides
+        # along on the equality rather than replacing the segment.
+        if anomaly["value"] == anomaly["median"]:
+            ax.plot(
+                when,
+                anomaly["value"],
+                marker=ANOMALY_MARKER,
+                ms=ANOMALY_MARKER_SIZE,
+                color=ANOMALY_COLOR,
+                zorder=ANOMALY_ZORDER,
+                label=NO_LEGEND_LABEL,
+            )
+
+
 def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     """Draw one series: a thin raw daily line under a bold 7-day median line.
 
@@ -599,6 +743,7 @@ def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     ax.plot(
         x_values, entry.median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
     )
+    _draw_anomaly_marks(ax, entry.anomalies, labelled=True)
     # D-14: an explicit zero floor, timeseries axes only. A growth chart must
     # never receive this call - it would erase a negative bar (RESEARCH
     # Pitfall 1).
@@ -615,9 +760,10 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
     """Draw every series on one shared raw y-axis, plus the scales-differ note.
 
     D-20 forbids a log or normalized scale here: that would invent a per-series
-    index with no source in metrics.json. The x-axis is left to matplotlib's
-    autoscale, which spans exactly the union of the series' plotted date ranges
-    (D-10) - no `set_xlim` call, so no invented bound.
+    index with no source in metrics.json. The x-axis spans the union of the
+    lines' own reported calendar ranges (D-10) - bounds read off the plan, never
+    invented by matplotlib - and the y-axis is a zero-anchored timeseries axis
+    (D-14).
     """
     for index, line in enumerate(entry.series_lines):
         x_values = mdates.date2num([point.date for point in line.points])
@@ -629,6 +775,12 @@ def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
             color=OVERLAY_COLOR_CYCLE[index % len(OVERLAY_COLOR_CYCLE)],
             label=line.label,
         )
+    # Each line draws its own markers, so an anomaly stays attached to the series
+    # it belongs to; the legend names them once for the whole chart.
+    drew_any = False
+    for line in entry.series_lines:
+        _draw_anomaly_marks(ax, line.anomalies, labelled=not drew_any)
+        drew_any = drew_any or bool(line.anomalies)
     ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
     ax.xaxis_date()
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))

@@ -1234,3 +1234,341 @@ def test_single_series_spec_still_produces_an_overlay(
     assert len(entry.series_lines) == 1
     assert len([c for c in document.charts if c.kind == make_charts.TIMESERIES_KIND]) == 1
     assert tmp_out.joinpath("chart_overlay.png").is_file()
+
+
+# --- Plan 05-05 Task 1: the mandatory anomaly overlay (D-08, D-09)
+
+GAP_SERIES_ID = "cs-pust-prerusovany"
+ANOMALY_DATE = "2026-03-15"
+ANOMALY_VALUE = 25380
+ANOMALY_MEDIAN = 2539
+
+
+def _timeseries_entry_of(
+    document: make_charts.ChartDocument, series_id: str = TRACER_SERIES_ID
+) -> make_charts.ChartEntry:
+    """The one timeseries entry a series owns, by kind and id rather than by index."""
+    timeseries = [
+        entry
+        for entry in document.charts
+        if entry.kind == make_charts.TIMESERIES_KIND and entry.series_id == series_id
+    ]
+    assert len(timeseries) == 1, f"exactly one timeseries chart for {series_id}"
+    return timeseries[0]
+
+
+def _legend_labels(entry: make_charts.ChartEntry) -> list[str]:
+    """Draw one plan entry on a throwaway axes and read back its legend text.
+
+    The strongest structural statement available about "does this chart claim an
+    anomaly": the legend is the only place a chart names its own elements, and
+    `ax.get_legend().get_texts()` reads exactly what a reader would read - with
+    no dependence on pixels, which are not a stable assertion surface across
+    matplotlib/freetype versions.
+    """
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    try:
+        if entry.kind == make_charts.OVERLAY_KIND:
+            make_charts._draw_overlay(entry, ax, mdates)
+        elif entry.kind == make_charts.GROWTH_KIND:
+            make_charts._draw_growth(entry, ax)
+        else:
+            make_charts._draw_timeseries(entry, ax, mdates)
+        legend = ax.get_legend()
+        if legend is None:
+            return []
+        return [text.get_text() for text in legend.get_texts()]
+    finally:
+        plt.close(fig)
+
+
+def test_anomaly_segments_match_contract_endpoints(tmp_path: Path) -> None:
+    """D-08: the marker's two ends are the contract's own `median` and `value`.
+
+    Element-wise equality with metrics.json's entry is the whole assertion: a
+    rescaled, re-rounded or re-estimated endpoint fails here, which is what
+    "the chart layer introduces no statistic" means operationally.
+    """
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0
+
+    document = _plan(out_dir, spec_path)
+    metrics = _metrics_by_series(out_dir)
+    pl = _timeseries_entry_of(document, TRACER_SERIES_ID)
+    cs = _timeseries_entry_of(document, GAP_SERIES_ID)
+
+    # The committed spike pair really does carry a non-empty anomalies[]: the
+    # overlay branch is exercised by data, not only by a hand-built document.
+    own = next(a for a in metrics[TRACER_SERIES_ID]["anomalies"] if a["date"] == ANOMALY_DATE)
+    assert list(pl.anomalies) == [
+        {"date": ANOMALY_DATE, "value": ANOMALY_VALUE, "median": ANOMALY_MEDIAN}
+    ]
+    for field in ("date", "value", "median"):
+        assert pl.anomalies[0][field] == own[field], (
+            f"the drawn endpoint {field!r} must be metrics.json's own value, verbatim"
+        )
+    assert pl.anomalies[0]["value"] == ANOMALY_VALUE
+    assert pl.anomalies[0]["median"] == ANOMALY_MEDIAN
+    assert cs.anomalies == (), "the unspiked series carries no anomaly"
+
+    assert pl.anomalies_drawn == 1
+    assert cs.anomalies_drawn == 0
+
+    # The single definition of the field: it is the length of the list it counts,
+    # for EVERY entry of EVERY kind - so the two can never drift apart.
+    for entry in document.charts:
+        assert entry.anomalies_drawn == len(entry.anomalies), (
+            f"{entry.kind}/{entry.series_id}: anomalies_drawn must equal len(anomalies)"
+        )
+
+    published = next(
+        item
+        for item in json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))[
+            "charts"
+        ]
+        if item["kind"] == make_charts.TIMESERIES_KIND
+        and item.get("series_id") == TRACER_SERIES_ID
+    )
+    assert published["anomalies_drawn"] == 1
+    # And the chart names the markers it drew: D-09, on the image itself.
+    labels = _legend_labels(pl)
+    assert make_charts.ANOMALY_LEGEND_LABEL in labels, labels
+    assert make_charts.RAW_LINE_LABEL in labels
+    assert make_charts.MEDIAN_LINE_LABEL in labels
+
+
+def test_growth_entry_never_carries_anomalies(tmp_path: Path) -> None:
+    """A daily spike on a window-summary chart is a category error, so it never goes there.
+
+    Leaving the growth entry's `anomalies` empty is what makes the single
+    `anomalies_drawn == len(anomalies)` definition true for that kind as well:
+    its count is 0 for the same reason the rest of its list is.
+    """
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0
+
+    document = _plan(out_dir, spec_path)
+    growth = _growth_entry_of(document, TRACER_SERIES_ID)
+    timeseries = _timeseries_entry_of(document, TRACER_SERIES_ID)
+
+    assert growth.anomalies == ()
+    assert growth.anomalies_drawn == 0
+    assert timeseries.anomalies_drawn == 1
+    assert timeseries.anomalies != ()
+
+    # Same series, same document, two kinds: the growth chart's own legend must
+    # not claim a marker it does not draw.
+    labels = _legend_labels(growth)
+    assert make_charts.ANOMALY_LEGEND_LABEL not in labels, labels
+
+
+def test_empty_anomalies_render_no_markers_and_no_legend_entry(tmp_out: Path) -> None:
+    """`anomalies: []` is a valid, common state: zero markers, no anomaly legend entry."""
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+
+    for entry in document.charts:
+        assert entry.anomalies == (), f"{entry.kind} must carry no anomaly on the golden"
+        assert entry.anomalies_drawn == 0
+        assert "anomaly" not in entry.subtitle, (
+            "a chart that draws no anomaly must not claim one in its subtitle"
+        )
+    for item in manifest["charts"]:
+        assert item["anomalies_drawn"] == 0
+
+    # The empty state still produces a real chart for every kind.
+    for item in manifest["charts"]:
+        blob = tmp_out.joinpath(item["filename"]).read_bytes()
+        assert blob[:8] == PNG_MAGIC, f"{item['filename']} must be a real PNG"
+        assert len(blob) > 1024, f"{item['filename']} must not be empty or truncated"
+
+    for entry in document.charts:
+        if entry.kind in {make_charts.TIMESERIES_KIND, make_charts.OVERLAY_KIND}:
+            assert make_charts.ANOMALY_LEGEND_LABEL not in _legend_labels(entry)
+
+
+def _write_gaps_pair(out_dir: Path) -> None:
+    """Materialize the committed gap pair, building its metrics with production code.
+
+    The plan does not commit a metrics fixture for the gapless/holey CSV: the
+    analyzer is the only sanctioned producer of metrics.json, so the test runs it
+    rather than freezing a second hand-maintained copy that could drift.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.joinpath("series.csv").write_bytes(
+        FIXTURES_DIR.joinpath("series.gaps.example.csv").read_bytes()
+    )
+    spec = json.loads(FIXTURES_DIR.joinpath("spec.example.json").read_text(encoding="utf-8"))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+    metrics = analyze_trends.build_metrics(spec, "tests/fixtures/spec.example.json", grouped)
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("anomaly_date", "expected"),
+    [
+        ("2025-05-12", "not present in series.csv"),
+        ("2025-13-45", "anomaly date is not YYYY-MM-DD"),
+        ("20250512", "anomaly date is not YYYY-MM-DD"),
+    ],
+    ids=["absent-day", "impossible-date", "basic-iso-format"],
+)
+def test_anomaly_date_absent_from_series_csv_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], anomaly_date: str, expected: str
+) -> None:
+    """T-5-17: a claimed anomaly may not float over a day the chart does not draw.
+
+    2025-05-12 is a real calendar day inside the series' window and inside the
+    spec's inclusive bounds, but it is one of the five days the committed gap
+    fixture leaves absent - so a marker there would be a claim the picture
+    cannot support. The other two cases pin the format guard: Python 3.11's
+    `date.fromisoformat` also accepts the basic "20250512" form, so the
+    YYYY-MM-DD check cannot be delegated to it.
+    """
+    out_dir = tmp_path / "gaps"
+    _write_gaps_pair(out_dir)
+    path = out_dir / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == GAP_SERIES_ID)
+    node["anomalies"] = [{"date": anomaly_date, "value": 9999, "median": 1200}]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", out_dir) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert expected in captured.err, captured.err
+    assert anomaly_date in captured.err
+    assert list(out_dir.glob("*.png")) == [], "a refused anomaly must write no PNG"
+    assert not out_dir.joinpath("charts.json").exists()
+
+
+def test_anomaly_missing_field_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A half-read anomaly is refused rather than drawn as a partial marker."""
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    path = out_dir / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)
+    del node["anomalies"][0]["median"]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", out_dir) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "anomaly is missing 'median'" in captured.err
+    assert TRACER_SERIES_ID in captured.err
+    assert list(out_dir.glob("*.png")) == []
+
+
+def test_float_median_is_not_truncated(tmp_path: Path) -> None:
+    """T-5-18: `statistics.median` returns a float on an even-length window.
+
+    RESEARCH Pattern 4 recorded a real one from a live capture:
+    `{"date": "2025-09-21", "value": 2586, "median": 2189.5}`. A narrowing cast
+    to int would silently move a drawn coordinate by half a view - invisible in
+    the PNG and fatal to the contract's promise that the marker is the number.
+    """
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    path = out_dir / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)
+    node["anomalies"] = [{"date": "2025-09-21", "value": 2586, "median": 2189.5}]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0
+    entry = _timeseries_entry_of(_plan(out_dir, spec_path))
+
+    assert entry.anomalies_drawn == 1
+    assert entry.anomalies[0]["median"] == 2189.5
+    assert isinstance(entry.anomalies[0]["median"], float)
+    assert entry.anomalies[0]["value"] == 2586
+    assert isinstance(entry.anomalies[0]["value"], int)
+
+
+def test_zero_length_anomaly_segment_still_gets_a_marker(tmp_path: Path) -> None:
+    """A `value == median` marker is a zero-length segment: it would draw nothing.
+
+    The detector can never emit a zero score at MAD_K = 3.5, so this only arises
+    from a hand-built document - but "a claimed anomaly that renders as nothing"
+    is a lie by omission, so the marker point is unconditional on the equality.
+    """
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    path = out_dir / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)
+    node["anomalies"] = [{"date": ANOMALY_DATE, "value": 2539, "median": 2539}]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0
+    entry = _timeseries_entry_of(_plan(out_dir, spec_path))
+    assert entry.anomalies[0]["value"] == entry.anomalies[0]["median"]
+
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots()
+    try:
+        make_charts._draw_timeseries(entry, ax, mdates)
+        drawn = [line for line in ax.get_lines() if line.get_marker() == "o"]
+        assert drawn, "a zero-length anomaly must still get a visible marker point"
+        legend = ax.get_legend()
+        labels = [text.get_text() for text in legend.get_texts()] if legend else []
+        assert make_charts.ANOMALY_LEGEND_LABEL in labels, labels
+    finally:
+        plt.close(fig)
+
+
+def test_chart_subtitle_and_legend_name_their_method(tmp_path: Path) -> None:
+    """D-09: a PNG separated from the report still says what it shows."""
+    out_dir = tmp_path / "anomalies"
+    _write_anomaly_pair(out_dir)
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert _run_charts(spec_path, out_dir) == 0
+
+    document = _plan(out_dir, spec_path)
+    kinds: set[str] = set()
+    for entry in document.charts:
+        kinds.add(entry.kind)
+        assert isinstance(entry.subtitle, str) and entry.subtitle.strip()
+        if entry.kind == make_charts.TIMESERIES_KIND:
+            assert "raw" in entry.subtitle
+            assert "median" in entry.subtitle
+            if entry.anomalies_drawn > 0:
+                assert "anomaly" in entry.subtitle
+        if entry.kind == make_charts.GROWTH_KIND:
+            assert "clean" in entry.subtitle
+    assert kinds == {
+        make_charts.TIMESERIES_KIND,
+        make_charts.GROWTH_KIND,
+        make_charts.OVERLAY_KIND,
+    }, "every kind must be asserted, so the test cannot pass vacuously"
+
+    published = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    for item in published["charts"]:
+        assert item["subtitle"] == next(
+            entry.subtitle for entry in document.charts if entry.filename == item["filename"]
+        ), "the manifest must publish the subtitle the image carries"
+        assert item["subtitle"]
