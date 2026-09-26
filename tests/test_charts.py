@@ -110,13 +110,14 @@ def _spec_series_item(series_id: str) -> dict[str, Any]:
     return next(item for item in golden["series"] if item["id"] == series_id)
 
 
-def _copy_fixtures(out_dir: Path, series_ids: tuple[str, ...]) -> None:
-    """Materialize a working series.csv + metrics.json pair inside out_dir.
+def _write_csv_filtered(out_dir: Path, series_ids: tuple[str, ...]) -> None:
+    """Write only `series_ids`' rows of the committed CSV into out_dir/series.csv.
 
-    The committed fixtures are inputs, never scratch files, so every chart test
-    writes filtered *copies*. Filtering is required rather than cosmetic: the
-    analyzer reader rejects a series_id absent from the spec, and the plan
-    iterates metrics.series - so a one-series spec needs one-series inputs.
+    Filtering is byte-level line selection, so the CRLF row endings and the exact
+    `views` cells of the committed fixture survive; the committed files are
+    inputs, never scratch files. The analyzer reader rejects a CSV series_id
+    absent from the spec, which is why the CSV can be narrowed independently of
+    metrics.json when a test needs the two documents to disagree.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = FIXTURES_DIR.joinpath("series.example.csv").read_bytes()
@@ -130,6 +131,10 @@ def _copy_fixtures(out_dir: Path, series_ids: tuple[str, ...]) -> None:
     assert len(kept) > 0, "fixture filter kept no rows"
     out_dir.joinpath("series.csv").write_bytes(header + b"".join(kept))
 
+
+def _write_metrics_filtered(out_dir: Path, series_ids: tuple[str, ...]) -> None:
+    """Write a metrics.json whose series array is filtered to `series_ids`."""
+    out_dir.mkdir(parents=True, exist_ok=True)
     metrics = json.loads(FIXTURES_DIR.joinpath("metrics.example.json").read_text(encoding="utf-8"))
     metrics["series"] = [
         node for node in metrics["series"] if node["series_id"] in series_ids
@@ -138,6 +143,24 @@ def _copy_fixtures(out_dir: Path, series_ids: tuple[str, ...]) -> None:
     out_dir.joinpath("metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def _copy_fixtures(out_dir: Path, series_ids: tuple[str, ...]) -> None:
+    """Materialize a working series.csv + metrics.json pair inside out_dir.
+
+    The committed fixtures are inputs, never scratch files, so every chart test
+    writes filtered *copies*. Filtering is required rather than cosmetic: the
+    analyzer reader rejects a series_id absent from the spec, and the plan
+    iterates metrics.series - so a one-series spec needs one-series inputs.
+    """
+    _write_csv_filtered(out_dir, series_ids)
+    _write_metrics_filtered(out_dir, series_ids)
+
+
+def _metrics_series_order() -> tuple[str, ...]:
+    """The committed golden metrics series order - the SSoT for chart ordering."""
+    metrics = json.loads(FIXTURES_DIR.joinpath("metrics.example.json").read_text(encoding="utf-8"))
+    return tuple(node["series_id"] for node in metrics["series"])
 
 
 def _run_charts(spec_path: Path, out_dir: Path) -> int:
@@ -420,3 +443,193 @@ def test_missing_metrics_exits_nonzero_without_writing(
         "a failed run must not write any new chart"
     )
     assert captured.out == "", "a failed run must not print a success line"
+
+
+# --- Plan 05-03 Task 1: N-series scaling, deterministic names, unsafe-id refusal
+
+# One series_id per character class the filename guard must reject. `../../etc/passwd`
+# is a path escape; the rest prove the charset is ASCII-only, not merely
+# separator-free (T-5-01).
+UNSAFE_SERIES_IDS = (
+    "../../etc/passwd",
+    "with space",
+    "café",
+    "a/b",
+    "a:b",
+)
+
+
+def test_inventory_is_two_png_per_series_plus_overlay(tmp_out: Path) -> None:
+    """D-19: one PNG per (series_id, kind) pair, plus exactly one overlay (2N+1)."""
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    order = _metrics_series_order()
+    per_series = [entry for entry in document.charts if entry.series_id is not None]
+    overlay = [entry for entry in document.charts if entry.kind == make_charts.OVERLAY_KIND]
+    timeseries = [entry for entry in per_series if entry.kind == make_charts.TIMESERIES_KIND]
+
+    # One timeseries entry per series, in metrics.json series order. CONTRACTS.md
+    # §3 freezes that order as spec.series[] order, so nothing may sort it away.
+    assert [entry.series_id for entry in timeseries] == list(order)
+    assert [entry.spec_index for entry in timeseries] == list(range(len(order)))
+    assert [entry.spec_index for entry in per_series] == sorted(
+        entry.spec_index for entry in per_series
+    ), "charts[] must follow spec order, never a sort by label or language"
+
+    # A chart is identified by the pair (series_id, kind): no duplicate pair, and
+    # the per-series side of the inventory is exactly N x (kinds per series).
+    pairs = [(entry.series_id, entry.kind) for entry in per_series]
+    assert len(pairs) == len(set(pairs)), "one entry per (series_id, kind) pair"
+    kinds_per_series = {entry.kind for entry in per_series}
+    assert len(per_series) == len(order) * len(kinds_per_series)
+    assert len(overlay) <= 1, "the comparison view is one chart, and never a per-series one"
+    assert len(document.charts) == len(per_series) + len(overlay)
+    # Plan 05-03 Task 2 adds the overlay, taking the formula to the literal D-19
+    # 2N+1 (2 series + 1 overlay = 3 entries and 3 PNGs; 05-04's growth kind
+    # takes the same expression to 5).
+
+    # Count from the manifest, never from a directory glob: an orphan file must
+    # not be able to stand in for a designed chart, and a dangling entry must
+    # not be able to hide.
+    assert len(manifest["charts"]) == len(document.charts)
+    assert sorted(path.name for path in tmp_out.glob("*.png")) == sorted(
+        entry["filename"] for entry in manifest["charts"]
+    )
+    assert [entry["spec_index"] for entry in manifest["charts"] if "series_id" in entry] == list(
+        range(len(order))
+    )
+
+
+def test_filenames_are_deterministic_and_derived_from_series_id(tmp_path: Path) -> None:
+    """The same inputs produce the same names in the same order, from series_id alone."""
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    first_dir, second_dir = tmp_path / "run-a", tmp_path / "run-b"
+    _copy_fixtures(first_dir, ALL_SERIES_IDS)
+    _copy_fixtures(second_dir, ALL_SERIES_IDS)
+    assert _run_charts(spec_path, first_dir) == 0
+    assert _run_charts(spec_path, second_dir) == 0
+
+    first = json.loads(first_dir.joinpath("charts.json").read_text(encoding="utf-8"))["charts"]
+    second = json.loads(second_dir.joinpath("charts.json").read_text(encoding="utf-8"))["charts"]
+    assert [entry["filename"] for entry in first] == [entry["filename"] for entry in second]
+
+    for entry in first:
+        if entry["kind"] == make_charts.OVERLAY_KIND:
+            continue
+        assert entry["filename"] == f"chart_{entry['series_id']}_{entry['kind']}.png"
+    # T-5-09: because an unsafe id is refused rather than sanitized, two distinct
+    # ids can never map to one name - and a future kind constant must not collide
+    # with the fixed overlay name either.
+    names = [entry["filename"] for entry in first]
+    assert len(names) == len(set(names)), "filenames must be unique within a run"
+    assert make_charts.OVERLAY_FILENAME not in {
+        entry["filename"] for entry in first if entry["kind"] != make_charts.OVERLAY_KIND
+    }
+
+
+@pytest.mark.parametrize("unsafe_id", UNSAFE_SERIES_IDS)
+def test_unsafe_series_id_is_refused_without_writing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], unsafe_id: str
+) -> None:
+    """T-5-01: an unsafe series_id is refused, never sanitized, and writes nothing."""
+    out_dir = tmp_path / "out"
+    spec_path = _write_unsafe_series_inputs(tmp_path, out_dir, unsafe_id)
+
+    assert _run_charts(spec_path, out_dir) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "not filename-safe" in captured.err
+    assert unsafe_id in captured.err, "the refusal must name the offending id"
+    assert list(out_dir.glob("*.png")) == [], "a refused series must write no PNG"
+    assert not out_dir.joinpath("charts.json").exists(), "a refused series must publish no manifest"
+    assert sorted(path.name for path in out_dir.iterdir()) == ["metrics.json", "series.csv"]
+    # Nothing outside --out either: the id is refused before any path is built.
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["out", "spec.json"]
+
+
+def _write_unsafe_series_inputs(tmp_path: Path, out_dir: Path, unsafe_id: str) -> Path:
+    """Materialize a one-series spec whose id is `unsafe_id`, through all three documents.
+
+    The unsafe id has to reach build_chart_plan for the refusal to be the thing
+    under test, so the spec item, the CSV rows and the metrics series all carry
+    it: analyze_trends.load_series_csv rejects a CSV series_id absent from the
+    spec, and the chart plan joins metrics.series against spec.series.
+    """
+    item = dict(_spec_series_item(TRACER_SERIES_ID))
+    item["id"] = unsafe_id
+    spec_path = _write_spec(tmp_path, [item])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = FIXTURES_DIR.joinpath("series.example.csv").read_bytes()
+    lines = raw.splitlines(keepends=True)
+    header, rows = lines[0], lines[1:]
+    kept: list[bytes] = []
+    for line in rows:
+        fields = line.split(b",")
+        if fields[2].decode("utf-8") == TRACER_SERIES_ID:
+            fields[2] = unsafe_id.encode("utf-8")
+            kept.append(b",".join(fields))
+    assert kept, "no tracer rows found to rename"
+    out_dir.joinpath("series.csv").write_bytes(header + b"".join(kept))
+
+    metrics = json.loads(FIXTURES_DIR.joinpath("metrics.example.json").read_text(encoding="utf-8"))
+    node = dict(next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID))
+    node["series_id"] = unsafe_id
+    metrics["series"] = [node]
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return spec_path
+
+
+def test_series_with_no_rows_fails_closed(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Absent data is never turned into a chart: the stage fails closed instead."""
+    out_dir = tmp_path / "out"
+    # Both series are declared, so the analyzer reader is the one that must refuse
+    # the CSV's missing series before the plan can invent a chart for it.
+    spec_path = _write_spec(tmp_path, [_spec_series_item(sid) for sid in ALL_SERIES_IDS])
+    _write_csv_filtered(out_dir, (TRACER_SERIES_ID,))
+    _write_metrics_filtered(out_dir, ALL_SERIES_IDS)
+
+    assert _run_charts(spec_path, out_dir) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    missing = next(sid for sid in ALL_SERIES_IDS if sid != TRACER_SERIES_ID)
+    assert missing in captured.err, "the failure must name the series that has no rows"
+    assert "no observations for" in captured.err
+    assert list(out_dir.glob("*.png")) == []
+    assert not out_dir.joinpath("charts.json").exists()
+
+    # The plan's own guard is the second line of defence, and it is unreachable
+    # through main() precisely because the reader above already refuses. Asserted
+    # on the plan directly so the branch cannot rot: an empty observation list
+    # must raise ChartError naming the series, never produce an empty chart.
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    metrics, digest = make_charts.load_metrics(out_dir / "metrics.json")
+    grouped = analyze_trends.load_series_csv(FIXTURES_DIR / "series.example.csv", spec)
+    del grouped[missing]
+    with pytest.raises(make_charts.ChartError) as raised:
+        make_charts.build_chart_plan(spec, metrics, digest, grouped, str(out_dir / "metrics.json"))
+    assert str(raised.value) == f"no observations for series: {missing}"
+
+
+def test_metrics_series_absent_from_spec_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T-5-02: the plan joins metrics against the spec instead of trusting either."""
+    out_dir = tmp_path / "out"
+    # A spec declaring one series, a CSV carrying that series, and metrics.json
+    # listing two: the chart stage must refuse the mismatch before it can label
+    # a chart with the wrong language or article.
+    spec_path = _write_spec(tmp_path, [_spec_series_item(TRACER_SERIES_ID)])
+    _write_csv_filtered(out_dir, (TRACER_SERIES_ID,))
+    _write_metrics_filtered(out_dir, ALL_SERIES_IDS)
+
+    assert _run_charts(spec_path, out_dir) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "is not in spec" in captured.err
+    missing = next(sid for sid in ALL_SERIES_IDS if sid != TRACER_SERIES_ID)
+    assert missing in captured.err
+    assert list(out_dir.glob("*.png")) == []
+    assert not out_dir.joinpath("charts.json").exists()

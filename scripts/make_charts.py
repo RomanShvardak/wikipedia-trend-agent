@@ -44,6 +44,10 @@ Y_HEADROOM_FACTOR = 1.05
 TIMESERIES_KIND = "timeseries"
 GROWTH_KIND = "growth"
 OVERLAY_KIND = "overlay"
+# The overlay is owned by no single series, so its name is fixed rather than
+# derived from a series_id - which is also what keeps it from ever colliding
+# with a per-series name (T-5-09).
+OVERLAY_FILENAME = "chart_overlay.png"
 REASON_NA_LABEL = "n/a"  # D-04: a null growth renders as a labelled n/a bar
 # Provisional until plan 05-07 ratifies the charts.v1 field list in
 # CONTRACTS.md §7 (D-18).
@@ -86,6 +90,10 @@ class ChartEntry:
 
     kind: str
     series_id: str | None
+    # The series' position in spec.series[], or None for a chart that belongs to
+    # no single spec position (the overlay). Emitted in the manifest so the
+    # ordering is inspectable rather than merely implied by list position.
+    spec_index: int | None
     label: str
     language: str
     filename: str
@@ -200,6 +208,56 @@ def _subtitle(label: str) -> str:
     return f"{label} - {METHOD_PHRASE}"
 
 
+def _spec_series_index(spec: Mapping[str, Any]) -> dict[str, int]:
+    """Map every spec.series[] id to its position, so chart order is inspectable."""
+    series = spec.get("series")
+    if not isinstance(series, list) or not series:
+        raise ChartError("spec.series must be a non-empty list")
+    index_by_id: dict[str, int] = {}
+    for position, item in enumerate(series):
+        where = f"spec.series[{position}]"
+        if not isinstance(item, dict):
+            raise ChartError(f"{where} must be an object")
+        series_id = _require_str(item, "id", where)
+        if series_id in index_by_id:
+            raise ChartError(f"duplicate spec series id: {series_id}")
+        index_by_id[series_id] = position
+    return index_by_id
+
+
+def _timeseries_entry(
+    node: Mapping[str, Any],
+    observations: Sequence[analyze_trends.Observation],
+    spec_index: int,
+) -> ChartEntry:
+    """Build the one timeseries entry a series owns; plan 05-04 adds the growth sibling."""
+    series_id = _require_str(node, "series_id", "metrics.series entry")
+    label = _require_str(node, "label", "metrics.series entry")
+    points = tuple(SeriesPoint(observation.date, observation.views) for observation in observations)
+    raw_values = tuple(point.views for point in points)
+    # D-14: the floor is the literal 0.0, never a computed value, so no axis can
+    # ever imply negative views.
+    return ChartEntry(
+        kind=TIMESERIES_KIND,
+        series_id=series_id,
+        spec_index=spec_index,
+        label=label,
+        language=_require_str(node, "language", "metrics.series entry"),
+        filename=series_filename(series_id, TIMESERIES_KIND),
+        points=points,
+        raw_values=raw_values,
+        median_values=tuple(rolling_median_7(raw_values)),
+        gaps=(),
+        anomalies=(),
+        anomalies_drawn=0,
+        yscale="linear",
+        y_limits=(0.0, float(max(raw_values)) * Y_HEADROOM_FACTOR),
+        bars=(),
+        note=None,
+        subtitle=_subtitle(label),
+    )
+
+
 def build_chart_plan(
     spec: Mapping[str, Any],
     metrics: Mapping[str, Any],
@@ -218,41 +276,27 @@ def build_chart_plan(
     series_nodes = metrics["series"]
     if not isinstance(series_nodes, list) or not series_nodes:
         raise ChartError("metrics.series must be a non-empty list")
+    # A chart is identified by the pair (series_id, kind). D-19's 2N+1 inventory
+    # - one PNG per pair, plus the one overlay - is what that identity produces
+    # once both per-series kinds exist. Iteration follows metrics.series document
+    # order, which CONTRACTS.md §3 freezes as spec.series[] order; nothing here
+    # sorts by label, language or views.
+    spec_index_by_id = _spec_series_index(spec)
     charts: list[ChartEntry] = []
     for node in series_nodes:
         if not isinstance(node, dict):
             raise ChartError("metrics.series entries must be objects")
         series_id = _require_str(node, "series_id", "metrics.series entry")
+        # The stage joins the two documents rather than trusting either one: a
+        # metrics series the spec does not declare must never be labelled with
+        # some other series' language or article (T-5-02).
+        if series_id not in spec_index_by_id:
+            raise ChartError(f"metrics series is not in spec: {series_id}")
         series_filename(series_id, TIMESERIES_KIND)
         observations = list(grouped.get(series_id, []))
         if not observations:
             raise ChartError(f"no observations for series: {series_id}")
-        points = tuple(
-            SeriesPoint(observation.date, observation.views) for observation in observations
-        )
-        raw_values = tuple(point.views for point in points)
-        # D-14: the floor is the literal 0.0, never a computed value, so no
-        # axis can ever imply negative views.
-        charts.append(
-            ChartEntry(
-                kind=TIMESERIES_KIND,
-                series_id=series_id,
-                label=_require_str(node, "label", "metrics.series entry"),
-                language=_require_str(node, "language", "metrics.series entry"),
-                filename=series_filename(series_id, TIMESERIES_KIND),
-                points=points,
-                raw_values=raw_values,
-                median_values=tuple(rolling_median_7(raw_values)),
-                gaps=(),
-                anomalies=(),
-                anomalies_drawn=0,
-                yscale="linear",
-                y_limits=(0.0, float(max(raw_values)) * Y_HEADROOM_FACTOR),
-                bars=(),
-                note=None,
-                subtitle=_subtitle(_require_str(node, "label", "metrics.series entry")),
-            )
-        )
+        charts.append(_timeseries_entry(node, observations, spec_index_by_id[series_id]))
     return ChartDocument(
         contract_version=CHARTS_CONTRACT_VERSION,
         spec_name=_require_str(metrics, "spec_name", "metrics"),
@@ -337,6 +381,10 @@ def _entry_payload(entry: ChartEntry) -> dict[str, object]:
     }
     if entry.series_id is not None:
         payload["series_id"] = entry.series_id
+    # Same omission rule as `series_id`: written only by the kinds that own it.
+    # The overlay belongs to no spec.series[] position, so it carries none.
+    if entry.spec_index is not None:
+        payload["spec_index"] = entry.spec_index
     if entry.kind == GROWTH_KIND and entry.bars:
         payload["bars"] = [_bar_payload(bar) for bar in entry.bars]
     if entry.note is not None:
