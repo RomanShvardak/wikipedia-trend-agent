@@ -182,6 +182,30 @@ FORECAST_VOCABULARY = (
     "monetiz",
 )
 
+# A CLOSED list, and the closure is the point. The CR-01 defect was that a
+# rendered Ukrainian document printed `low`, `up`, `inconclusive` and the three
+# ASCII chart-disclosure keys verbatim, and the goal is that THESE EXACT ELEVEN
+# WORDS do not appear - not that no Latin text appears at all. Two legitimate
+# ASCII things do appear in a `uk` report and are deliberately not scanned: the
+# chart `filename`s, and the overlay's frozen `charts.v1 §7.2.4` ASCII `note`,
+# which is a stable interface string quoted verbatim. A broad "no English" gate
+# would have to be weakened to pass, and a gate that must be weakened to pass is
+# a gate nobody trusts - so the closed list is narrower, exact, and honest about
+# what it excludes.
+ENGLISH_ENUM_AND_DISCLOSURE_VOCABULARY: tuple[str, ...] = (
+    "low",
+    "medium",
+    "high",
+    "up",
+    "down",
+    "flat",
+    "noise",
+    "inconclusive",
+    "gaps",
+    "anomalies_drawn",
+    "log_masked_points",
+)
+
 # A standalone `inf` / `nan` as a word. Substring matching would be wrong here
 # (`inf` is inside `information`), which is why these two are word-bounded while
 # `None` / `null` / `NaN` / `Infinity` are matched as literals - no English word
@@ -595,7 +619,15 @@ def test_tracer_publishes_every_section_and_the_frozen_manifest(tmp_out: Path) -
     # the label alone printed the same sentence twice and a reader could not tell
     # which of the two charts it described. One line per published entry, each
     # naming its own filename, is the property.
-    disclosures = [line for line in text.splitlines() if "anomalies_drawn=" in line]
+    #
+    # The filter is built from the TOKEN, not from the ASCII literal
+    # `anomalies_drawn=`: 06-04 made the disclosure key a `REPORT_TOKENS` entry,
+    # so a filter hard-coded on the English key would match zero lines and the
+    # distinctness property - the one that caught the original duplicate-line
+    # defect - would be asserted over an empty list. Re-keying is not a licence
+    # to weaken any of the four properties below; all four are kept verbatim.
+    disclosure_key = build_report.report_tokens("uk")["disclosure_anomalies_drawn"]
+    disclosures = [line for line in text.splitlines() if disclosure_key in line]
     assert len(disclosures) == len(published), (
         f"one disclosure per published chart, got {len(disclosures)} for {len(published)}"
     )
@@ -928,6 +960,231 @@ def test_low_confidence_series_is_framed_as_a_hypothesis(tmp_out: Path) -> None:
         )
 
     assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
+# --- 06-04 Task 1: the CR-01 tracer ------------------------------------------
+#
+# 06-VERIFICATION.md recorded B-1 / CR-01: a rendered Ukrainian report printed
+# `up`, `high` and `anconclusible`-class enum values plus the three ASCII
+# chart-disclosure keys, because `REPORT_TOKENS` had no key for an enum value and
+# a `low` word is not a number, so §8.4's sweep and every arithmetic test were
+# blind to it. `test_uk_report_carries_no_english_enum_or_disclosure_value` is
+# the witness: it renders the committed fixture through the REAL chart stage,
+# reads `report.md` back OFF DISK, and asserts the closed eleven-word list is
+# absent from the three regions the defect reached. Its own name carries
+# `english_enum` because Task 4's non-vacuity probe 1 selects it with
+# `-k english_enum` - measured on this project's pytest, a selector matching no
+# node name prints `50 deselected in 0.08s` and exits 5, which is non-zero, so
+# the name is a pinned selector contract and not a description.
+def test_uk_report_carries_no_english_enum_or_disclosure_value(tmp_out: Path) -> None:
+    """A `uk` report carries no English enum value, disclosure key or trust level.
+
+    Three regions and three, because a fourth would be dishonest rather than
+    stricter: the CHART section is deliberately NOT scanned, since it carries the
+    chart `filename`s and the overlay's frozen `charts.v1 §7.2.4` ASCII `note`,
+    which is a stable interface string quoted verbatim from the manifest and which
+    `06-VERIFICATION.md` lists as a named human call rather than as a gap. Those
+    are the scope exclusions, stated here rather than left implicit.
+
+    POSITIVES FIRST, absences second. Every absence assertion below is trivially
+    satisfiable by an empty or broken document, so the six headings, a non-empty
+    `metrics_shown` and at least one rendered `format_number(..., percent=True)`
+    are all asserted BEFORE the first `not re.search(...)`, and the count of rows
+    and regions actually inspected is asserted non-zero so a rename that emptied
+    the metrics table cannot make the loop vacuous.
+    """
+    before = _fixture_bytes()
+    assert LOW_CONFIDENCE_EXAMPLE.is_file(), (
+        "the low-confidence metrics fixture must be committed before the "
+        "localization can be tested from committed data"
+    )
+    _copy_chart_inputs(tmp_out)
+    _write_metrics(tmp_out, LOW_CONFIDENCE_EXAMPLE.read_bytes())
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert make_charts.main(["--spec", str(spec_path), "--out", str(tmp_out)]) == 0
+    assert _run_report(tmp_out) == 0
+
+    text = tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+    manifest = json.loads(
+        tmp_out.joinpath(build_report.REPORT_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    language = _spec_language()
+
+    # --- positives ---
+    order = _section_order(text, language)
+    assert order == sorted(order), f"the six sections are out of order: {order}"
+    assert len(set(order)) == len(order), "a section heading appears more than once"
+    assert manifest["metrics_shown"], "metrics_shown is empty, so nothing was rendered"
+
+    document = json.loads(LOW_CONFIDENCE_EXAMPLE.read_text(encoding="utf-8"))
+    clean_phrases = [
+        build_report.format_number(node["growth"][window]["clean"]["pct"], percent=True)
+        for node in document["series"]
+        for window in analyze_trends.GROWTH_WINDOWS
+        if node["growth"][window]["clean"].get("pct") is not None
+    ]
+    assert clean_phrases, "the fixture has no non-null clean percentage to render"
+    assert any(f"{phrase}%" in text for phrase in clean_phrases), (
+        f"no clean percentage was rendered at all, so the absence assertions below "
+        f"would be satisfiable by an empty document: {clean_phrases!r}"
+    )
+
+    # --- absences ---
+    rows = _metrics_table_rows(text, language)
+    regions = [
+        *rows,
+        _section_body(text, language, "trust"),
+        _section_body(text, language, "limitations"),
+    ]
+    assert rows, "the metrics table has no data rows, so nothing was inspected"
+    assert len(regions) == len(rows) + 2 and all(region for region in regions), (
+        f"expected one region per metrics row plus trust and limitations, got {regions!r}"
+    )
+    for index, region in enumerate(regions):
+        for word in ENGLISH_ENUM_AND_DISCLOSURE_VOCABULARY:
+            found = re.search(rf"\b{re.escape(word)}\b", region, re.IGNORECASE)
+            assert found is None, (
+                f"region {index} carries the English word {word!r} at offset "
+                f"{found.start() if found else -1}: {region!r}"
+            )
+
+    assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
+def test_confidence_and_trend_tokens_refuse_an_unmapped_enum_value() -> None:
+    """No enum value can fall back to the English word, and the refusal names it.
+
+    Modelled on `test_reason_token_refuses_an_unmapped_reason`, and the same two
+    halves. First, an out-of-enum value raises and NAMES the value verbatim, so a
+    caller knows which upstream value to add - which is also what makes an added
+    value loud instead of silent. Second, every mapped value resolves to a
+    non-blank phrase in EVERY declared language: a blank phrase would render an
+    empty cell and still satisfy a membership check.
+    """
+    for lookup, value in (
+        (build_report.confidence_token, "very high"),
+        (build_report.trend_token, "sideways"),
+    ):
+        with pytest.raises(build_report.ReportError) as refusal:
+            lookup("uk", value)
+        assert value in str(refusal.value), (
+            f"the refusal must name the offending value verbatim; got {refusal.value!r}"
+        )
+
+    for language in build_report.REPORT_TOKENS:
+        for mapping in (build_report.CONFIDENCE_TOKEN_KEYS, build_report.TREND_TOKEN_KEYS):
+            for value, key in mapping.items():
+                phrase = build_report._enum_token(language, mapping, value, "enum")
+                assert phrase.strip(), (
+                    f"REPORT_TOKENS[{language!r}][{key!r}] is blank, so the value "
+                    f"{value!r} would render as an empty cell"
+                )
+                assert phrase == build_report.report_tokens(language)[key]
+
+
+def test_enum_token_maps_cover_every_value_analyze_trends_can_emit() -> None:
+    """Both maps are complete against the code that PRODUCES the values, measured.
+
+    `REASON_TOKENS` keys its reasons by importing the upstream constant BY
+    REFERENCE, so an upstream rename fails at collection time. The two enum
+    families cannot: `analyze_trends.py:729/737/739/740/752/754/756/759` hold
+    INLINE string literals, so there is nothing to import - which is exactly why
+    the CR-01 leak survived, since no upstream rename could ever break a key set.
+
+    This test is the mechanical substitute. It CALLS `score_confidence` and
+    `safe_direction` over their documented input grids, collects what they
+    actually return, and requires the measured set to equal the literal enum set
+    AND the map's key set. A new level or direction added upstream without a
+    token fails here instead of leaking English onto the page. The non-empty
+    result count is asserted per grid so an argument-order mistake cannot empty
+    either set and make the equality vacuously true.
+    """
+    from datetime import date
+
+    levels: set[str] = set()
+    level_calls = 0
+    for period_days in (30, 91, 730):
+        for monthly_30d in (0, 500, 1000, 10000):
+            for anomaly_share in (0.0, 0.05, 0.5):
+                for clean_y1_available in (True, False):
+                    for comparison_span in (None, (date(2014, 1, 1), date(2016, 1, 1))):
+                        level, _reasons = analyze_trends.score_confidence(
+                            period_days,
+                            monthly_30d,
+                            anomaly_share,
+                            clean_y1_available,
+                            comparison_span,
+                        )
+                        levels.add(level)
+                        level_calls += 1
+    assert level_calls == 3 * 4 * 3 * 2 * 2, "the confidence grid was not fully exercised"
+    assert levels == {"low", "medium", "high"}, (
+        f"score_confidence's reachable levels drifted: {sorted(levels)}"
+    )
+    assert levels == set(build_report.CONFIDENCE_TOKEN_KEYS), (
+        f"CONFIDENCE_TOKEN_KEYS must cover every reachable level, differing on "
+        f"{sorted(levels ^ set(build_report.CONFIDENCE_TOKEN_KEYS))}"
+    )
+
+    directions: set[str] = set()
+    direction_calls = 0
+    for period_days in (30, 730):
+        for raw_y1_pct in (None, -20.0, 0.0, 20.0):
+            for clean_y1_pct in (None, -20.0, 0.0, 20.0):
+                for confidence in ("low", "high"):
+                    for monthly_30d in (500, 5000):
+                        directions.add(
+                            analyze_trends.safe_direction(
+                                period_days,
+                                raw_y1_pct,
+                                clean_y1_pct,
+                                confidence,
+                                monthly_30d,
+                            )
+                        )
+                        direction_calls += 1
+    assert direction_calls == 2 * 4 * 4 * 2 * 2, "the direction grid was not fully exercised"
+    assert directions == {"up", "down", "flat", "noise", "inconclusive"}, (
+        f"safe_direction's reachable directions drifted: {sorted(directions)}"
+    )
+    assert directions == set(build_report.TREND_TOKEN_KEYS), (
+        f"TREND_TOKEN_KEYS must cover every reachable direction, differing on "
+        f"{sorted(directions ^ set(build_report.TREND_TOKEN_KEYS))}"
+    )
+
+
+def test_report_token_tables_disagree_for_the_eleven_new_keys() -> None:
+    """The `uk` phrases are real translations, not copies of the `en` ones.
+
+    Without this, `test_uk_report_carries_no_english_enum_or_disclosure_value`
+    would be satisfiable by a `uk` table silently filled from the `en` table -
+    the absence assertions would then be unearnable rather than earned, and the
+    CR-01 test would pass on a bilingual document. The second half (no ASCII
+    letter in the `uk` value) is what makes "translated" mechanical rather than
+    a matter of taste.
+    """
+    keys = (
+        "confidence_low",
+        "confidence_medium",
+        "confidence_high",
+        "trend_up",
+        "trend_down",
+        "trend_flat",
+        "trend_noise",
+        "trend_inconclusive",
+        "disclosure_gaps",
+        "disclosure_anomalies_drawn",
+        "disclosure_log_masked_points",
+    )
+    for key in keys:
+        assert build_report.REPORT_TOKENS["uk"][key] != build_report.REPORT_TOKENS["en"][key], (
+            f"REPORT_TOKENS['uk'][{key!r}] is a copy of the English phrase, so the "
+            f"closed-list absence assertions are unearned"
+        )
+        assert not re.search(r"[A-Za-z]", build_report.REPORT_TOKENS["uk"][key]), (
+            f"REPORT_TOKENS['uk'][{key!r}] contains an ASCII letter: "
+            f"{build_report.REPORT_TOKENS['uk'][key]!r}"
+        )
 
 
 # --- 06-02 Task 2: the fidelity battery --------------------------------------

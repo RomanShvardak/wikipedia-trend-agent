@@ -103,6 +103,27 @@ REPORT_TOKENS: dict[str, dict[str, str]] = {
         "not_a_forecast": "This is not a forecast and not a recommendation",
         "chart_image_alt": "Chart",
         "assumption": "author assumption",
+        # The eleven enum and disclosure words. CONTRACTS.md §8.3 says two
+        # tables carry every word the document writes, and until now these eleven
+        # were written by neither. A confidence level and a disclosure key are
+        # words the reader reads, not numbers, so §8.4 does not reach them and
+        # the completeness sweep could not see them. The `en` values are the
+        # ASCII words this stage used to write out of the source document, so an
+        # English reader's document is unchanged in vocabulary; none of them is a
+        # `test_contracts.ROLLUP_KEY_BLACKLIST` word, and the `en` table is not
+        # rendered by any test (the committed spec's `language` is `uk`), so a
+        # rollup word introduced here would be invisible to the rollup test.
+        "confidence_low": "low",
+        "confidence_medium": "medium",
+        "confidence_high": "high",
+        "trend_up": "up",
+        "trend_down": "down",
+        "trend_flat": "flat",
+        "trend_noise": "noise",
+        "trend_inconclusive": "inconclusive",
+        "disclosure_gaps": "gaps",
+        "disclosure_anomalies_drawn": "anomalies_drawn",
+        "disclosure_log_masked_points": "log_masked_points",
     },
     "uk": {
         "title": "Аналіз переглядів Wikipedia",
@@ -138,6 +159,21 @@ REPORT_TOKENS: dict[str, dict[str, str]] = {
         # asserting this token appears NOWHERE in the document — a token that
         # is a substring of a section heading could never be absent.
         "assumption": "припущення автора",
+        # The same eleven words, localized. `зростання` is a trend DIRECTION here
+        # and is deliberately lowercase so it cannot be confused with the
+        # `growth` COLUMN header `Зростання`; the two are different words of the
+        # document, and only the column header is a heading.
+        "confidence_low": "низька",
+        "confidence_medium": "середня",
+        "confidence_high": "висока",
+        "trend_up": "зростання",
+        "trend_down": "спад",
+        "trend_flat": "плоске",
+        "trend_noise": "шум",
+        "trend_inconclusive": "невизначено",
+        "disclosure_gaps": "прогалин",
+        "disclosure_anomalies_drawn": "намальованих аномалій",
+        "disclosure_log_masked_points": "знецінених точок",
     },
 }
 # The keys a language table MUST define. A partial table is the same defect as a
@@ -174,6 +210,17 @@ REQUIRED_REPORT_TOKENS: tuple[str, ...] = (
     "not_a_forecast",
     "chart_image_alt",
     "assumption",
+    "confidence_low",
+    "confidence_medium",
+    "confidence_high",
+    "trend_up",
+    "trend_down",
+    "trend_flat",
+    "trend_noise",
+    "trend_inconclusive",
+    "disclosure_gaps",
+    "disclosure_anomalies_drawn",
+    "disclosure_log_masked_points",
 )
 # CONTRACTS.md §8.2's six headings, in the frozen order, named by the token that
 # supplies each. The order is a CONTRACT, so it lives in one tuple that the
@@ -273,6 +320,33 @@ REASON_TOKENS: dict[str, dict[str, str]] = {
     },
 }
 
+# D-16 for the two ENUM families a metrics row carries. `REASON_TOKENS` above
+# keys its reasons by importing the upstream constant BY REFERENCE, so a rename
+# upstream breaks this module at collection time. These two cannot: the values are
+# INLINE string literals in analyze_trends.py (`"high" if score >= 4 else ...` at
+# :729, `"up"` / `"down"` / `"flat"` at :737/:739/:740 and `"inconclusive"` /
+# `"noise"` at :752/:754), so there is nothing to import - which is exactly why
+# the CR-01 leak survived: no upstream rename could ever break a key set.
+#
+# So the maps are keyed on the VERBATIM `metrics.json` VALUE, and completeness is
+# proved by MEASURING the reachable set out of `analyze_trends.score_confidence`
+# and `analyze_trends.safe_direction` themselves
+# (`test_report.test_enum_token_maps_cover_every_value_analyze_trends_can_emit`).
+# That test is load-bearing, not decorative: a value added upstream without a
+# token fails there instead of printing English inside a Ukrainian document.
+CONFIDENCE_TOKEN_KEYS: dict[str, str] = {
+    "low": "confidence_low",
+    "medium": "confidence_medium",
+    "high": "confidence_high",
+}
+TREND_TOKEN_KEYS: dict[str, str] = {
+    "up": "trend_up",
+    "down": "trend_down",
+    "flat": "trend_flat",
+    "noise": "trend_noise",
+    "inconclusive": "trend_inconclusive",
+}
+
 # GFM table-cell safety. A raw `|` in a spec-authored label splits one cell into
 # two and shifts every column after it; a newline inside a cell ends the row
 # early and can inject a row the report never wrote. Both are reachable from
@@ -321,6 +395,40 @@ def reason_token(language: str, reason: str) -> str:
     if table is None or reason not in table:
         raise ReportError(f"no localized phrase for reason: {reason!r}")
     return table[reason]
+
+
+def _enum_token(language: str, mapping: Mapping[str, str], value: str, kind: str) -> str:
+    """The localized phrase for one enum value, or a refusal — never the English word.
+
+    One seam for every enum family, modelled line-for-line on `reason_token`, so a
+    new family gets a fail-closed lookup rather than a third spelling of the same
+    refusal. Fail-closed on BOTH sides:
+
+    - **No language table, or a table missing the named key.** `report_tokens`
+      raises first, and it refuses a PARTIAL table exactly as it refuses a wholly
+      missing one, so a table that never grew the eleven new keys cannot render a
+      single character.
+    - **The value is not in `mapping`.** Raised, with the value named verbatim, so
+      the caller knows which upstream value to add. Falling back to the English
+      word here would put `low` or `up` into a Ukrainian document — a bilingual
+      artefact no test of the arithmetic would catch, because every number would
+      still be right.
+    """
+    table = report_tokens(language)
+    key = mapping.get(value)
+    if key is None or key not in table:
+        raise ReportError(f"no localized phrase for {kind}: {value!r}")
+    return table[key]
+
+
+def confidence_token(language: str, value: str) -> str:
+    """The localized phrase for one verbatim `metrics.json` `confidence` level."""
+    return _enum_token(language, CONFIDENCE_TOKEN_KEYS, value, "confidence")
+
+
+def trend_token(language: str, value: str) -> str:
+    """The localized phrase for one verbatim `metrics.json` `trend_direction`."""
+    return _enum_token(language, TREND_TOKEN_KEYS, value, "trend_direction")
 
 
 def md_cell(value: object) -> str:
@@ -608,8 +716,8 @@ def render_report(
             format_number(node["total_views"]),
             format_number(node["avg_daily_views"]),
             growth,
-            node["trend_direction"],
-            node["confidence"],
+            trend_token(language, str(node["trend_direction"])),
+            confidence_token(language, str(node["confidence"])),
             format_number(node["anomaly_share"]),
         ]
         lines.append("| " + " | ".join(md_cell(cell) for cell in row) + " |")
@@ -640,7 +748,10 @@ def render_report(
         reasons = "; ".join(
             md_cell(reason_token(language, reason)) for reason in node["confidence_reasons"]
         )
-        level = md_cell(node["confidence"])
+        level = confidence_token(language, str(node["confidence"]))
+        # The comparison below deliberately keeps the RAW enum value: localizing
+        # the hypothesis framing would make whether a reading is a hypothesis
+        # depend on a translation rather than on the confidence level itself.
         prefix = f"{tokens['hypothesis']}: " if node["confidence"] == "low" else ""
         lines.append(f"- {label}: {prefix}{level} — {reasons}")
         show(f"series[{index}].confidence")
@@ -687,9 +798,11 @@ def render_report(
         # name, so it is both the disambiguator and the join key.
         lines.append(
             f"- {md_cell(entry.get('label', ''))} "
-            f"[{md_cell(entry['filename'])}]: "
-            f"gaps={gap_days}, anomalies_drawn={int(entry.get('anomalies_drawn', 0))}, "
-            f"log_masked_points={int(entry.get('log_masked_points', 0))}"
+            f"[{md_cell(entry['filename'])}] — "
+            f"{tokens['disclosure_gaps']}: {gap_days}; "
+            f"{tokens['disclosure_anomalies_drawn']}: {int(entry.get('anomalies_drawn', 0))}; "
+            f"{tokens['disclosure_log_masked_points']}: "
+            f"{int(entry.get('log_masked_points', 0))}"
         )
     lines.append("")
 

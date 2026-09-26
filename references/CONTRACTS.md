@@ -658,7 +658,8 @@ wants different wording changes the success criterion, not this table alone.
 
 ### 8.3 The report's own words
 
-Two tables carry every word the document writes, and both are **fail-closed**:
+Three tables carry every word the document writes, and all three are
+**fail-closed**:
 
 - `REPORT_TOKENS` — the section headings, table headers, labels and footer
   phrases, keyed language → phrase. A language with **no table**, and a table
@@ -670,11 +671,28 @@ Two tables carry every word the document writes, and both are **fail-closed**:
   `analyze_trends.py` → localized phrase. An unmapped reason is refused the same
   way. The keys are imported **by reference**, so a constant renamed upstream
   fails this completeness check instead of silently falling back to English.
+- `CONFIDENCE_TOKEN_KEYS` and `TREND_TOKEN_KEYS` — the `confidence` level and the
+  `trend_direction` a metrics row carries, plus the three chart-disclosure keys,
+  mapped from their **verbatim `metrics.json` value** to the `REPORT_TOKENS` key
+  that phrases them. A value in neither map is refused exactly as an unmapped
+  reason is, and the refusal names the value verbatim. These enum values are
+  inline literals in `analyze_trends.py` rather than named constants, so they
+  cannot be imported by reference the way `REASON_TOKENS` keys its reasons;
+  completeness is instead proved by calling `analyze_trends.score_confidence` and
+  `analyze_trends.safe_direction` and comparing the reachable value set against
+  the map's key set.
 
 **English is never a fallback.** A Ukrainian report with one English heading is a
 bilingual artefact the reader did not ask for, and no test of the arithmetic
 would catch it — the numbers would all be right. This is the same argument
 `charts.v1` §7.4 carries for chart text, and the same refusal.
+
+A confidence level, a trend direction and the three chart-disclosure keys are
+**words the reader reads**, not numbers, and a report that wrote them in English
+while every heading sat in Ukrainian is the bilingual artefact the tables above
+exist to prevent — a leak the number-completeness sweep structurally cannot see,
+because a word is not a numeral. They are phrased through `REPORT_TOKENS` like
+every other word, and a value outside the enum is a refusal, never a passthrough.
 
 Mapping an English reason string to a localized phrase is **not** a number
 derivation, and therefore does not breach §7.3's never-recompute rule: no value
