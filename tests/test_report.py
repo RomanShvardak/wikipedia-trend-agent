@@ -1624,6 +1624,15 @@ def _empty_charts(out_dir: Path) -> None:
     _patch_json(out_dir.joinpath("charts.json"), lambda d: d.__setitem__("charts", []))
 
 
+def _shape_less_confidence_reasons(out_dir: Path) -> None:
+    """`confidence_reasons` present but not a list of non-empty strings."""
+
+    def mutate(document):
+        document["series"][0]["confidence_reasons"] = [""]
+
+    _patch_json(out_dir.joinpath("metrics.json"), mutate)
+
+
 def _unmapped_confidence_reason(out_dir: Path) -> None:
     """A reason string no `analyze_trends` constant emits, in the DOCUMENT.
 
@@ -1728,6 +1737,76 @@ def test_fail_closed_missing_confidence_names_the_key_and_never_a_traceback(
         f"a missing display field must be a refusal, not a traceback: {err!r}"
     )
     assert "Traceback" not in err, f"a refusal must not print a traceback: {err!r}"
+
+
+# Each row: a mutation, and the exact `where.key` the refusal must name. Six
+# fields, six keys - measured rather than narrated, because two injected-defect
+# probes found that a refusal can be CORRECT and still name nothing:
+#   probe 1: dropping `where.key` from the `confidence_reasons` message left the
+#            whole matrix green (observed 18 passed), because no row asserted
+#            that message;
+#   probe 4: disabling the null-clean.pct reason guard left the matrix green too
+#            (observed 18 passed), because the run then failed LATER and for a
+#            different reason - `reason_token("uk", "None")` refuses on its own -
+#            so a correct-looking exit 1 hid a missing guard.
+# A guard that refuses for the wrong reason is not a guard.
+KEY_NAMED_ROWS = (
+    pytest.param(_missing_confidence, "series[0].confidence", id="confidence"),
+    pytest.param(_missing_trend_direction, "series[0].trend_direction", id="trend-direction"),
+    pytest.param(_missing_period_days, "series[0].period.days", id="period-days"),
+    pytest.param(
+        _null_clean_pct_without_reason, "series[0].growth.y2.clean", id="null-clean-reason"
+    ),
+    pytest.param(
+        _shape_less_confidence_reasons,
+        "series[0].confidence_reasons",
+        id="confidence-reasons-shape",
+    ),
+)
+
+
+@pytest.mark.parametrize("mutate,expected_key", KEY_NAMED_ROWS)
+def test_fail_closed_refusal_names_the_exact_field_and_not_another(
+    tmp_path: Path, capsys, mutate, expected_key
+) -> None:
+    """Every display-field refusal names ITS OWN `where.key`, and nothing else.
+
+    Asserted per field rather than for one field, because a message naming the
+    wrong key is as unusable as no message: a model reading
+    `metrics.series[0].confidence` when the missing field was `period.days` would
+    fix the wrong thing. The `not in` half is what catches a message that names
+    the right key AND a wrong one.
+    """
+    others = [
+        key
+        for key in (
+            "series[0].confidence",
+            "series[0].trend_direction",
+            "series[0].period.days",
+            "series[0].growth.y2.clean",
+            "series[0].confidence_reasons",
+        )
+        if key != expected_key
+    ]
+    out_dir = _prepared_report_dir(tmp_path, f"out.named.{expected_key.rsplit('.', 1)[-1]}")
+    mutate(out_dir)
+
+    assert _run_report(out_dir) == 1
+    failures = [
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("report failed:")
+    ]
+    assert len(failures) == 1, f"expected one refusal line, got {failures!r}"
+    assert expected_key in failures[0], (
+        f"the refusal must name {expected_key!r}; it said {failures[0]!r}"
+    )
+    for other in others:
+        # Identifier-boundary aware: `series[0].confidence` is a PREFIX of
+        # `series[0].confidence_reasons`, so a plain substring test would report
+        # the correct message for one field as naming another.
+        assert not re.search(re.escape(other) + r"(?![A-Za-z0-9_])", failures[0]), (
+            f"the refusal for {expected_key!r} also names {other!r}: {failures[0]!r}"
+        )
+    assert "Traceback" not in failures[0]
 
 
 def test_invalid_spec_exits_with_exit_two_and_writes_nothing(tmp_path: Path, capsys) -> None:
