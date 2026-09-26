@@ -10,6 +10,8 @@ import ast
 import csv
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import unicodedata
 from datetime import date, timedelta
@@ -361,8 +363,104 @@ def _scale_calls_in_render_path(function_name: str) -> list[dict[str, Any]]:
     return calls
 
 
-def test_backend_is_agg() -> None:
-    """matplotlib.use("Agg") precedes the first pyplot import, and Agg is live."""
+# The adversarial ambient backend for the runtime probe below. Two properties,
+# both load-bearing: it must NOT be Agg (or "the backend is agg" is free in a
+# process that already had it), and it must be importable with no display and no
+# GUI toolkit (or the probe cannot start on a headless machine). matplotlib's own
+# non-interactive `svg` backend is exactly that - unlike `tkagg`, this machine's
+# accidental default, which exists here only because tkinter happens to be
+# installed and is absent from a container.
+ADVERSARIAL_AMBIENT_BACKEND = "svg"
+
+# The probe itself: a FRESH interpreter, in which nothing has selected a backend
+# yet, that imports the production module and runs the PRODUCTION CLI, then
+# reports the backend before and after. A subprocess is not a convenience here,
+# it is the only mechanism that can answer the question: once any import has
+# bound a backend in this process, `matplotlib.use()`'s effect can no longer be
+# told apart from whatever the test session did earlier, so an in-process
+# `get_backend()` asserts ambient state rather than the code under test. It can
+# go red for reasons entirely outside make_charts.py, and it can go green without
+# production's `use("Agg")` ever executing. The script is a probe, never a
+# re-implementation: it calls `make_charts.main` and does not touch a backend
+# itself, so there is nothing here to pass by restating the code it checks.
+_BACKEND_PROBE = '''
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+out_dir, spec_path = sys.argv[2], sys.argv[3]
+
+import matplotlib
+
+# Importing the production module must not itself pull a rendering backend
+# (C-03), so the value read here is the ambient one, not production's.
+import make_charts
+
+ambient = matplotlib.get_backend()
+try:
+    code = make_charts.main(["--spec", spec_path, "--out", out_dir])
+    error = None
+except BaseException as exc:  # a failed render still has a backend to report
+    code = -1
+    error = "{}: {}".format(type(exc).__name__, exc)
+print(
+    "BACKEND_REPORT:"
+    + json.dumps(
+        {
+            "ambient": ambient,
+            "rc": code,
+            "error": error,
+            "after": matplotlib.get_backend(),
+        }
+    ),
+    flush=True,
+)
+'''
+
+
+def _probe_backend_in_fresh_process(spec_path: Path, out_dir: Path) -> dict[str, Any]:
+    """Run the production CLI in a fresh interpreter and return its backend report.
+
+    `sys.executable`, never a literal `python`: a bare `python` on this machine
+    is Anaconda, which cannot import matplotlib and carries pytest 7 (D-17), so a
+    hardcoded interpreter name would make the probe pass or fail for reasons
+    that have nothing to do with the code under test.
+    """
+    env = dict(os.environ)
+    env["MPLBACKEND"] = ADVERSARIAL_AMBIENT_BACKEND
+    scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+    completed = subprocess.run(
+        [sys.executable, "-", scripts_dir, str(out_dir), str(spec_path)],
+        input=_BACKEND_PROBE,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    assert completed.returncode == 0, (
+        "the probe interpreter itself failed:\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    reports = [
+        line[len("BACKEND_REPORT:") :]
+        for line in completed.stdout.splitlines()
+        if line.startswith("BACKEND_REPORT:")
+    ]
+    assert len(reports) == 1, (
+        f"expected exactly one backend report, got {reports!r}\n{completed.stdout}"
+    )
+    return json.loads(reports[0])
+
+
+def test_backend_is_agg(tmp_path: Path, tmp_out: Path) -> None:
+    """matplotlib.use("Agg") precedes the first pyplot import, and Agg is live.
+
+    Two halves, and the order matters: the source half (below) pins the ordering
+    statically and cannot be faked by any runtime state; the runtime half then
+    asks the question the name claims to answer - is Agg actually LIVE after the
+    production render has run - in a fresh process where the answer cannot have
+    been inherited from this test session.
+    """
     source = _module_source()
     tree = ast.parse(source)
     use_lines = [
@@ -391,10 +489,35 @@ def test_backend_is_agg() -> None:
         'matplotlib.use("Agg") must precede the first import matplotlib.pyplot'
     )
 
-    import matplotlib
-    import matplotlib.pyplot  # noqa: F401 (imported only to bind the backend)
+    # --- the runtime half: a fresh process, the production CLI, no in-process state
+    spec_path = _write_spec(tmp_path, [_spec_series_item(TRACER_SERIES_ID)])
+    _copy_fixtures(tmp_out, (TRACER_SERIES_ID,))
+    report = _probe_backend_in_fresh_process(spec_path, tmp_out)
 
-    assert matplotlib.get_backend().lower() == "agg"
+    # The precondition that gives the last assertion meaning: the probe really
+    # did start on a NON-Agg backend. Without this, "after == agg" could be a
+    # property of the host rather than something production did.
+    assert report["ambient"].lower() == ADVERSARIAL_AMBIENT_BACKEND.lower()
+    assert report["ambient"].lower() != "agg", (
+        "the probe's ambient backend must not be Agg, or the assertion below is free"
+    )
+
+    # And production really rendered to completion, so the backend claim is about
+    # a live render rather than about an import that happened and then raised.
+    assert report["error"] is None, report["error"]
+    assert report["rc"] == 0, report
+    pngs = sorted(tmp_out.glob("*.png"))
+    assert len(pngs) == 3, [path.name for path in pngs]
+    for png in pngs:
+        blob = png.read_bytes()
+        assert blob[:8] == PNG_MAGIC, f"{png.name} must be a real PNG"
+
+    # The claim the test's name makes. `use("Agg")` on its own is not enough: the
+    # backend is read AFTER the render, so this is the state a reader's process
+    # ends up in, and a `use("Agg")` that never reached pyplot leaves it untouched.
+    assert report["after"].lower() == "agg", (
+        f"the production render must leave Agg live; it left {report['after']!r}"
+    )
 
 
 def test_charts_module_ast_forbids_dynamic_execution_and_heavy_dependencies() -> None:
