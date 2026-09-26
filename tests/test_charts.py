@@ -487,45 +487,90 @@ UNSAFE_SERIES_IDS = (
 
 
 def test_inventory_is_two_png_per_series_plus_overlay(tmp_out: Path) -> None:
-    """D-19: one PNG per (series_id, kind) pair, plus exactly one overlay (2N+1)."""
+    """D-19's 2N+1, closed and pinned: two per-series kinds plus one overlay."""
     spec_path, manifest = _render_two_series(tmp_out)
     document = _plan(tmp_out, spec_path)
     order = _metrics_series_order()
     per_series = [entry for entry in document.charts if entry.series_id is not None]
     overlay = [entry for entry in document.charts if entry.kind == make_charts.OVERLAY_KIND]
     timeseries = [entry for entry in per_series if entry.kind == make_charts.TIMESERIES_KIND]
+    growth = [entry for entry in per_series if entry.kind == make_charts.GROWTH_KIND]
 
-    # One timeseries entry per series, in metrics.json series order. CONTRACTS.md
-    # §3 freezes that order as spec.series[] order, so nothing may sort it away.
+    # One entry of each per-series kind per series, in metrics.json series order.
+    # CONTRACTS.md §3 freezes that order as spec.series[] order, so nothing may
+    # sort it away.
     assert [entry.series_id for entry in timeseries] == list(order)
+    assert [entry.series_id for entry in growth] == list(order)
     assert [entry.spec_index for entry in timeseries] == list(range(len(order)))
+    assert [entry.spec_index for entry in growth] == list(range(len(order)))
     assert [entry.spec_index for entry in per_series] == sorted(
         entry.spec_index for entry in per_series
     ), "charts[] must follow spec order, never a sort by label or language"
 
     # A chart is identified by the pair (series_id, kind): no duplicate pair, and
-    # the per-series side of the inventory is exactly N x (kinds per series).
+    # the per-series side of the inventory is exactly N x 2.
     pairs = [(entry.series_id, entry.kind) for entry in per_series]
     assert len(pairs) == len(set(pairs)), "one entry per (series_id, kind) pair"
-    kinds_per_series = {entry.kind for entry in per_series}
-    assert len(per_series) == len(order) * len(kinds_per_series)
+    assert {entry.kind for entry in per_series} == {
+        make_charts.TIMESERIES_KIND,
+        make_charts.GROWTH_KIND,
+    }, "D-19 names exactly two per-series kinds"
+    assert len(per_series) == len(order) * 2
     assert len(overlay) == 1, "the comparison view must never be conditional on N > 1"
-    # D-19's 2N+1: N x (per-series kinds) + exactly one comparison view. With two
-    # per-series kinds this is the literal 2N+1; plan 05-04 Task 2 pins the
-    # number and the kind sequence here, and adds the N=1/N=2 parametrization.
-    assert len(document.charts) == len(order) * len(kinds_per_series) + 1
+
+    # D-19's literal 2N+1, and the kind sequence it produces. Per-series kinds
+    # are adjacent siblings in spec order; the overlay is last.
+    assert len(document.charts) == 2 * len(order) + 1
+    assert len(document.charts) == 5
+    assert [entry.kind for entry in document.charts] == [
+        make_charts.TIMESERIES_KIND,
+        make_charts.GROWTH_KIND,
+        make_charts.TIMESERIES_KIND,
+        make_charts.GROWTH_KIND,
+        make_charts.OVERLAY_KIND,
+    ]
     assert document.charts[-1].kind == make_charts.OVERLAY_KIND, "the overlay is last"
 
     # Count from the manifest, never from a directory glob: an orphan file must
     # not be able to stand in for a designed chart, and a dangling entry must
     # not be able to hide.
-    assert len(manifest["charts"]) == len(document.charts)
-    assert sorted(path.name for path in tmp_out.glob("*.png")) == sorted(
+    assert len(manifest["charts"]) == len(document.charts) == 5
+    assert {path.name for path in tmp_out.glob("*.png")} == {
         entry["filename"] for entry in manifest["charts"]
-    )
+    }
+    assert len(list(tmp_out.glob("*.png"))) == 5, "exactly five PNGs on disk"
+    assert make_charts.OVERLAY_FILENAME in {path.name for path in tmp_out.glob("*.png")}
     assert [entry["spec_index"] for entry in manifest["charts"] if "series_id" in entry] == [
         entry.spec_index for entry in per_series
     ], "the manifest must publish the same spec order the plan declares"
+
+
+@pytest.mark.parametrize(
+    ("series_ids", "expected_total"),
+    [(("pl-post-przerywany",), 3), (("cs-pust-prerusovany", "pl-post-przerywany"), 5)],
+    ids=["N=1", "N=2"],
+)
+def test_inventory_total_is_two_per_series_plus_one_overlay(
+    tmp_path: Path,
+    series_ids: tuple[str, ...],
+    expected_total: int,
+) -> None:
+    """The 2N+1 count holds for any N, checked from the plan and from the disk."""
+    out_dir = tmp_path / "out"
+    if len(series_ids) == 1:
+        spec_path = _write_spec(tmp_path, [_spec_series_item(series_ids[0])])
+    else:
+        spec_path = FIXTURES_DIR / "spec.example.json"
+    _copy_fixtures(out_dir, series_ids)
+    assert _run_charts(spec_path, out_dir) == 0
+
+    document = _plan(out_dir, spec_path)
+    assert len(document.charts) == 2 * len(series_ids) + 1
+    assert len(document.charts) == expected_total
+    assert [c.kind for c in document.charts].count(make_charts.OVERLAY_KIND) == 1
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    assert len(manifest["charts"]) == expected_total
+    assert len(list(out_dir.glob("*.png"))) == expected_total
 
 
 def test_filenames_are_deterministic_and_derived_from_series_id(tmp_path: Path) -> None:
@@ -854,6 +899,203 @@ def test_missing_growth_window_fails_closed(
     assert "'y2'" in captured.err
     assert TRACER_SERIES_ID in captured.err
     assert list(tmp_out.glob("*.png")) == []
+
+
+# --- Plan 05-04 Task 2: the negative-bar guarantee, 0 != null, and 2N+1
+
+
+def _write_growth_pair_with_pct(
+    out_dir: Path, series_id: str, window: str, pct: float, absolute: int
+) -> None:
+    """Copy the golden pair into out_dir, then set one window's clean pct/abs."""
+    _copy_fixtures(out_dir, ALL_SERIES_IDS)
+    path = out_dir / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == series_id)
+    node["growth"][window]["clean"]["pct"] = pct
+    node["growth"][window]["clean"]["abs"] = absolute
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_negative_growth_bar_stays_within_y_limits(tmp_out: Path) -> None:
+    """RESEARCH Pitfall 1: a -22.0% decline must render downward, never be clipped.
+
+    The measured failure was `set_ylim(0, None)` on `[3.5, 16.7, -22.0]`
+    producing `ylim (0.0, 18.63)` - the decline entirely outside the visible
+    axis, so a falling topic read as a small rising one. On this horizontal form
+    the same truncation is `set_xlim(left=0)`, which the branch never calls.
+    """
+    _write_growth_pair_with_pct(tmp_out, TRACER_SERIES_ID, "y1", -22.0, -4860)
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 0
+
+    document = _plan(tmp_out, FIXTURES_DIR / "spec.example.json")
+    entry = _growth_entry_of(document, TRACER_SERIES_ID)
+
+    # The value-axis floor is below the most negative bar, so nothing is clipped.
+    assert entry.y_limits[0] < 0.0
+    assert entry.y_limits[0] <= -22.0
+    # And the ceiling still clears the largest positive bar on the same chart
+    # (3M's +3.5% - the 1Y bar it replaced was the +16.7%).
+    assert entry.y_limits[1] >= 3.5
+
+    bars = {bar.window: bar for bar in entry.bars}
+    # The bar's value is the negative pct exactly, drawn downward from zero.
+    assert bars["y1"].pct == -22.0
+    assert bars["y1"].abs == -4860
+    # All three render paths are on one chart: positive, negative, and null.
+    assert bars["m3"].pct == 3.5
+    assert bars["y2"].pct is None
+
+    manifest = json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
+    published = _published_growth_of(manifest, TRACER_SERIES_ID)
+    assert published["y_limits"] == [entry.y_limits[0], entry.y_limits[1]]
+    assert published["y_limits"][0] <= -22.0
+    y1_bar = next(bar for bar in published["bars"] if bar["window"] == "y1")
+    assert y1_bar["pct"] == -22.0
+    assert y1_bar["bar_null"] is False
+
+    blob = tmp_out.joinpath(published["filename"]).read_bytes()
+    assert blob[:8] == PNG_MAGIC, "the growth chart must be a real PNG"
+    assert len(blob) > 1024, "the growth chart must not be empty or truncated"
+
+
+def test_growth_axes_never_receive_a_zero_floor() -> None:
+    """The growth branch names no axis-limit call at all - the prohibition as a call.
+
+    Scoped to the GROWTH_KIND branch of `render_chart` (and the draw helper it
+    delegates to) rather than counted module-wide, so a legitimate
+    `set_ylim` on the timeseries or overlay path cannot misfire this guard.
+    """
+    tree = ast.parse(_module_source())
+    render_functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "render_chart"
+    ]
+    assert len(render_functions) == 1, "render_chart must be a single function"
+    forbidden = {"set_xlim", "set_ylim", "set_xscale"}
+
+    # The branch is located by the *identifier* `GROWTH_KIND`, so resolve that
+    # identifier to its value in the module and require it to be the real kind
+    # constant. Without this the guard would keep "passing" after a rename that
+    # silently moved the growth branch somewhere the walk cannot see.
+    constant_value = None
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "GROWTH_KIND"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+        ):
+            constant_value = node.value.value
+    assert constant_value == make_charts.GROWTH_KIND
+
+    growth_branches: list[ast.AST] = []
+    for node in ast.walk(render_functions[0]):
+        if not isinstance(node, ast.If):
+            continue
+        comparison = node.test
+        if not isinstance(comparison, ast.Compare) or len(comparison.comparators) != 1:
+            continue
+        comparator = comparison.comparators[0]
+        if (
+            isinstance(comparator, ast.Name)
+            and comparator.id == "GROWTH_KIND"
+            and isinstance(comparison.left, ast.Attribute)
+            and comparison.left.attr == "kind"
+        ):
+            growth_branches.extend(node.body)
+    assert growth_branches, "render_chart must branch on the GROWTH_KIND entry"
+
+    # The branch delegates to a private draw helper; follow the delegation so the
+    # guard covers the code that actually issues matplotlib calls.
+    drawn_bodies: list[ast.AST] = list(growth_branches)
+    for node in growth_branches:
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_draw_growth"
+        ):
+            helpers = [
+                item
+                for item in ast.walk(tree)
+                if isinstance(item, ast.FunctionDef) and item.name == "_draw_growth"
+            ]
+            assert len(helpers) == 1, "the growth render path must be its own function"
+            drawn_bodies.extend(helpers[0].body)
+
+    offending = [
+        f"{node.func.attr}() at line {node.lineno}"
+        for root in drawn_bodies
+        for node in ast.walk(root)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in forbidden
+    ]
+    assert not offending, (
+        "the growth branch must name no axis-limit or scale call - a zero floor "
+        f"here erases a negative bar: {offending}"
+    )
+
+    # The positive half: a zero floor on the *timeseries* path is D-14, and this
+    # guard must not mistake it for a violation.
+    timeseries_helpers = [
+        item
+        for item in ast.walk(tree)
+        if isinstance(item, ast.FunctionDef) and item.name == "_draw_timeseries"
+    ]
+    assert len(timeseries_helpers) == 1
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set_ylim"
+        for node in ast.walk(timeseries_helpers[0])
+    ), "D-14's timeseries zero floor must still be there - this guard is scoped"
+
+
+def test_zero_growth_is_a_solid_bar_distinct_from_the_null_bar(tmp_out: Path) -> None:
+    """A real 0.0% reading and a null must never be confusable (ANAL-06 as rendered)."""
+    _write_growth_pair_with_pct(tmp_out, TRACER_SERIES_ID, "y1", 0.0, 0)
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 0
+
+    document = _plan(tmp_out, FIXTURES_DIR / "spec.example.json")
+    entry = _growth_entry_of(document, TRACER_SERIES_ID)
+    bars = {bar.window: bar for bar in entry.bars}
+    assert bars["y1"].pct == 0.0
+    assert bars["y1"].pct is not None, "a 0.0 reading is a number, never a null"
+    assert bars["y1"].reason is None
+    assert bars["y2"].pct is None
+    assert bars["y2"].reason == "insufficient observations in one or both equal-length windows"
+
+    manifest = json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
+    published = _published_growth_of(manifest, TRACER_SERIES_ID)
+    published_bars = {bar["window"]: bar for bar in published["bars"]}
+    # The distinction is explicit in the artifact, not inferred from a missing key.
+    assert published_bars["y1"]["bar_null"] is False
+    assert published_bars["y1"]["pct"] == 0.0
+    assert "reason" not in published_bars["y1"]
+    assert published_bars["y2"]["bar_null"] is True
+    assert "pct" not in published_bars["y2"]
+    assert published_bars["y2"]["reason"]
+
+    # And a 0.0 bar still has its own place on the value axis: the all-positive
+    # range includes it rather than collapsing to a degenerate span.
+    assert entry.y_limits[0] < 0.0 <= entry.y_limits[1]
+
+
+def test_growth_bar_order_matches_contract_key_order(tmp_out: Path) -> None:
+    """The bars follow the analyzer's own key order, so it cannot silently reorder."""
+    spec_path, _manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    for entry in document.charts:
+        if entry.kind != make_charts.GROWTH_KIND:
+            continue
+        assert [bar.window for bar in entry.bars] == list(analyze_trends.GROWTH_WINDOWS)
+        assert tuple(bar.window for bar in entry.bars) == make_charts.GROWTH_BAR_WINDOWS
+    assert list(analyze_trends.GROWTH_WINDOWS) == ["m3", "y1", "y2"]
 
 
 # --- Plan 05-03 Task 2: the shared-axis multi-series overlay (D-01, D-20)

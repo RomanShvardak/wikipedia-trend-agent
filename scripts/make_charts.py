@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import sys
+import textwrap
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -92,6 +93,19 @@ GROWTH_METHOD_PHRASE = "clean growth (anomalies excluded)"
 # and never a zero-height solid one.
 NULL_BAR_COLOR = "#ADB5BD"
 NULL_BAR_HATCH = "///"
+NULL_BAR_EDGE = "#6C757D"
+# D-04 wants a *visible* hatched bar, and a zero-width rectangle draws nothing:
+# the first render of this chart left the 2Y row completely blank, hatch included.
+# The n/a stub is therefore this fraction of the already-planned value-axis span -
+# a display constant read off `entry.y_limits`, never a data value, and it sits
+# beside an "n/a" label so it can never be read as a small measurement.
+NULL_BAR_WIDTH_FRACTION = 0.02
+# Where the n/a text starts, as a fraction of the axes width. Anchored clear of
+# the stub itself, which occupies the first NULL_BAR_WIDTH_FRACTION of the span.
+NULL_LABEL_AXES_FRACTION = 0.04
+# The contract reason is quoted verbatim (D-04), so it is wrapped to this width
+# rather than truncated: a clipped reason is the same defect as a missing one.
+NULL_BAR_REASON_WRAP = 34
 # Bar geometry. `barh` takes a *height* argument, so BAR_HEIGHT is the vertical
 # extent of each horizontal bar - it is not a `set_height` call, which is the
 # vertical-form call the prohibition names.
@@ -656,24 +670,39 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
     """
     positions = list(range(len(entry.bars)))
     labels: list[str] = []
+    # The only arithmetic in this body: the width of the n/a stub, as a fraction
+    # of the span the plan already computed. It is a display constant, never a
+    # measurement - no bar value passes through it.
+    span = entry.y_limits[1] - entry.y_limits[0]
+    stub_width = span * NULL_BAR_WIDTH_FRACTION
+    # A label anchored at a bar's end and extending outward runs off the plot
+    # when that end sits near the axis edge - the first render clipped the 3M
+    # label against the right spine. Anchoring each label *inward* (toward the
+    # axis midpoint) keeps it inside the axes for every bar position, and the
+    # label is drawn above its own bar, never on it.
+    midpoint = (entry.y_limits[0] + entry.y_limits[1]) / 2.0
     for index, bar in enumerate(entry.bars):
         window_label = WINDOW_LABELS[bar.window]
         labels.append(window_label)
         if bar.pct is None:
             # D-04: visible, hatched, grey, and annotated with the contract
-            # reason. Never a missing row, never a zero-height solid bar.
-            drawn = ax.barh(index, 0.0, height=BAR_HEIGHT)
+            # reason. Never a missing row, never a zero-height solid bar. The
+            # annotation is anchored in axes fractions, not data coordinates,
+            # so the reason stays inside the plot on any axis sign.
+            drawn = ax.barh(index, stub_width, height=BAR_HEIGHT)
             for patch in drawn:
                 patch.set_color(NULL_BAR_COLOR)
+                patch.set_edgecolor(NULL_BAR_EDGE)
                 patch.set_hatch(NULL_BAR_HATCH)
             ax.annotate(
-                f"{REASON_NA_LABEL}\n{bar.reason}",
-                xy=(0.0, index),
-                xytext=(6, 0),
+                f"{REASON_NA_LABEL}\n{textwrap.fill(bar.reason or '', NULL_BAR_REASON_WRAP)}",
+                xy=(NULL_LABEL_AXES_FRACTION, index),
+                xycoords=("axes fraction", "data"),
+                xytext=(0, 0),
                 textcoords="offset points",
                 va="center",
                 ha="left",
-                fontsize=8,
+                fontsize=7,
                 color="#495057",
             )
             continue
@@ -681,17 +710,19 @@ def _draw_growth(entry: ChartEntry, ax: Any) -> None:
         for patch in drawn:
             patch.set_color(GROWTH_BAR_COLOR)
         # D-05: value, window and volume base on the chart itself, so every
-        # dynamic number is traceable without the report. The base is formatted
-        # with a space thousands separator (display-only; the compared value in
-        # charts.json is the unformatted contract number).
+        # dynamic number is traceable without the report. The label sits ABOVE
+        # its own bar's end, not beside it: beside it, a left-anchored label on a
+        # negative bar lands on the y tick labels, which is what the first render
+        # showed. The base is formatted with a space thousands separator
+        # (display-only; the compared value in charts.json is unformatted).
         ax.annotate(
-            f"{window_label} {bar.pct:+.1f}%\non {bar.base_avg_daily_views: ,.1f} views/day",
+            f"{window_label} {bar.pct:+.1f}%\non {bar.base_avg_daily_views: .1f} views/day",
             xy=(bar.pct, index),
-            xytext=(6 if bar.pct >= 0 else -6, 0),
+            xytext=(0, 9),
             textcoords="offset points",
-            va="center",
-            ha="left" if bar.pct >= 0 else "right",
-            fontsize=8,
+            va="bottom",
+            ha="right" if bar.pct >= midpoint else "left",
+            fontsize=7,
             color="#212529",
         )
     ax.set_yticks(positions)
