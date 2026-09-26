@@ -615,6 +615,166 @@ def test_timeseries_has_raw_and_median_series(tmp_out: Path) -> None:
         assert len(entry.points) == len(expected)
 
 
+def _write_all_zero_pair(out_dir: Path) -> Path:
+    """Write a series.csv in which EVERY series has views=0 on EVERY day.
+
+    `_write_zero_pair` can blank two named days; nothing built the fully
+    degenerate series, which is why CR-04's state had no test at all. The
+    committed fixtures have a minimum of 1000, so `y_limits[1] > 0.0` held
+    everywhere by accident of the data rather than by construction.
+
+    metrics.json is rebuilt by the sanctioned analyzer rather than hand-edited,
+    for the reason `_write_zero_pair` gives: a zero is a real observation
+    (D-11), so the growth windows and the anomaly detector must see it.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = FIXTURES_DIR.joinpath("series.example.csv").read_text(encoding="utf-8").splitlines()
+    patched: list[str] = []
+    for index, line in enumerate(rows):
+        if index > 0:
+            fields = line.split(",")
+            fields[1] = "0"
+            line = ",".join(fields)
+        patched.append(line)
+    out_dir.joinpath("series.csv").write_text("\n".join(patched) + "\n", encoding="utf-8")
+
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+    out_dir.joinpath("metrics.json").write_text(
+        json.dumps(
+            analyze_trends.build_metrics(spec, str(spec_path), grouped),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return spec_path
+
+
+@pytest.mark.parametrize("regime", ["linear", "log"])
+def test_a_degenerate_all_zero_series_still_gets_a_drawable_axis(
+    tmp_path: Path, regime: str
+) -> None:
+    """CR-04: an all-zero series must not produce a zero span, in either regime.
+
+    `max(values) * 1.05` is 0.0 when every reading is 0, and D-14's floor is the
+    literal 0.0, so the two together were `set_ylim(0.0, 0.0)`. Measured: that
+    makes the transform singular and matplotlib auto-expands to (-0.05, 0.05) -
+    an axis showing NEGATIVE view counts, which is RESEARCH Pitfall 2 and D-14's
+    exact target reached through a zero span instead of a missing floor. Under
+    `--log-scale` the same series published the inverted pair [1.0, 0.0], low
+    bound above high bound.
+    """
+    out_dir = tmp_path / f"zero-{regime}"
+    spec_path = _write_all_zero_pair(out_dir)
+    log_scale = regime == "log"
+    flags = ("--log-scale",) if log_scale else ()
+    assert _run_charts_with_flags(spec_path, out_dir, *flags) == 0
+
+    document = _plan(out_dir, spec_path, log_scale=log_scale)
+    # Nothing may publish a degenerate or inverted pair - not just the timeseries
+    # axis, but every entry in the document, in the regime it was drawn in.
+    for entry in document.charts:
+        low, high = entry.y_limits
+        assert low < high, (
+            f"{entry.kind}: a published y_limits must be a real pair, not "
+            f"{entry.y_limits}"
+        )
+    manifest = json.loads(out_dir.joinpath("charts.json").read_text(encoding="utf-8"))
+    for item in manifest["charts"]:
+        published_low, published_high = item["y_limits"]
+        assert published_low < published_high, (
+            f"{item['kind']}: the manifest published an inverted or degenerate "
+            f"pair {[published_low, published_high]}"
+        )
+        # D-15: the flag reaches the timeseries and overlay axes only; a
+        # percentage bar chart is never a log axis.
+        if item["kind"] != make_charts.GROWTH_KIND:
+            assert item["yscale"] == ("log" if log_scale else "linear")
+
+    if not log_scale:
+        # D-14's floor is the literal 0.0 and the ceiling now has a floor of its
+        # own, so a series of nothing but zeros is still drawable and still says
+        # "no negative views".
+        for entry in (c for c in document.charts if c.kind != make_charts.GROWTH_KIND):
+            assert entry.y_limits[0] == 0.0, "D-14's floor is the literal 0.0"
+            assert entry.y_limits[1] >= 1.0, (
+                "an all-zero series must still get a ceiling above zero"
+            )
+
+    # And the picture exists: a real PNG for every chart the manifest claims.
+    for item in manifest["charts"]:
+        blob = out_dir.joinpath(item["filename"]).read_bytes()
+        assert blob[:8] == PNG_MAGIC, f"{item['filename']} must be a real PNG"
+        assert len(blob) > 1024, f"{item['filename']} must not be empty"
+
+    # And the picture itself: the defect was never the manifest, it was the axis
+    # matplotlib drew from a zero span. Read the drawn limits back off the axes
+    # production builds and require the floor the plan published.
+    import matplotlib
+
+    if matplotlib.get_backend().lower() != "agg":
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    drawn_axes: list[Any] = []
+    original_subplots = plt.subplots
+
+    def _recording_subplots(*args: Any, **kwargs: Any) -> Any:
+        figure, axes = original_subplots(*args, **kwargs)
+        drawn_axes.append(axes)
+        return figure, axes
+
+    timeseries = _timeseries_entry_of(document)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(plt, "subplots", _recording_subplots)
+        make_charts.render_chart(timeseries, out_dir)
+    assert len(drawn_axes) == 1
+    drawn_low, drawn_high = (float(bound) for bound in drawn_axes[0].get_ylim())
+    assert drawn_low >= 0.0, (
+        "the drawn value axis must never show a negative view count (RESEARCH "
+        f"Pitfall 2 / D-14); the figure drew {drawn_low}..{drawn_high}"
+    )
+    assert drawn_low < drawn_high, f"the drawn axis is degenerate: {(drawn_low, drawn_high)}"
+
+    # The state is honestly disclosed rather than silently absorbed: every reading
+    # is non-positive, so the log regime must say it masked all of them. The
+    # expected count is recomputed from the CSV by the existing independent
+    # counter, never read back out of the plan under test.
+    if log_scale:
+        nonpositive = _csv_nonpositive_count(out_dir / "series.csv", TRACER_SERIES_ID)
+        assert nonpositive > 0, "the all-zero CSV must actually carry non-positive days"
+        for entry in (c for c in document.charts if c.yscale == make_charts.LOG_YSCALE):
+            expected = (
+                sum(_csv_nonpositive_count(out_dir / "series.csv", line.series_id)
+                    for line in entry.series_lines)
+                if entry.kind == make_charts.OVERLAY_KIND
+                else nonpositive
+            )
+            assert entry.log_masked_points == expected, (
+                "a log chart that masked every reading must count every reading"
+            )
+            assert entry.log_note, "a log chart that masked everything must say so"
+
+
+def test_display_limits_refuses_a_degenerate_pair() -> None:
+    """CR-04: the refusal itself is tested, not only the state that triggered it.
+
+    A ceiling fix alone would leave the next degenerate pair publishable. Every
+    entry routes `y_limits` through this one function precisely so the refusal is
+    a property of the field; if that function ever stopped refusing, the guard
+    would have no way of knowing.
+    """
+    assert make_charts._display_limits(0.0, 1.0, "probe") == (0.0, 1.0)
+    assert make_charts._display_limits(-1.0, 0.5, "probe") == (-1.0, 0.5)
+    for degenerate in ((0.0, 0.0), (1.0, 0.0), (5.0, 5.0)):
+        with pytest.raises(make_charts.ChartError) as raised:
+            make_charts._display_limits(*degenerate, "probe")
+        assert "degenerate" in str(raised.value)
+        assert "probe" in str(raised.value), "the refusal must name the chart it refused"
+
+
 def test_timeseries_y_limits_anchored_at_zero(tmp_out: Path) -> None:
     """D-14: the lower bound is exactly 0.0, not merely bounded below by zero.
 

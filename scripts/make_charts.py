@@ -58,6 +58,13 @@ DPI = 150
 # D-14: the timeseries floor is the literal 0.0; the ceiling only adds headroom
 # so the highest raw point is not drawn on the frame.
 Y_HEADROOM_FACTOR = 1.05
+# The ceiling's own floor, for a series in which EVERY reading is zero. Without
+# it, `max(values) * 1.05` is 0.0 and `set_ylim(0.0, 0.0)` makes the transform
+# singular: matplotlib auto-expands to (-0.05, 0.05) and the chart shows negative
+# view counts, which is RESEARCH Pitfall 2 reached through a zero span rather
+# than through a missing floor. A DISPLAY bound, like the log floor beside it and
+# never a data claim - which is why it is a literal rather than a computed value.
+Y_CEILING_FLOOR = 1.0
 TIMESERIES_KIND = "timeseries"
 GROWTH_KIND = "growth"
 OVERLAY_KIND = "overlay"
@@ -72,6 +79,11 @@ LINEAR_YSCALE = "linear"
 # The floor of a log axis when EVERY plotted value is non-positive, so there is
 # no smallest positive reading to show. A DISPLAY bound, never a data claim.
 LOG_FALLBACK_LOWER_BOUND = 1.0
+# ...and the matching ceiling for the same state. Both bounds are arbitrary by
+# construction - the data has nothing to show - so both are recognisable
+# literals, and the pair stays strictly ordered (a low bound at or above the
+# high bound is refused by `_display_limits` rather than published).
+LOG_FALLBACK_UPPER_BOUND = 10.0
 # The disclosure D-15 requires on both the image and in the manifest. A constant
 # format string rather than a localized token: this text is the interface a
 # reader (and Phase 6) reads to learn what the axis did not draw, and a count
@@ -759,6 +771,46 @@ def _log_lower_bound(values: Sequence[int | float]) -> float:
     return min(positives)
 
 
+def _timeseries_ceiling(values: Sequence[int | float], log_scale: bool) -> float:
+    """The headroom ceiling, with a floor of its own.
+
+    `max(values) * Y_HEADROOM_FACTOR` is 0.0 for an all-zero series - a state the
+    fetcher can produce, since it writes `0` for a day with no data and D-11 keeps
+    a zero a reading. Paired with D-14's literal 0.0 floor that is
+    `set_ylim(0.0, 0.0)`, which makes the transform singular: matplotlib
+    auto-expands to (-0.05, 0.05) and the chart shows negative view counts. That
+    is RESEARCH Pitfall 2 and D-14's exact target, reached through a zero span
+    rather than through a missing floor, so the ceiling is bounded from below as
+    well as the floor from above. The bound is a DISPLAY fact, never a claim
+    about the data.
+
+    In the log regime the maximum is taken over the positive readings only, which
+    is identical to the raw maximum whenever anything is positive and yields the
+    arbitrary-but-recognisable fallback pair when nothing is.
+    """
+    if log_scale:
+        positives = [float(value) for value in values if value > 0]
+        if not positives:
+            return LOG_FALLBACK_UPPER_BOUND
+        return max(positives) * Y_HEADROOM_FACTOR
+    return max(float(max(values)) * Y_HEADROOM_FACTOR, Y_CEILING_FLOOR)
+
+
+def _display_limits(low: float, high: float, where: str) -> tuple[float, float]:
+    """The published display bounds, refused outright when they are degenerate.
+
+    CONTRACTS.md 7.2 calls `y_limits` a pair of display bounds, and a pair with
+    its low bound at or above its high bound is not a pair of bounds at all -
+    matplotlib discards it and autoscales, so the manifest would describe
+    nothing. Every entry's `y_limits` passes through here, so the refusal is a
+    property of the field rather than of each call site remembering to check.
+    `low < high` is false for a NaN too, which is the correct answer.
+    """
+    if not low < high:
+        raise ChartError(f"{where} display bounds are degenerate: [{low}, {high}]")
+    return (float(low), float(high))
+
+
 def _log_note(masked: int) -> str:
     """The exact disclosure string a log chart prints and charts.json publishes."""
     return LOG_NOTE_TEMPLATE.format(masked=masked)
@@ -785,11 +837,14 @@ def _timeseries_entry(
         DataGap(series_id, start, end, tokens["no_data"]) for start, end in calendar_gaps(points)
     )
     masked = _nonpositive_count(raw_values) if log_scale else 0
-    ceiling = float(max(raw_values)) * Y_HEADROOM_FACTOR
+    ceiling = _timeseries_ceiling(raw_values, log_scale)
     # D-14: the floor is the literal 0.0, never a computed value, so no axis can
     # ever imply negative views. D-15 changes the REGIME, not that rule: a log
     # axis cannot express a zero floor at all, which is why it is a separately
     # labelled mode with its own disclosure rather than a variant of this one.
+    # `_timeseries_ceiling` bounds the ceiling from below for the same reason
+    # from the other side, and `_display_limits` refuses the degenerate pair the
+    # two would otherwise form.
     floor = _log_lower_bound(raw_values) if log_scale else 0.0
     return ChartEntry(
         kind=TIMESERIES_KIND,
@@ -814,7 +869,7 @@ def _timeseries_entry(
         yscale=LOG_YSCALE if log_scale else LINEAR_YSCALE,
         log_masked_points=masked,
         log_note=_log_note(masked) if log_scale else None,
-        y_limits=(floor, ceiling),
+        y_limits=_display_limits(floor, ceiling, f"timeseries {series_id}"),
         bars=(),
         note=None,
         subtitle=_subtitle(label, tokens, len(anomalies)),
@@ -952,7 +1007,10 @@ def _growth_entry(
         yscale=LINEAR_YSCALE,
         log_masked_points=0,
         log_note=None,
-        y_limits=_growth_value_limits(bars),
+        y_limits=_display_limits(
+            *_growth_value_limits(bars), f"growth {series_id}"
+        ),
+
         # No date axis on this chart, so there is no D-10 domain to publish -
         # and the omission is by the `x_limits is not None` guard, not by kind.
         x_limits=None,
@@ -999,8 +1057,6 @@ def _overlay_entry(
     start = min(line.x_limits[0] for line in lines)
     end = max(line.x_limits[1] for line in lines)
     # D-14 applied to the overlay as a timeseries axes - which is what it is.
-    # One shared ceiling over every series, so the axis is comparable.
-    largest = max(max(line.raw_values) for line in lines)
     # D-15 on the comparison view: one shared regime, one shared disclosure, and
     # the masked count is the union over every line - a line's non-positive days
     # are absent from the SHARED axis, not just from its own plot, so counting
@@ -1008,6 +1064,10 @@ def _overlay_entry(
     all_values = [value for line in lines for value in line.raw_values]
     masked = _nonpositive_count(all_values) if log_scale else 0
     floor = _log_lower_bound(all_values) if log_scale else 0.0
+    # ONE shared ceiling over the union of every series, so the axis is
+    # comparable - and with the same floor as the per-series axis, because an
+    # all-zero union must not form a zero span either.
+    ceiling = _timeseries_ceiling(all_values, log_scale)
     return ChartEntry(
         kind=OVERLAY_KIND,
         series_id=None,
@@ -1038,7 +1098,7 @@ def _overlay_entry(
         yscale=LOG_YSCALE if log_scale else LINEAR_YSCALE,
         log_masked_points=masked,
         log_note=_log_note(masked) if log_scale else None,
-        y_limits=(floor, float(largest) * Y_HEADROOM_FACTOR),
+        y_limits=_display_limits(floor, ceiling, "overlay"),
         bars=(),
         # D-20: the manifest's machine-readable disclosure, deliberately ASCII
         # and unlocalized because Phase 6 quotes it verbatim. The ON-IMAGE text
