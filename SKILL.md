@@ -30,6 +30,18 @@ Use this skill when the user:
 Do not use it as a demand/ability-to-pay forecast: article interest ≠ product
 demand. Say that explicitly in conclusions.
 
+## Where the detail lives
+
+Load one file per question. This body deliberately does not restate them.
+
+| Question | File |
+|---|---|
+| What fields exist, and what does `pct: null` mean? | `references/CONTRACTS.md` (§1 spec, §2 metrics, §6 resolved, §7 charts, §8 report) |
+| How do I read `confidence`, `confidence_reasons` and `trend_direction`? What may I say out loud? | `references/INTERPRETATION.md` |
+| What are the UA, throttle, retry, 404 and cache rules? | `references/API_ACCESS.md` |
+| What makes these numbers easy to misread? | `references/DATA_CAVEATS.md` |
+| What does a conforming spec look like? | `assets/example.intermittent-fasting.json` |
+
 ## Workflow
 
 1. **Discover canonical articles.** Run `resolve_articles.py` with the shared
@@ -44,26 +56,56 @@ demand. Say that explicitly in conclusions.
    `--topic-for` expression, then add `--select PROJECT=ARTICLE` for exactly
    one saved `status="selectable"` candidate per project. An `ambiguous`
    project also requires `--reason`. Stop here unless the published manifest
-   reports `status="confirmed"`.
+   reports `status="confirmed"`. The second run is offline and
+   candidate-bounded: it may only choose among candidates the first run saved.
 4. **Author `spec.json`.** Only after confirmation, turn the request into the
    frozen input contract: articles-first `series[]` with full fields per
-   `references/CONTRACTS.md` (§1). Copy each confirmed
-   `selection.article` verbatim as `series[].article`; the topic lives only in
-   `request`.
-5. **Validate.** Run the spec through the shared validator (aggregated model-
-   readable stderr, exit 2 on violations). Example spec:
-   `tests/fixtures/spec.example.json`.
-6. **Run the stages**:
-   - fetch (`fetch_pageviews.py`) — data → `series.csv` with `.cache/`,
-     UA fail-fast and ~1 req/s throttle;
-   - analyze (`analyze_trends.py`) — growth/seasonality/anomalies/confidence
-     → `metrics.json`;
-   - charts (`make_charts.py`) — PNG charts;
-   - report (`build_report.py`) — Markdown report;
-   - **one-command `run_all.py` arrives in v0.7** — not implemented yet; until
-     then run the landed stages individually.
+   `references/CONTRACTS.md` (§1). Copy each confirmed `selection.article`
+   verbatim as `series[].article`; the topic lives only in `request`.
+5. **Validate.** The first stage validates the spec and refuses every violation
+   at once (aggregated model-readable stderr, exit 2). A conforming example is
+   `assets/example.intermittent-fasting.json`.
+6. **Run the pipeline — one command, normally:**
+
+   ```bash
+   python scripts/run_all.py --spec out/spec.json --out out
+   ```
+
+   | Exit | Meaning | What the model does |
+   |---|---|---|
+   | 0 | all four stages succeeded | read `out/metrics.json`, `out/report.md`, `out/charts.json` |
+   | 2 | the spec is invalid | fix the spec against `references/CONTRACTS.md` §1 and re-run; stderr lists every violation at once |
+   | 1 | fatal — empty series, no fetchable chunks, an unreadable input, a refused report language, or a missing User-Agent | read stderr, fix the article slug, the window, the `quality` flag or `WTI_USER_AGENT` |
+   | 3 | partial — at least one series failed to fetch and at least one succeeded | read the per-series `series_id: message` stderr lines, fix that slug, re-run |
+   | anything else | a crash | report it verbatim; do not rewrite pipeline logic |
+
+   The four stages run in this order: fetch (`fetch_pageviews.py`) → analyze
+   (`analyze_trends.py`) → charts (`make_charts.py`) → report
+   (`build_report.py`). The orchestrator stops at the first failing stage and
+   names it on stderr (`run_all: stage <name> failed: …`), so no later stage
+   ever runs and no later artifact is written. `resolve_articles.py` is
+   **not** part of it: it is the human-confirmed pre-stage in steps 1–3, and
+   `run_all.py` runs only after `spec.json` exists. The command takes exactly
+   `--spec`, `--out` and `--verbose`; it passes no `--log-scale`, so the one
+   command always produces the linear chart regime, and the opt-in log regime
+   is a deliberate second run of the chart stage.
+
+   **The diagnostic path — the four stages individually.** Use this when one
+   stage must be re-run with different options, or when you need its own
+   output on stderr. Each stage takes the same `--spec` and `--out`:
+
+   ```bash
+   python scripts/fetch_pageviews.py --spec out/spec.json --out out   # -> series.csv
+   python scripts/analyze_trends.py --spec out/spec.json --out out   # -> metrics.json
+   python scripts/make_charts.py  --spec out/spec.json --out out      # -> PNG charts + charts.json
+   python scripts/build_report.py --spec out/spec.json --out out     # -> report.md + report.manifest.json
+   ```
+
+   `make_charts.py` also accepts `--log-scale`; `run_all.py` deliberately does
+   not forward it.
 7. **Answer from `metrics.json` only.** Copy `confidence`, `confidence_reasons`,
-   `as_of` and growth numbers verbatim; cite the charts.
+   `as_of` and growth numbers verbatim; cite the charts. Read
+   `references/INTERPRETATION.md` before writing a sentence about a trend.
 
 ### Resolver examples
 
@@ -100,7 +142,8 @@ flag: it adds no field, changes no selection, and changes no API behavior.
 
 - **User-Agent:** set `WTI_USER_AGENT` to a descriptive value before any
   network call (Wikimedia 403s without it). Placeholder UAs fail fast with an
-  actionable error — a non-descriptive identity never leaks.
+  actionable error — a non-descriptive identity never leaks. Full policy in
+  `references/API_ACCESS.md`.
 - **Cache:** `WTI_CACHE` (default `.cache/`); resolver `--ttl-hours` defaults to
   a valid `WTI_TTL_HOURS` or `24.0`, explicit CLI wins, and `0` forces refetch.
   Only validated HTTP 200 endpoint payloads are cached.
@@ -118,6 +161,9 @@ flag: it adds no field, changes no selection, and changes no API behavior.
   — pipeline stages must not break the frozen v0.1 contract, and
   `resolved.json` is a separate pre-stage contract (§6), not a change to
   `spec.json` or `metrics.json`.
+- **Numbers:** quote the pipeline's numbers, never recompute or transform one.
+  The same value must never be derived a second time downstream, in a chart or
+  in prose (ANAL-06 / `references/CONTRACTS.md` §7.3).
 
 ## Red flags (stop and warn the user)
 
@@ -135,14 +181,28 @@ flag: it adds no field, changes no selection, and changes no API behavior.
 - < 1000 views/month — noise, not signal.
 - Comparison crossing 2015-05-01 — methodology change (spider/bot filtering).
 - One giant spike driving the whole trend — check `anomalies` in `metrics.json`.
+- **Exit 2 means fix the spec, not rewrite code.** It comes only from spec
+  validation, and stderr lists every violation at once.
+- **A chart stage that succeeds and a report stage that then refuses is a
+  language-coverage limitation, not a broken run.** The chart stage accepts
+  more languages than the report stage does (`references/CONTRACTS.md` §8.3
+  names the `ja` case: a valid `charts.json`, then exit 1 and nothing written).
+  Read the stderr line naming the language before concluding anything.
+- **A `low` confidence reading is a hypothesis.** The wording rules in
+  `references/INTERPRETATION.md` are binding on the answer, not advisory.
 
 ## Verification checklist
 
 - [ ] `resolved.json` reached `status="confirmed"` with one selection per
       requested project before fetch/spec authoring.
+- [ ] `run_all.py` exited 0, or its exit code was read against the table above
+      and acted on (`2` → fix the spec; anything else → report verbatim).
 - [ ] `metrics.json` exists and every number in the answer matches it.
 - [ ] `as_of` stated (last complete day of data).
 - [ ] `confidence` + `confidence_reasons` copied verbatim.
+- [ ] `trend_direction` reported as the value it is — never as "interest is
+      rising"; `inconclusive` and `noise` reported as answers, not failures.
+- [ ] Every growth figure is the `clean` variant, quoted with its volume base.
 - [ ] Assumptions and limitations listed; `low` confidence phrased as a
       hypothesis, never a conclusion.
 - [ ] Contracts hold and tests are green:
@@ -150,8 +210,11 @@ flag: it adds no field, changes no selection, and changes no API behavior.
 
 ## Performance on cheap model
 
-- One input file (`spec.json`), one output file to read (`metrics.json`).
+- One input file (`spec.json`), one command, one output file to read
+  (`metrics.json`).
 - All arithmetic lives in code — the model quotes numbers, never recomputes.
 - Stdlib-first: the only runtime dependency is `matplotlib>=3.11` (charts).
+- One file per question, so a cheap model loads `SKILL.md` plus at most one
+  reference file instead of the whole contract.
 - If a stage crashes: read exit code + stderr, fix the spec, do not rewrite
   pipeline logic.
