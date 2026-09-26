@@ -1,0 +1,398 @@
+"""Render local Wikipedia pageview metrics into Agg PNGs and a charts.json manifest.
+
+The stage is split in two halves on purpose (RESEARCH Pattern 1). The planning
+half is pure: `build_chart_plan` reads `metrics.json` + `series.csv` and
+returns frozen dataclasses holding *every* number that will reach a chart, so
+a test can read the number instead of guessing at pixels. The rendering half is
+dumb: `render_chart` maps those fields onto matplotlib calls and performs no
+arithmetic. matplotlib is imported *inside* the render function only, so
+importing this module never pulls a rendering backend (C-03 / RESEARCH §
+Environment: this machine's default backend is `tkagg`, not Agg).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from statistics import median
+from typing import Any
+
+import analyze_trends
+import common
+from common import dump_json, load_and_validate_spec, setup_logging
+
+log = common.log
+
+# The chart stage is the first stage to turn a spec string into a filesystem
+# name (T-5-01). `common.validate_spec` accepts any non-empty string as a
+# series id, so the filename guard is a new, local, mandatory check.
+SERIES_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
+# D-06/D-07: the smoothed line reuses the anomaly detector's own window radius,
+# so the drawn median can never disagree with the `clean` growth it twins.
+MEDIAN_RADIUS_DAYS = analyze_trends.MAD_RADIUS_DAYS
+FIGURESIZE = (9.0, 3.6)  # AGENTS.md § Charting
+DPI = 150
+# D-14: the timeseries floor is the literal 0.0; the ceiling only adds headroom
+# so the highest raw point is not drawn on the frame.
+Y_HEADROOM_FACTOR = 1.05
+TIMESERIES_KIND = "timeseries"
+GROWTH_KIND = "growth"
+OVERLAY_KIND = "overlay"
+REASON_NA_LABEL = "n/a"  # D-04: a null growth renders as a labelled n/a bar
+# Provisional until plan 05-07 ratifies the charts.v1 field list in
+# CONTRACTS.md §7 (D-18).
+CHARTS_CONTRACT_VERSION = "charts.v1"
+# D-09: the method disclosure a chart carries so it stays self-describing when
+# it travels on its own. The wording is a numeric description of the two drawn
+# series, not prose, so it is language-neutral; the *label* is spec-authored in
+# the requested language and is copied verbatim (D-16).
+METHOD_PHRASE = "raw daily / 7-day median"
+RAW_LINE_LABEL = "raw daily"
+MEDIAN_LINE_LABEL = "7-day median"
+
+
+class ChartError(RuntimeError):
+    """A model-readable local input or rendering failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesPoint:
+    """One plotted observation: a calendar day and the views recorded for it."""
+
+    date: date
+    views: int | float
+
+
+@dataclass(frozen=True, slots=True)
+class GrowthBar:
+    """One growth window's plotted value, copied from metrics.json (D-02/D-03)."""
+
+    window: str
+    pct: float | None
+    abs: int | None
+    base_avg_daily_views: float
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ChartEntry:
+    """Every number and label that reaches one PNG; the renderer adds nothing."""
+
+    kind: str
+    series_id: str | None
+    label: str
+    language: str
+    filename: str
+    points: tuple[SeriesPoint, ...]
+    raw_values: tuple[int | float, ...]
+    median_values: tuple[float, ...]
+    gaps: tuple[tuple[date, date], ...]
+    anomalies: tuple[dict[str, object], ...]
+    anomalies_drawn: int
+    yscale: str
+    y_limits: tuple[float, float]
+    bars: tuple[GrowthBar, ...]
+    note: str | None
+    subtitle: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChartDocument:
+    """The whole chart inventory plus the digest of the metrics it was built from."""
+
+    contract_version: str
+    spec_name: str
+    as_of: str
+    language: str
+    generated_from: str
+    metrics_sha256: str
+    charts: tuple[ChartEntry, ...]
+
+
+def _require_str(container: Mapping[str, Any], key: str, where: str) -> str:
+    value = container.get(key)
+    if not isinstance(value, str) or not value:
+        raise ChartError(f"{where}.{key} must be a non-empty string")
+    return value
+
+
+def _require_number(container: Mapping[str, Any], key: str, where: str) -> int | float:
+    value = container.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ChartError(f"{where}.{key} must be a number")
+    return value
+
+
+def load_metrics(path: str | Path) -> tuple[dict[str, object], str]:
+    """Read, shape-check, and hash the local metrics.json in a single pass.
+
+    The digest is taken from the exact bytes read, so a consumer can detect a
+    stale manifest without ever comparing timestamps.
+    """
+    metrics_path = Path(path)
+    try:
+        raw = metrics_path.read_bytes()
+    except OSError as error:
+        raise ChartError(f"could not read metrics JSON: {metrics_path}") from error
+    try:
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ChartError(f"metrics JSON is malformed: {metrics_path}") from error
+    if not isinstance(document, dict):
+        raise ChartError("metrics JSON top level must be an object")
+    _require_str(document, "spec_name", "metrics")
+    _require_str(document, "as_of", "metrics")
+    series = document.get("series")
+    if not isinstance(series, list) or not series:
+        raise ChartError("metrics.series must be a non-empty list")
+    for index, item in enumerate(series):
+        where = f"metrics.series[{index}]"
+        if not isinstance(item, dict):
+            raise ChartError(f"{where} must be an object")
+        _require_str(item, "series_id", where)
+        _require_str(item, "label", where)
+        _require_str(item, "language", where)
+        _require_number(item, "avg_daily_views", where)
+        growth = item.get("growth")
+        if not isinstance(growth, dict):
+            raise ChartError(f"{where}.growth must be an object")
+        for window in analyze_trends.GROWTH_WINDOWS:
+            if window not in growth:
+                raise ChartError(f"{where}.growth.{window} is missing")
+        if not isinstance(item.get("anomalies"), list):
+            raise ChartError(f"{where}.anomalies must be a list")
+    # Reuse the analyzer's finite walk rather than writing a second one: a
+    # `1e400` or a NaN must fail closed before it can be drawn as a silent lie
+    # (T-5-02).
+    try:
+        analyze_trends.validate_finite_numbers(document)
+    except analyze_trends.AnalysisError as error:
+        raise ChartError(f"metrics JSON carries a non-finite number: {error}") from error
+    return document, hashlib.sha256(raw).hexdigest()
+
+
+def rolling_median_7(values: Sequence[int | float]) -> list[float]:
+    """Centered 7-day rolling median; the window is truncated at the series edges."""
+    smoothed: list[float] = []
+    for index in range(len(values)):
+        window = values[
+            max(0, index - MEDIAN_RADIUS_DAYS) : index + MEDIAN_RADIUS_DAYS + 1
+        ]
+        smoothed.append(float(median(window)))
+    return smoothed
+
+
+def series_filename(series_id: str, kind: str) -> str:
+    """Return the deterministic PNG name for a series, refusing any path escape."""
+    if not SERIES_ID_PATTERN.fullmatch(series_id):
+        raise ChartError(f"series id is not filename-safe: {series_id!r}")
+    return f"chart_{series_id}_{kind}.png"
+
+
+def _subtitle(label: str) -> str:
+    """D-09: the chart names its own method, next to the spec-authored label."""
+    return f"{label} - {METHOD_PHRASE}"
+
+
+def build_chart_plan(
+    spec: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+    metrics_sha256: str,
+    grouped: Mapping[str, Sequence[analyze_trends.Observation]],
+    metrics_path: str,
+) -> ChartDocument:
+    """Decide every number that will be drawn, without importing a backend.
+
+    Growth, totals, averages, and anomaly local medians are read from
+    `metrics.json` and never recomputed (ANAL-06 / CHRT-02). The single
+    permitted derivation is the centered rolling median, and it never feeds a
+    numeric label.
+    """
+    language = _require_str(spec, "language", "spec")
+    series_nodes = metrics["series"]
+    if not isinstance(series_nodes, list) or not series_nodes:
+        raise ChartError("metrics.series must be a non-empty list")
+    charts: list[ChartEntry] = []
+    for node in series_nodes:
+        if not isinstance(node, dict):
+            raise ChartError("metrics.series entries must be objects")
+        series_id = _require_str(node, "series_id", "metrics.series entry")
+        series_filename(series_id, TIMESERIES_KIND)
+        observations = list(grouped.get(series_id, []))
+        if not observations:
+            raise ChartError(f"no observations for series: {series_id}")
+        points = tuple(
+            SeriesPoint(observation.date, observation.views) for observation in observations
+        )
+        raw_values = tuple(point.views for point in points)
+        # D-14: the floor is the literal 0.0, never a computed value, so no
+        # axis can ever imply negative views.
+        charts.append(
+            ChartEntry(
+                kind=TIMESERIES_KIND,
+                series_id=series_id,
+                label=_require_str(node, "label", "metrics.series entry"),
+                language=_require_str(node, "language", "metrics.series entry"),
+                filename=series_filename(series_id, TIMESERIES_KIND),
+                points=points,
+                raw_values=raw_values,
+                median_values=tuple(rolling_median_7(raw_values)),
+                gaps=(),
+                anomalies=(),
+                anomalies_drawn=0,
+                yscale="linear",
+                y_limits=(0.0, float(max(raw_values)) * Y_HEADROOM_FACTOR),
+                bars=(),
+                note=None,
+                subtitle=_subtitle(_require_str(node, "label", "metrics.series entry")),
+            )
+        )
+    return ChartDocument(
+        contract_version=CHARTS_CONTRACT_VERSION,
+        spec_name=_require_str(metrics, "spec_name", "metrics"),
+        as_of=_require_str(metrics, "as_of", "metrics"),
+        language=language,
+        generated_from=str(metrics_path),
+        metrics_sha256=metrics_sha256,
+        charts=tuple(charts),
+    )
+
+
+def render_chart(entry: ChartEntry, out_dir: Path) -> Path:
+    """Draw one chart from its plan entry. No arithmetic happens in this body."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # must precede pyplot: this machine defaults to tkagg
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(out_dir)
+    path = out_dir / entry.filename
+    if path.resolve().parent != out_dir.resolve():
+        raise ChartError(f"chart target escapes the output directory: {entry.filename}")
+    fig, ax = plt.subplots(figsize=FIGURESIZE, dpi=DPI)
+    x_values = mdates.date2num([point.date for point in entry.points])
+    # D-07: the raw daily line stays visible beneath the bold median line, so an
+    # anomaly marker lands on a line the reader can actually see.
+    ax.plot(x_values, entry.raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=RAW_LINE_LABEL)
+    ax.plot(
+        x_values, entry.median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
+    )
+    # D-14: an explicit zero floor, timeseries axes only. A growth chart must
+    # never receive this call - it would erase a negative bar (RESEARCH
+    # Pitfall 1).
+    ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
+    # D-10: the axis spans the full calendar range; only rows present in
+    # series.csv are plotted, and a views=0 row is drawn at face value (D-11).
+    ax.xaxis_date()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.legend(loc="upper left", frameon=False, fontsize=8)
+    ax.set_title(entry.subtitle, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=DPI)
+    plt.close(fig)
+    return path
+
+
+def _bar_payload(bar: GrowthBar) -> dict[str, object]:
+    """Serialize one growth bar, omitting a null-valued key rather than nulling it."""
+    payload: dict[str, object] = {
+        "window": bar.window,
+        "base_avg_daily_views": bar.base_avg_daily_views,
+    }
+    if bar.pct is not None:
+        payload["pct"] = bar.pct
+    if bar.abs is not None:
+        payload["abs"] = bar.abs
+    if bar.reason is not None:
+        payload["reason"] = bar.reason
+    return payload
+
+
+def _entry_payload(entry: ChartEntry) -> dict[str, object]:
+    """Serialize one chart entry under the charts.v1 omission rule.
+
+    A key is written when its value is meaningful for this entry and omitted -
+    never written as null - when it is not. `gaps` and `anomalies_drawn` are
+    unconditional so a consumer never special-cases an absent one.
+    """
+    payload: dict[str, object] = {
+        "kind": entry.kind,
+        "label": entry.label,
+        "language": entry.language,
+        "filename": entry.filename,
+        "yscale": entry.yscale,
+        "y_limits": [entry.y_limits[0], entry.y_limits[1]],
+        "points": len(entry.points),
+        "gaps": [[start.isoformat(), end.isoformat()] for start, end in entry.gaps],
+        "anomalies_drawn": entry.anomalies_drawn,
+        "subtitle": entry.subtitle,
+    }
+    if entry.series_id is not None:
+        payload["series_id"] = entry.series_id
+    if entry.kind == GROWTH_KIND and entry.bars:
+        payload["bars"] = [_bar_payload(bar) for bar in entry.bars]
+    if entry.note is not None:
+        payload["note"] = entry.note
+    return payload
+
+
+def _manifest(document: ChartDocument) -> dict[str, object]:
+    """Serialize the plan: the manifest cannot disagree with the picture."""
+    return {
+        "contract_version": document.contract_version,
+        "spec_name": document.spec_name,
+        "as_of": document.as_of,
+        "language": document.language,
+        "generated_from": document.generated_from,
+        "metrics_sha256": document.metrics_sha256,
+        "charts": [_entry_payload(entry) for entry in document.charts],
+    }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spec", required=True, help="path to spec.json")
+    parser.add_argument("--out", default="out", help="output directory (default: out)")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="logging-only debug diagnostics; adds no manifest field and changes no behavior",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the local-only chart CLI."""
+    args = _parser().parse_args(argv)
+    setup_logging(args.verbose)
+    spec = load_and_validate_spec(args.spec)
+    out_dir = Path(args.out)
+    metrics_path = out_dir / "metrics.json"
+    manifest_path = out_dir / "charts.json"
+    try:
+        grouped = analyze_trends.load_series_csv(out_dir / "series.csv", spec)
+        metrics, metrics_sha256 = load_metrics(metrics_path)
+        document = build_chart_plan(spec, metrics, metrics_sha256, grouped, str(metrics_path))
+        try:
+            for entry in document.charts:
+                render_chart(entry, out_dir)
+            dump_json(_manifest(document), manifest_path)
+        except OSError as error:
+            raise ChartError(f"could not write charts output: {manifest_path}") from error
+    except (ChartError, analyze_trends.AnalysisError) as error:
+        print(f"charts failed: {error}", file=sys.stderr)
+        return 1
+    print(f"Rendered {len(document.charts)} charts; output: {manifest_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
