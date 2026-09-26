@@ -18,3 +18,15 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 mypy_path = ["scripts"]
+
+# matplotlib ships no complete type information, and the repository's gate is
+# `mypy scripts --strict`. Without this override mypy follows matplotlib into
+# numpy's bundled stubs, which use 3.12+ `type` statement syntax that
+# `python_version = "3.11"` cannot parse - so the run aborts on a THIRD-PARTY
+# file before it has checked a line of this project's code. Scoped to matplotlib
+# alone: it is the single permitted relaxation, there is no `# type: ignore`
+# anywhere in the stage module, and every other import in `scripts/` stays fully
+# checked.
+[[tool.mypy.overrides]]
+module = ["matplotlib", "matplotlib.*"]
+ignore_missing_imports = true

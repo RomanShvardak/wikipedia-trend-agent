@@ -8,6 +8,22 @@ dumb: `render_chart` maps those fields onto matplotlib calls and performs no
 arithmetic. matplotlib is imported *inside* the render function only, so
 importing this module never pulls a rendering backend (C-03 / RESEARCH §
 Environment: this machine's default backend is `tkagg`, not Agg).
+
+Exit codes - the frozen CONTRACTS.md §4 table, in full:
+
+    0   every chart rendered and charts.json published
+    2   spec problem, inherited verbatim from common.load_and_validate_spec's
+        SystemExit(2) and never intercepted here
+    1   any local input or publication failure
+
+There is deliberately NO `3` (partial) case. CONTRACTS.md §4 defines 3 for a
+pipeline stage that completes some units and fails others; this stage has no
+such outcome, because a half-populated charts.json is worse than none at all -
+a reader who finds four PNGs and a manifest naming five has been told something
+false about the fifth, and has no way to tell which. So a series that cannot be
+charted fails the whole stage: `charts.json` is published only after EVERY
+render has returned, and a failure at any point leaves the prior manifest bytes
+untouched with no staging file behind. Two outcomes, never three.
 """
 from __future__ import annotations
 

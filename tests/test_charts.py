@@ -2712,6 +2712,255 @@ def test_the_render_path_writes_no_hardcoded_chart_words(tmp_path: Path) -> None
     assert tokens["clean_growth"] in growth["subtitle"]
 
 
+# --- Plan 05-06 Task 3: the fail-closed contract and the --strict typing gate
+
+
+def test_empty_metrics_file_fails_closed(
+    tmp_out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A zero-byte metrics.json is a failure, not an empty chart set.
+
+    `json.loads(b"")` raises, which is the correct outcome - the interesting
+    property is that it raises BEFORE any render, so the sentinel PNG is the only
+    file in `--out` and the sentinel manifest bytes are the ones still there.
+    """
+    _write_golden_copy(tmp_out)
+    sentinel_manifest = tmp_out / "charts.json"
+    sentinel_manifest.write_bytes(b"sentinel")
+    sentinel_png = tmp_out / "chart_pl-post-przerywany_timeseries.png"
+    sentinel_png.write_bytes(b"stub")
+    (tmp_out / "metrics.json").write_bytes(b"")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "metrics JSON is malformed" in captured.err
+    assert sentinel_manifest.read_bytes() == b"sentinel"
+    assert sentinel_png.read_bytes() == b"stub"
+    assert sorted(path.name for path in tmp_out.glob("*.png")) == [sentinel_png.name], (
+        "a refused input must write no new chart"
+    )
+    assert captured.out == "", "a failed run must not print a success line"
+
+
+def test_malformed_metrics_json_fails_closed(
+    tmp_out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A truncated document is refused on the same terms as an empty one."""
+    _write_golden_copy(tmp_out)
+    (tmp_out / "metrics.json").write_bytes(b"{not json")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "metrics JSON is malformed" in captured.err
+    assert list(tmp_out.glob("*.png")) == []
+    assert not tmp_out.joinpath("charts.json").exists()
+
+
+def test_metrics_missing_a_required_series_field_fails_closed(
+    tmp_out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A series without `avg_daily_views` names the field in the refusal.
+
+    The message matters more than the exit code here: a model reading stderr has
+    to be able to fix the document, and "metrics.series[0].avg_daily_views must
+    be a number" is fixable while "invalid metrics" is not.
+    """
+    _write_golden_copy(tmp_out)
+    path = tmp_out / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    del metrics["series"][0]["avg_daily_views"]
+    path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "avg_daily_views" in captured.err
+    assert TRACER_SERIES_ID not in captured.err or "series[0]" in captured.err
+    assert list(tmp_out.glob("*.png")) == []
+    assert not tmp_out.joinpath("charts.json").exists()
+
+
+def test_non_finite_metrics_value_is_refused(
+    tmp_out: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`1e400` in a growth pct is refused before anything is drawn.
+
+    The point is the ORDER, not the refusal. `json.loads` turns `1e400` into
+    `inf` happily, and a `barh` of `inf` renders a bar that looks like a real
+    reading - a silent lie drawn from a number the contract says is not
+    computable. So the assertion is that the analyzer's own finite walk is
+    actually REACHED, by requiring the message it alone can produce.
+    """
+    _write_golden_copy(tmp_out)
+    path = tmp_out / "metrics.json"
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    node = next(n for n in metrics["series"] if n["series_id"] == TRACER_SERIES_ID)
+    # A unique sentinel so the substitution cannot hit an unrelated cell, and a
+    # RAW `1e400` token so the value really is a non-finite float on the way in
+    # rather than a pre-encoded `Infinity` (which is not valid strict JSON).
+    node["growth"]["m3"]["clean"]["pct"] = 987654321
+    patched = json.dumps(metrics, ensure_ascii=False, indent=2)
+    assert patched.count("987654321") == 1
+    path.write_text(patched.replace("987654321", "1e400"), encoding="utf-8")
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "non-finite" in captured.err
+    assert list(tmp_out.glob("*.png")) == [], "a non-finite value must draw nothing"
+    assert not tmp_out.joinpath("charts.json").exists()
+
+
+def test_publication_failure_leaves_prior_manifest_and_no_staging_file(
+    tmp_out: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An interrupted publication replaces nothing and leaves nothing behind.
+
+    `common.dump_json` stages into a same-directory dotfile and `os.replace`s it
+    into position, so a failure at the replace is the one moment where a naive
+    implementation would leave either a truncated manifest or a stray staging
+    file in `--out`. Both are asserted: the sentinel bytes survive byte for
+    byte, and the directory holds no `.charts.json.*.tmp`.
+    """
+    _write_golden_copy(tmp_out)
+    manifest = tmp_out / "charts.json"
+    manifest.write_bytes(b"sentinel")
+
+    def fail_replace(source: object, destination: object) -> None:
+        raise OSError("simulated interrupted replace")
+
+    monkeypatch.setattr(make_charts.common.os, "replace", fail_replace)
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "could not write charts output" in captured.err
+    assert manifest.read_bytes() == b"sentinel", (
+        "a failed publication must not touch the prior manifest's bytes"
+    )
+    assert list(tmp_out.glob(".charts.json.*.tmp")) == [], (
+        "a failed publication must not leave a staging file behind"
+    )
+    assert list(tmp_out.glob("*.tmp")) == []
+
+
+def test_render_failure_leaves_no_partial_png(
+    tmp_out: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failure on the SECOND chart publishes no manifest and no half-drawn set.
+
+    The invariant is the ordering in `main`: charts.json is written only after
+    every render has returned, so an interrupted run leaves complete PNGs and no
+    description of them. A reader finding two PNGs and no manifest knows the run
+    did not finish; a reader finding two PNGs and a manifest naming five has been
+    told something false.
+    """
+    _write_golden_copy(tmp_out)
+    calls: list[str] = []
+    # The real renderer is captured BEFORE the patch: `flaky_render` calls it
+    # through the module attribute, which the monkeypatch has just replaced, so
+    # resolving it lazily would make the stub recurse into itself and never draw
+    # anything - a green test for a run that rendered no chart at all.
+    real_render = make_charts.render_chart
+
+    def flaky_render(entry: make_charts.ChartEntry, out_dir: Path) -> Path:
+        calls.append(entry.filename)
+        if len(calls) == 2:
+            raise make_charts.ChartError(f"simulated render failure on {entry.filename}")
+        return real_render(entry, out_dir)
+
+    monkeypatch.setattr(make_charts, "render_chart", flaky_render)
+
+    assert _run_charts(FIXTURES_DIR / "spec.example.json", tmp_out) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("charts failed:"), captured.err
+    assert "simulated render failure" in captured.err
+    assert len(calls) == 2, "the run must stop at the failure, not continue"
+
+    assert not tmp_out.joinpath("charts.json").exists(), (
+        "no manifest may describe an incomplete run"
+    )
+    # Whatever PNGs are on disk are COMPLETE files: the failure happened before
+    # the second savefig, so the second file was never created at all.
+    pngs = sorted(tmp_out.glob("*.png"))
+    assert len(pngs) == 1, [path.name for path in pngs]
+    blob = pngs[0].read_bytes()
+    assert blob[:8] == PNG_MAGIC
+    assert len(blob) > 1024
+    assert list(tmp_out.glob(".charts.json.*.tmp")) == []
+
+
+def test_spec_problem_exits_two(tmp_path: Path) -> None:
+    """RUN-01: an invalid spec is exit 2, never intercepted into a chart error.
+
+    The chart stage must not convert the frozen exit-2 contract into its own
+    exit 1, because a caller distinguishes the two: 2 means "fix your spec" and
+    1 means "fix your data or your environment". `load_and_validate_spec` raises
+    `SystemExit(2)` before any stage code runs, and nothing here catches it.
+    """
+    out_dir = tmp_path / "out"
+    _write_golden_copy(out_dir)
+    spec_path = tmp_path / "spec.json"
+    spec = json.loads(FIXTURES_DIR.joinpath("spec.example.json").read_text(encoding="utf-8"))
+    # A ROOT required field, so `common.validate_spec` is what refuses it. (A
+    # missing `window` is not a violation the frozen validator reports - it is
+    # caught later by the analyzer's own reader, which is a different stage's
+    # contract and a different exit code. The exit-2 case under test is the
+    # validator's, so the test must provoke the validator.)
+    del spec["language"]
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as raised:
+        _run_charts(spec_path, out_dir)
+    assert raised.value.code == 2
+    assert list(out_dir.glob("*.png")) == [], "a spec problem must draw nothing"
+    assert not out_dir.joinpath("charts.json").exists()
+
+
+def test_usetex_is_never_enabled() -> None:
+    """T-5-21: no LaTeX, and no mathtext `$...$` around a user string.
+
+    A label is spec-authored text reaching a text engine. `text.usetex=True`
+    would hand it to a LaTeX shell pipeline, and a `$...$` pair in a label would
+    be interpreted as math - both are injection surfaces inside a renderer, and
+    neither raises: they produce a wrong or empty image. The module never
+    mentions `usetex` at all, which is the strongest form of the guarantee, and
+    the AST walk below pins the absence of any attribute assignment to it.
+    """
+    source = _module_source()
+    assert "usetex" not in source, "the chart module must never mention text.usetex"
+    assert "$" not in source, (
+        "no `$` may appear in the module - mathtext interpolation of a spec "
+        "string is a rendering injection vector"
+    )
+
+    tree = ast.parse(source)
+    offending: list[str] = []
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for target in targets:
+            attribute = target
+            while isinstance(attribute, (ast.Attribute, ast.Subscript)):
+                attribute = attribute.value  # type: ignore[assignment]
+            if isinstance(attribute, ast.Attribute) and attribute.attr == "usetex":
+                offending.append(f"line {node.lineno}")
+            if isinstance(target, ast.Attribute) and target.attr == "usetex":
+                offending.append(f"line {node.lineno}")
+    assert not offending, f"text.usetex must never be assigned: {offending}"
+
+    # And the positive half: labels really do reach the canvas through the
+    # ordinary text paths, so the guarantee is about the text engine and not
+    # about labels never being drawn.
+    assert "set_title" in source and "ax.plot(" in source
+    assert "rcParams" not in source, "no rcParams mutation in the render path"
+
+
 def test_log_disclosure_text_stays_inside_the_canvas(tmp_path: Path) -> None:
     """05-06 inherits 05-05's clipping guard for the text it adds.
 

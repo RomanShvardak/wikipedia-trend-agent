@@ -1368,7 +1368,14 @@ def _validate_project(
     status = project.get("status")
     if status not in {"ready", "ambiguous", "unresolved", "error"}:
         raise _contract_error(f"{field}.status is outside the resolved.v1 enum")
-    _validate_search_hits(project.get("search_hits"), field=f"{field}.search_hits", project_status=cast(str, status))
+    # The enum check above already proves this - membership in a set of str
+    # literals is only possible for a str - but the checker needs it stated.
+    # A `cast` here is redundant under the repository's `--strict` gate, which
+    # enables `--warn-redundant-casts` and reported it; an assert narrows under
+    # every configuration and is the same idiom `make_charts` uses for its own
+    # plan invariants.
+    assert isinstance(status, str), f"{field}.status must be one of the resolved.v1 strings"
+    _validate_search_hits(project.get("search_hits"), field=f"{field}.search_hits", project_status=status)
 
     candidates = project.get("candidates")
     if not isinstance(candidates, list) or len(candidates) > MAX_SEARCH_RESULTS * MAX_REDIRECT_HOPS:
