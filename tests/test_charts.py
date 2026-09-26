@@ -187,23 +187,29 @@ def test_tracer_one_series_renders_png_and_publishes_charts_json(tmp_path: Path,
     # Case 1: a full CLI run, no monkeypatching, exit 0.
     assert _run_charts(spec_path, tmp_out) == 0
 
-    # Case 2: one real PNG, 8 magic bytes, non-trivial size.
+    # Case 2: one real PNG per rendered chart, 8 magic bytes, non-trivial size.
+    # N=1 publishes the timeseries plus the comparison view (D-19: 2N+1), and at
+    # N=1 that is 2 of the 5 a two-kind inventory would reach at N=2.
     pngs = sorted(tmp_out.glob("*.png"))
-    assert len(pngs) == 1, f"expected exactly one rendered PNG, got {pngs}"
-    blob = pngs[0].read_bytes()
-    assert blob[:8] == PNG_MAGIC, "rendered chart must be a real PNG"
-    assert len(blob) > 1024, "rendered chart must not be empty or truncated"
+    assert len(pngs) == 2, f"expected the timeseries and the overlay, got {pngs}"
+    for png in pngs:
+        blob = png.read_bytes()
+        assert blob[:8] == PNG_MAGIC, "rendered chart must be a real PNG"
+        assert len(blob) > 1024, "rendered chart must not be empty or truncated"
 
     manifest = json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
     assert manifest["contract_version"] == "charts.v1"
     assert manifest["spec_name"] == "intermittent_fasting_pl_cs"
     assert manifest["language"] == "uk"
-    assert len(manifest["charts"]) == 1
-    assert manifest["charts"][0]["filename"] == pngs[0].name
-    assert manifest["charts"][0]["kind"] == "timeseries"
-    assert manifest["charts"][0]["series_id"] == TRACER_SERIES_ID
-    assert manifest["charts"][0]["anomalies_drawn"] == 0
-    assert manifest["charts"][0]["gaps"] == []
+    assert len(manifest["charts"]) == 2
+    assert sorted(entry["filename"] for entry in manifest["charts"]) == [png.name for png in pngs]
+    timeseries_entry = next(
+        entry for entry in manifest["charts"] if entry["kind"] == make_charts.TIMESERIES_KIND
+    )
+    assert timeseries_entry["filename"] == f"chart_{TRACER_SERIES_ID}_timeseries.png"
+    assert timeseries_entry["series_id"] == TRACER_SERIES_ID
+    assert timeseries_entry["anomalies_drawn"] == 0
+    assert timeseries_entry["gaps"] == []
 
     # Cases 3-6 assert on the plan, not on pixels: the plan is the only place a
     # chart number exists (RESEARCH Pattern 1).
@@ -213,7 +219,7 @@ def test_tracer_one_series_renders_png_and_publishes_charts_json(tmp_path: Path,
     document = make_charts.build_chart_plan(
         spec, metrics, digest, grouped, str(tmp_out / "metrics.json")
     )
-    entry = document.charts[0]
+    entry = next(c for c in document.charts if c.kind == make_charts.TIMESERIES_KIND)
 
     # Case 3: the plotted raw values are the CSV views, in date order, exactly.
     expected_views = _csv_views_by_series(tmp_out / "series.csv")[TRACER_SERIES_ID]
@@ -344,7 +350,11 @@ def test_timeseries_has_raw_and_median_series(tmp_out: Path) -> None:
     spec_path, _manifest = _render_two_series(tmp_out)
     views_by_series = _csv_views_by_series(tmp_out / "series.csv")
 
+    # Filtered on kind, not on index: the comparison view carries no series of its
+    # own and is asserted separately.
     for entry in _plan(tmp_out, spec_path).charts:
+        if entry.kind != make_charts.TIMESERIES_KIND:
+            continue
         expected = views_by_series[entry.series_id]
         assert list(entry.raw_values) == expected, (
             "the plotted raw line must be the series.csv views in date order, exactly"
@@ -482,11 +492,12 @@ def test_inventory_is_two_png_per_series_plus_overlay(tmp_out: Path) -> None:
     assert len(pairs) == len(set(pairs)), "one entry per (series_id, kind) pair"
     kinds_per_series = {entry.kind for entry in per_series}
     assert len(per_series) == len(order) * len(kinds_per_series)
-    assert len(overlay) <= 1, "the comparison view is one chart, and never a per-series one"
-    assert len(document.charts) == len(per_series) + len(overlay)
-    # Plan 05-03 Task 2 adds the overlay, taking the formula to the literal D-19
-    # 2N+1 (2 series + 1 overlay = 3 entries and 3 PNGs; 05-04's growth kind
-    # takes the same expression to 5).
+    assert len(overlay) == 1, "the comparison view must never be conditional on N > 1"
+    # D-19's 2N+1: N x (per-series kinds) + exactly one comparison view. With the
+    # growth kind of 05-04 this is the literal 2N+1; today it is 2 + 1 = 3.
+    assert len(document.charts) == len(order) * len(kinds_per_series) + 1
+    assert len(document.charts) == 3
+    assert document.charts[-1].kind == make_charts.OVERLAY_KIND, "the overlay is last"
 
     # Count from the manifest, never from a directory glob: an orphan file must
     # not be able to stand in for a designed chart, and a dangling entry must
@@ -633,3 +644,139 @@ def test_metrics_series_absent_from_spec_fails_closed(
     assert missing in captured.err
     assert list(out_dir.glob("*.png")) == []
     assert not out_dir.joinpath("charts.json").exists()
+
+
+# --- Plan 05-03 Task 2: the shared-axis multi-series overlay (D-01, D-20)
+
+
+def _overlay_entry_of(document: make_charts.ChartDocument) -> make_charts.ChartEntry:
+    """The one comparison view a document publishes, by kind rather than by index."""
+    overlays = [entry for entry in document.charts if entry.kind == make_charts.OVERLAY_KIND]
+    assert len(overlays) == 1, "exactly one comparison view per document"
+    return overlays[0]
+
+
+def test_overlay_shares_axis_and_declares_scale_difference(tmp_out: Path) -> None:
+    """D-20: one shared, zero-anchored y-axis and an explicit scales-differ note."""
+    spec_path, manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    entry = _overlay_entry_of(document)
+    metrics = json.loads(tmp_out.joinpath("metrics.json").read_text(encoding="utf-8"))
+    order = [node["series_id"] for node in metrics["series"]]
+    labels = [node["label"] for node in metrics["series"]]
+
+    # One shared axis: the literal zero floor plus headroom over the largest raw
+    # value of *any* series, so no series is scaled away relative to another.
+    assert entry.y_limits[0] == 0.0
+    largest = max(max(line.raw_values) for line in entry.series_lines)
+    assert entry.y_limits[1] >= largest
+    assert entry.note == "comparative view; per-series scales differ"
+    assert entry.yscale == "linear"
+
+    # Membership is the full metrics series order, and each line keeps its own
+    # spec-authored label verbatim.
+    assert entry.series_ids == tuple(order)
+    assert len(entry.series_lines) == len(order)
+    assert [line.series_id for line in entry.series_lines] == order
+    assert [line.label for line in entry.series_lines] == labels
+
+    # The two always-emitted text fields resolve to their own sources, never to
+    # an invented value: the overlay's own constant label, and the document-level
+    # language rather than any single series' language.
+    assert entry.label == make_charts.OVERLAY_LABEL
+    assert entry.language == document.language
+    assert document.language == json.loads(spec_path.read_text(encoding="utf-8"))["language"]
+    assert entry.language not in {node["language"] for node in metrics["series"]}
+    assert entry.filename == make_charts.OVERLAY_FILENAME
+    assert entry.spec_index is None
+    assert entry.series_id is None
+
+    # The manifest publishes the overlay the same way, and never a derived copy
+    # of the per-series numbers.
+    published = next(
+        item for item in manifest["charts"] if item["kind"] == make_charts.OVERLAY_KIND
+    )
+    assert published["series_ids"] == order
+    assert published["note"] == make_charts.OVERLAY_NOTE
+    assert "series_lines" not in published
+    assert "series_id" not in published, "the overlay belongs to no single series"
+    assert "spec_index" not in published
+    assert document.charts[-1].kind == make_charts.OVERLAY_KIND, "the overlay is last"
+
+    # No axis call in the overlay path may set a log or normalized scale: that
+    # would invent a per-series index with no source in metrics.json.
+    tree = ast.parse(_module_source())
+    overlay_functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_draw_overlay"
+    ]
+    assert len(overlay_functions) == 1, "the overlay render path must be its own function"
+    scale_calls = [
+        node
+        for node in ast.walk(overlay_functions[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"set_yscale", "set_xscale", "set_rscale"}
+    ]
+    assert not scale_calls, "D-20 forbids a log or normalized scale on the overlay"
+
+
+def test_overlay_plots_raw_values_without_rescaling(tmp_out: Path) -> None:
+    """The comparison view reuses each series' own numbers, element for element."""
+    spec_path, _manifest = _render_two_series(tmp_out)
+    document = _plan(tmp_out, spec_path)
+    entry = _overlay_entry_of(document)
+    per_series = {
+        chart.series_id: chart for chart in document.charts if chart.series_id is not None
+    }
+
+    for line in entry.series_lines:
+        own = per_series[line.series_id]
+        assert list(line.raw_values) == list(own.raw_values), (
+            "the overlay must plot the series' own raw values, not a transformed copy"
+        )
+        assert list(line.median_values) == list(own.median_values)
+        assert [point.date for point in line.points] == [point.date for point in own.points]
+        assert line.points == own.points
+
+
+def test_overlay_note_and_legend_are_rendered_into_the_png(tmp_out: Path) -> None:
+    """D-09: the disclosure is visible in the image, and the manifest carries its text."""
+    spec_path, manifest = _render_two_series(tmp_out)
+    entry = _overlay_entry_of(_plan(tmp_out, spec_path))
+    published = next(
+        item for item in manifest["charts"] if item["kind"] == make_charts.OVERLAY_KIND
+    )
+
+    assert entry.note, "the overlay note must be a non-empty disclosure"
+    assert published["note"] == entry.note
+    # One legend entry per series, each carrying that series' label verbatim: the
+    # per-series names are not lost to the overlay's own constant label.
+    assert published["series_ids"] and len(entry.series_lines) == len(entry.series_ids)
+    assert all(line.label for line in entry.series_lines)
+
+    blob = tmp_out.joinpath(published["filename"]).read_bytes()
+    assert blob[:8] == PNG_MAGIC, "the overlay must be a real PNG"
+    assert len(blob) > 1024, "the overlay must not be empty or truncated"
+
+
+def test_single_series_spec_still_produces_an_overlay(
+    tmp_path: Path, tmp_out: Path
+) -> None:
+    """The comparison view is never conditional on N > 1."""
+    spec_path = _write_spec(tmp_path, [_spec_series_item(TRACER_SERIES_ID)])
+    _copy_fixtures(tmp_out, (TRACER_SERIES_ID,))
+    assert _run_charts(spec_path, tmp_out) == 0
+
+    document = _plan(tmp_out, spec_path)
+    # Filtered by kind, never by a total: the count 2N+1 is 05-04's assertion to
+    # make, and it must not be this test's fragility.
+    assert [c.kind for c in document.charts if c.kind == make_charts.OVERLAY_KIND] == [
+        make_charts.OVERLAY_KIND
+    ]
+    entry = _overlay_entry_of(document)
+    assert entry.series_ids == (TRACER_SERIES_ID,)
+    assert len(entry.series_lines) == 1
+    assert len([c for c in document.charts if c.kind == make_charts.TIMESERIES_KIND]) == 1
+    assert tmp_out.joinpath("chart_overlay.png").is_file()

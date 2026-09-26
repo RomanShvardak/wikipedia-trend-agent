@@ -59,6 +59,23 @@ CHARTS_CONTRACT_VERSION = "charts.v1"
 METHOD_PHRASE = "raw daily / 7-day median"
 RAW_LINE_LABEL = "raw daily"
 MEDIAN_LINE_LABEL = "7-day median"
+# D-20: the overlay's disclosure. A constant rather than a formatted sentence, so
+# a test can assert it exactly and Phase 6 can quote it verbatim.
+OVERLAY_NOTE = "comparative view; per-series scales differ"
+# The overlay owns no single series and so has no metrics `label` to copy. This
+# constant names the comparison view itself - it is a manifest display name, not
+# a metrics value, and the per-series names are not lost to it: the legend
+# carries each SeriesLine.label verbatim.
+OVERLAY_LABEL = "all series compared"
+# The overlay draws one raw line per series, so it names its own method with its
+# own phrase rather than the per-series one: claiming a 7-day median on a picture
+# that carries no median line would be the exact misrepresentation this phase
+# exists to prevent.
+OVERLAY_METHOD_PHRASE = "raw daily; shared y-axis"
+# A distinct colour per series, so two lines in the comparison view never share
+# one. Read off the entry's own position, never from a matplotlib cycle that
+# could resynchronize between charts.
+OVERLAY_COLOR_CYCLE = ("#1c7ed6", "#f08c00", "#2f9e44", "#d6336c", "#7048e8", "#0c8599")
 
 
 class ChartError(RuntimeError):
@@ -85,6 +102,23 @@ class GrowthBar:
 
 
 @dataclass(frozen=True, slots=True)
+class SeriesLine:
+    """One series' render data on the comparison view, copied from its own entry.
+
+    Render-only, and never serialized into charts.json: the overlay already
+    publishes its membership through `series_ids` and the per-series entries it
+    references, so emitting the nested per-series data would duplicate
+    metrics.json inside the manifest for no consumer.
+    """
+
+    series_id: str
+    label: str
+    points: tuple[SeriesPoint, ...]
+    raw_values: tuple[int | float, ...]
+    median_values: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ChartEntry:
     """Every number and label that reaches one PNG; the renderer adds nothing."""
 
@@ -94,6 +128,12 @@ class ChartEntry:
     # no single spec position (the overlay). Emitted in the manifest so the
     # ordering is inspectable rather than merely implied by list position.
     spec_index: int | None
+    # Which series a chart shows. For the two per-series kinds that is the one
+    # series itself; for the overlay it is the full membership, in metrics order.
+    series_ids: tuple[str, ...]
+    # Render-only per-series data for the overlay; always () elsewhere and never
+    # serialized (see SeriesLine).
+    series_lines: tuple[SeriesLine, ...]
     label: str
     language: str
     filename: str
@@ -241,6 +281,8 @@ def _timeseries_entry(
         kind=TIMESERIES_KIND,
         series_id=series_id,
         spec_index=spec_index,
+        series_ids=(series_id,),
+        series_lines=(),
         label=label,
         language=_require_str(node, "language", "metrics.series entry"),
         filename=series_filename(series_id, TIMESERIES_KIND),
@@ -255,6 +297,58 @@ def _timeseries_entry(
         bars=(),
         note=None,
         subtitle=_subtitle(label),
+    )
+
+
+def _overlay_entry(
+    per_series: Sequence[ChartEntry], spec_language: str
+) -> ChartEntry:
+    """Build the one comparison view a document publishes, last in charts[].
+
+    D-20: one shared *raw* y-axis, never a normalized or rebased one. Each line
+    reuses its series' own already-built values, so the comparison view cannot
+    introduce a number with no source in metrics.json.
+    """
+    if not per_series:
+        raise ChartError("the overlay needs at least one per-series chart")
+    lines = tuple(
+        SeriesLine(
+            series_id=entry.series_id or "",
+            label=entry.label,
+            points=entry.points,
+            raw_values=entry.raw_values,
+            median_values=entry.median_values,
+        )
+        for entry in per_series
+    )
+    # D-14 applied to the overlay as a timeseries axes - which is what it is.
+    # One shared ceiling over every series, so the axis is comparable.
+    largest = max(max(line.raw_values) for line in lines)
+    return ChartEntry(
+        kind=OVERLAY_KIND,
+        series_id=None,
+        spec_index=None,
+        series_ids=tuple(line.series_id for line in lines),
+        series_lines=lines,
+        label=OVERLAY_LABEL,
+        # The document-level language, never one series' language: the overlay
+        # spans them all, and Phase 6 must be able to tell a Ukrainian overlay
+        # from an English one without reading pixels.
+        language=spec_language,
+        filename=OVERLAY_FILENAME,
+        # The overlay owns no single series' point tuple; its plotted data lives
+        # in series_lines, which the manifest reports as a count only.
+        points=(),
+        raw_values=(),
+        median_values=(),
+        gaps=(),
+        anomalies=(),
+        anomalies_drawn=0,
+        yscale="linear",
+        y_limits=(0.0, float(largest) * Y_HEADROOM_FACTOR),
+        bars=(),
+        note=OVERLAY_NOTE,
+        subtitle=f"{OVERLAY_LABEL} - {OVERLAY_METHOD_PHRASE}",
     )
 
 
@@ -297,6 +391,10 @@ def build_chart_plan(
         if not observations:
             raise ChartError(f"no observations for series: {series_id}")
         charts.append(_timeseries_entry(node, observations, spec_index_by_id[series_id]))
+    # D-01/D-19: the comparison view is a *separate* chart, appended last. It
+    # never replaces or suppresses the per-series charts, because a per-series
+    # view and a comparison answer different questions.
+    charts.append(_overlay_entry(charts, language))
     return ChartDocument(
         contract_version=CHARTS_CONTRACT_VERSION,
         spec_name=_require_str(metrics, "spec_name", "metrics"),
@@ -306,6 +404,70 @@ def build_chart_plan(
         metrics_sha256=metrics_sha256,
         charts=tuple(charts),
     )
+
+
+def _draw_timeseries(entry: ChartEntry, ax: Any, mdates: Any) -> None:
+    """Draw one series: a thin raw daily line under a bold 7-day median line.
+
+    D-07 keeps the raw line visible so an anomaly marker lands on a line the
+    reader can see. D-14's zero floor is a timeseries rule and is applied here,
+    off the entry's own limits.
+    """
+    x_values = mdates.date2num([point.date for point in entry.points])
+    ax.plot(x_values, entry.raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=RAW_LINE_LABEL)
+    ax.plot(
+        x_values, entry.median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
+    )
+    # D-14: an explicit zero floor, timeseries axes only. A growth chart must
+    # never receive this call - it would erase a negative bar (RESEARCH
+    # Pitfall 1).
+    ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
+    # D-10: the axis spans the full calendar range; only rows present in
+    # series.csv are plotted, and a views=0 row is drawn at face value (D-11).
+    ax.xaxis_date()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.legend(loc="upper left", frameon=False, fontsize=8)
+
+
+def _draw_overlay(entry: ChartEntry, ax: Any, mdates: Any) -> None:
+    """Draw every series on one shared raw y-axis, plus the scales-differ note.
+
+    D-20 forbids a log or normalized scale here: that would invent a per-series
+    index with no source in metrics.json. The x-axis is left to matplotlib's
+    autoscale, which spans exactly the union of the series' plotted date ranges
+    (D-10) - no `set_xlim` call, so no invented bound.
+    """
+    for index, line in enumerate(entry.series_lines):
+        x_values = mdates.date2num([point.date for point in line.points])
+        ax.plot(
+            x_values,
+            line.raw_values,
+            lw=0.9,
+            alpha=0.8,
+            color=OVERLAY_COLOR_CYCLE[index % len(OVERLAY_COLOR_CYCLE)],
+            label=line.label,
+        )
+    ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
+    ax.xaxis_date()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    # D-09: the disclosure is drawn into the image, so a PNG separated from the
+    # report still says the scales are not comparable. It sits above the legend
+    # so the two never overlap.
+    if entry.note:
+        ax.annotate(
+            entry.note,
+            xy=(0.0, 1.0),
+            xycoords="axes fraction",
+            xytext=(4, -8),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            fontsize=8,
+            color="#495057",
+        )
+    ax.legend(loc="upper left", bbox_to_anchor=(0.0, 0.92), frameon=False, fontsize=8)
 
 
 def render_chart(entry: ChartEntry, out_dir: Path) -> Path:
@@ -321,23 +483,10 @@ def render_chart(entry: ChartEntry, out_dir: Path) -> Path:
     if path.resolve().parent != out_dir.resolve():
         raise ChartError(f"chart target escapes the output directory: {entry.filename}")
     fig, ax = plt.subplots(figsize=FIGURESIZE, dpi=DPI)
-    x_values = mdates.date2num([point.date for point in entry.points])
-    # D-07: the raw daily line stays visible beneath the bold median line, so an
-    # anomaly marker lands on a line the reader can actually see.
-    ax.plot(x_values, entry.raw_values, lw=0.6, alpha=0.55, color="#4C6EF5", label=RAW_LINE_LABEL)
-    ax.plot(
-        x_values, entry.median_values, lw=1.8, color="#212529", label=MEDIAN_LINE_LABEL
-    )
-    # D-14: an explicit zero floor, timeseries axes only. A growth chart must
-    # never receive this call - it would erase a negative bar (RESEARCH
-    # Pitfall 1).
-    ax.set_ylim(entry.y_limits[0], entry.y_limits[1])
-    # D-10: the axis spans the full calendar range; only rows present in
-    # series.csv are plotted, and a views=0 row is drawn at face value (D-11).
-    ax.xaxis_date()
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax.legend(loc="upper left", frameon=False, fontsize=8)
+    if entry.kind == OVERLAY_KIND:
+        _draw_overlay(entry, ax, mdates)
+    else:
+        _draw_timeseries(entry, ax, mdates)
     ax.set_title(entry.subtitle, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=DPI)
@@ -360,6 +509,18 @@ def _bar_payload(bar: GrowthBar) -> dict[str, object]:
     return payload
 
 
+def _plotted_point_count(entry: ChartEntry) -> int:
+    """How many observations this chart draws.
+
+    A count of what was plotted, never a data value. The overlay owns no single
+    series' point tuple - its data lives in `series_lines` - so the count is the
+    sum of the per-series lines it actually draws.
+    """
+    if entry.kind == OVERLAY_KIND:
+        return sum(len(line.points) for line in entry.series_lines)
+    return len(entry.points)
+
+
 def _entry_payload(entry: ChartEntry) -> dict[str, object]:
     """Serialize one chart entry under the charts.v1 omission rule.
 
@@ -374,7 +535,7 @@ def _entry_payload(entry: ChartEntry) -> dict[str, object]:
         "filename": entry.filename,
         "yscale": entry.yscale,
         "y_limits": [entry.y_limits[0], entry.y_limits[1]],
-        "points": len(entry.points),
+        "points": _plotted_point_count(entry),
         "gaps": [[start.isoformat(), end.isoformat()] for start, end in entry.gaps],
         "anomalies_drawn": entry.anomalies_drawn,
         "subtitle": entry.subtitle,
@@ -385,6 +546,9 @@ def _entry_payload(entry: ChartEntry) -> dict[str, object]:
     # The overlay belongs to no spec.series[] position, so it carries none.
     if entry.spec_index is not None:
         payload["spec_index"] = entry.spec_index
+    # `series_ids` belongs to the overlay, the one chart that spans every series.
+    if entry.kind == OVERLAY_KIND:
+        payload["series_ids"] = list(entry.series_ids)
     if entry.kind == GROWTH_KIND and entry.bars:
         payload["bars"] = [_bar_payload(bar) for bar in entry.bars]
     if entry.note is not None:
