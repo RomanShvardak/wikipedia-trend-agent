@@ -2169,3 +2169,183 @@ def test_report_is_stale_answers_true_for_an_unusable_manifest(
     )
 
 
+# --- 06-03 Task 2: publication is atomic, and the manifest lands last ---------
+#
+# CONTRACTS.md 8.7's table has three outcomes and no fourth, and the exit-1 row
+# promises TWO things about a failed publication: the prior bytes are preserved
+# and no staging file is left behind. Neither half had a test. 06-02's
+# injected-defect probe 6 found that fact by swallowing the manifest write's
+# OSError and watching the whole fail-closed selection stay GREEN, which is the
+# strongest possible statement that nothing covered it.
+
+
+def test_atomic_publication_failure_preserves_prior_bytes_and_leaves_no_staging_file(
+    tmp_out: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An interrupted `os.replace` replaces nothing and leaves nothing behind.
+
+    The staging file plus one `os.replace` is the whole mechanism, so the
+    failure at the replace is the one moment a naive implementation would leave
+    either a truncated output or a stray `.report.md.*.tmp` in `--out`. Both
+    halves are asserted against SENTINEL bytes: the prior report and the prior
+    manifest must both survive byte for byte, which is a strictly stronger claim
+    than "the file still parses".
+
+    The test name keeps the substring `atomic` on purpose - 06-03's third
+    non-vacuity probe selects it with `-k atomic` to prove it can go red, and a
+    renamed test would silently make that probe select nothing.
+    """
+    _render_two_series(tmp_out)
+    report_path = tmp_out / build_report.REPORT_FILENAME
+    manifest_path = tmp_out / build_report.REPORT_MANIFEST_FILENAME
+    report_path.write_bytes(b"sentinel-report")
+    manifest_path.write_bytes(b"sentinel-manifest")
+
+    def fail_replace(source: object, destination: object) -> None:
+        raise OSError("simulated interrupted replace")
+
+    # The report module's own `os`, not `make_charts.common.os`: `dump_text` is
+    # this module's own twin of `dump_json` and its `os.replace` is the call
+    # under test.
+    monkeypatch.setattr(build_report.os, "replace", fail_replace)
+
+    assert _run_report(tmp_out) == 1, (
+        "a publication failure is exit 1 under 8.7's table - never a silent "
+        "success and never an uncaught traceback"
+    )
+
+    err = capsys.readouterr().err
+    failures = [line for line in err.splitlines() if line.startswith("report failed:")]
+    assert len(failures) == 1, (
+        f"a model gets one line to act on, not a traceback and not two competing "
+        f"complaints; got {failures!r}"
+    )
+    assert "could not write report output" in failures[0], (
+        f"the refusal must name the failing publication step, so a reader can tell "
+        f"a local input problem from a write failure; got {failures[0]!r}"
+    )
+
+    assert report_path.read_bytes() == b"sentinel-report", (
+        "a failed publication must not touch the prior report's bytes"
+    )
+    assert manifest_path.read_bytes() == b"sentinel-manifest", (
+        "a failed publication must not touch the prior manifest's bytes"
+    )
+    assert list(tmp_out.glob(".report.md.*.tmp")) == [], (
+        "a failed publication must not leave a report staging file behind"
+    )
+    assert list(tmp_out.glob(".report.manifest.json.*.tmp")) == [], (
+        "a failed publication must not leave a manifest staging file behind"
+    )
+    assert list(tmp_out.glob("*.tmp")) == [], (
+        f"no staging file of any name may survive: "
+        f"{[p.name for p in tmp_out.glob('*.tmp')]}"
+    )
+
+
+def test_manifest_is_published_only_after_the_report_is_in_place(
+    tmp_out: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A report write that fails publishes NEITHER file.
+
+    8.7's publication order, asserted rather than assumed: `report.md` is
+    written first and the manifest only once it is in place, so a manifest never
+    names a report that is not there. Breaking the report write is the direction
+    that could publish a manifest alone, so it is the direction this drives.
+
+    The directory is prepared by running the REAL chart stage only - no report
+    has been published here yet, which is what lets the assertions below state
+    that neither output file exists rather than merely that the prior bytes
+    survived.
+    """
+    _copy_chart_inputs(tmp_out)
+    assert make_charts.main(
+        ["--spec", str(FIXTURES_DIR / "spec.example.json"), "--out", str(tmp_out)]
+    ) == 0
+
+    def fail_write(text: str, path: object) -> None:
+        raise OSError("simulated interrupted report write")
+
+    monkeypatch.setattr(build_report, "dump_text", fail_write)
+
+    assert _run_report(tmp_out) == 1
+    err = capsys.readouterr().err
+    failures = [line for line in err.splitlines() if line.startswith("report failed:")]
+    assert len(failures) == 1, f"expected one refusal line, got {failures!r}"
+    assert not (tmp_out / build_report.REPORT_FILENAME).exists(), (
+        "report.md was written even though its own write raised"
+    )
+    assert not (tmp_out / build_report.REPORT_MANIFEST_FILENAME).exists(), (
+        "a manifest naming a report that was never written is the one thing 8.7's "
+        "publication order exists to prevent, and it is on disk"
+    )
+    assert list(tmp_out.glob("*.tmp")) == []
+
+
+def test_manifest_write_failure_keeps_the_prior_manifest_and_is_detectable_as_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The manifest write is the second half of the pair, and it is covered too.
+
+    This is the case WINDOWS entry 23 records: 06-02's probe 6 swallowed the
+    manifest write's `OSError` and the whole fail-closed selection stayed green,
+    because the only publication test that existed patched the REPORT write.
+    The other half of the pair had no coverage at all.
+
+    The interesting property is not the exit code - it is that the resulting
+    state is DETECTABLE. Here `metrics.json` genuinely changed first, so the new
+    report is a render of new content while the prior manifest still describes
+    the old bytes. That is a half-published directory, and the reason it is not
+    a false statement about the data is Task 1's own seam: `report_is_stale`
+    compares the manifest's recorded digest against the file on disk, finds
+    them different, and says so. An mtime comparison would have said "fresh",
+    which is precisely the defect RPT-03 was written to prevent.
+    """
+    out_dir = tmp_path / "out.manifest-failure"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _render_two_series(out_dir)
+
+    manifest_path = out_dir / build_report.REPORT_MANIFEST_FILENAME
+    report_path = out_dir / build_report.REPORT_FILENAME
+    manifest_path.write_bytes(b"sentinel-manifest")
+
+    # A genuine change to an input, so the prior manifest really is out of date
+    # by the time its write fails.
+    metrics_path = out_dir / "metrics.json"
+    document = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics_path.write_text(
+        json.dumps(document, ensure_ascii=False, indent=4), encoding="utf-8"
+    )
+
+    def fail_dump(obj: object, path: object) -> None:
+        raise OSError("simulated interrupted manifest write")
+
+    monkeypatch.setattr(build_report, "dump_json", fail_dump)
+
+    assert _run_report(out_dir) == 1
+    err = capsys.readouterr().err
+    failures = [line for line in err.splitlines() if line.startswith("report failed:")]
+    assert len(failures) == 1, f"expected one refusal line, got {failures!r}"
+    assert "could not write report output" in failures[0], (
+        f"the refusal must name the failing publication step; got {failures[0]!r}"
+    )
+
+    assert manifest_path.read_bytes() == b"sentinel-manifest", (
+        "a failed manifest write must leave the prior manifest's bytes untouched"
+    )
+    assert list(out_dir.glob("*.tmp")) == [], (
+        f"no staging file may survive: {[p.name for p in out_dir.glob('*.tmp')]}"
+    )
+
+    # The half-published state is real - the report is the new render, the
+    # manifest is the prior one - so it must be DETECTABLE, and it is.
+    assert report_path.read_text(encoding="utf-8").strip(), (
+        "the report was written before the manifest by design, so it is the new one"
+    )
+    assert build_report.report_is_stale(out_dir) is True, (
+        "metrics.json changed and the manifest could not be republished, yet the "
+        "directory reports itself current - a consumer would present a report as "
+        "describing input it no longer describes"
+    )
+
+

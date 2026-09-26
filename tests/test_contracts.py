@@ -26,9 +26,10 @@ from typing import Any
 
 import pytest
 
+import build_report
 import make_charts
 import resolve_articles
-from common import load_spec
+from common import load_and_validate_spec, load_spec
 
 METRICS_EXAMPLE = Path(__file__).resolve().parent / "fixtures" / "metrics.example.json"
 METRICS_ANOMALIES_EXAMPLE = (
@@ -713,3 +714,126 @@ def test_report_v1_contract_section_is_complete() -> None:
         "No test may reach the network",
     ):
         assert marker in text, f"report.v1 contract must document {marker!r}"
+
+
+# --- 06-03 Task 2: bind CONTRACTS.md 8.1 to the emitter in BOTH directions ---
+
+
+def _publish_report_manifest(tmp_out: Path) -> dict[str, Any]:
+    """Run the REAL chart stage then the REAL report stage, and read the manifest.
+
+    Both halves are the production emitters, in `tmp_out`, over the committed
+    golden inputs. A hand-written `report.manifest.json` would let this test pass
+    against a document no code writes, which is the whole failure a field-drift
+    test exists to catch - it would be asserting the constant against itself.
+    """
+    tmp_out.mkdir(parents=True, exist_ok=True)
+    assert _render_two_series_manifest(tmp_out), "the chart stage must run first"
+    spec_path = FIXTURES_DIR / "spec.example.json"
+    assert build_report.main(["--spec", str(spec_path), "--out", str(tmp_out)]) == 0, (
+        "the report stage must publish a manifest for this test to read"
+    )
+    return json.loads(
+        tmp_out.joinpath(build_report.REPORT_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+
+
+def test_report_manifest_emits_only_documented_fields(tmp_out: Path) -> None:
+    """A published manifest matches CONTRACTS.md 8.1's documented field list.
+
+    The charts.v1 test above is the model, and it binds a document to an
+    emitter in BOTH drift directions: an emitted field 8.1 does not document,
+    and a documented field the emitter stops writing. Exact set equality is
+    symmetric, so one assertion catches both — a dropped key fails as surely as
+    an added one.
+
+    Exact set equality is a SHAPE check, though, and a shape check passes on a
+    manifest full of plausible wrong values. The value assertions are what make
+    this a contract: both digests are re-computed here from the bytes on disk,
+    the two identity fields are read back out of `metrics.json`, and the language
+    is read out of the validated spec — so an emitter that carried a digest of
+    the wrong file, or an `as_of` from a different document, fails here even
+    though every key is present and correctly named.
+    """
+    import hashlib
+
+    manifest = _publish_report_manifest(tmp_out)
+    metrics_document = json.loads(tmp_out.joinpath("metrics.json").read_text(encoding="utf-8"))
+    spec = load_and_validate_spec(FIXTURES_DIR / "spec.example.json")
+
+    # --- drift OUT of the document, and drift OUT of the emitter, in one check
+    assert set(manifest) == REPORT_V1_TOP_LEVEL, (
+        f"report.manifest.json top-level keys must be exactly "
+        f"{sorted(REPORT_V1_TOP_LEVEL)}, got {sorted(manifest)} - an undocumented "
+        f"field is drift Phase 7's run_all.py would build on, and a documented "
+        f"field the emitter stopped writing is drift a consumer would hit first"
+    )
+    assert manifest["contract_version"] == "report.v1", (
+        f"the version literal is {manifest['contract_version']!r}, section 8.1 "
+        "froze 'report.v1' and anything else is rejected"
+    )
+
+    # --- the two digests, re-derived from the files this run published --------
+    assert manifest["metrics_sha256"] == hashlib.sha256(
+        tmp_out.joinpath("metrics.json").read_bytes()
+    ).hexdigest(), (
+        "metrics_sha256 must be the sha256 of the metrics.json bytes on disk; a "
+        "digest of any other content would make the staleness decision a lie"
+    )
+    assert manifest["charts_sha256"] == hashlib.sha256(
+        tmp_out.joinpath("charts.json").read_bytes()
+    ).hexdigest(), (
+        "charts_sha256 must be the sha256 of the charts.json bytes on disk, for "
+        "the same reason - and 06-03's staleness check reads this field"
+    )
+
+    # --- the three identity fields, read back out of their own sources --------
+    assert manifest["spec_name"] == metrics_document["spec_name"], (
+        f"spec_name must be copied verbatim from metrics.json's own "
+        f"{metrics_document['spec_name']!r}, got {manifest['spec_name']!r}"
+    )
+    assert manifest["as_of"] == metrics_document["as_of"], (
+        f"as_of must be copied verbatim from metrics.json's own "
+        f"{metrics_document['as_of']!r}, got {manifest['as_of']!r}"
+    )
+    assert manifest["language"] == spec["language"], (
+        f"language is the DOCUMENT language and comes from the validated spec's "
+        f"{spec['language']!r}, got {manifest['language']!r}"
+    )
+
+    # --- the two shapes a consumer resolves against the directory it was given
+    assert manifest["report_filename"] == "report.md", (
+        f"report_filename must be the bare relative name 'report.md', got "
+        f"{manifest['report_filename']!r}"
+    )
+    formats = manifest["formats"]
+    assert formats == [{"format": "markdown", "filename": "report.md"}], (
+        f"v1 writes exactly one markdown entry, got {formats!r}; a v1.x PDF is one "
+        "appended object, so a renamed or reshaped slot is exactly the drift this "
+        "assertion prevents"
+    )
+    for entry in formats:
+        assert isinstance(entry, dict) and set(entry) == {"format", "filename"}, (
+            f"a formats entry is an object carrying both keys, got {entry!r}"
+        )
+        name = entry["filename"]
+        assert not (
+            "/" in name or "\\" in name or ".." in name or ":" in name
+        ), (
+            f"formats[].filename must be a bare relative name a consumer resolves "
+            f"against the directory it was given, got {name!r} - the day a PDF "
+            f"entry appears, a path-shaped value here is a traversal vector"
+        )
+
+    shown = manifest["metrics_shown"]
+    assert isinstance(shown, list) and shown, (
+        f"metrics_shown is the pointer list that turns 'every required number is "
+        f"present' into a set comparison; an empty one makes that impossible: {shown!r}"
+    )
+    assert all(isinstance(pointer, str) for pointer in shown), (
+        f"every metrics_shown entry is a string path, got {shown!r}"
+    )
+    assert len(shown) == len(set(shown)), (
+        f"metrics_shown carries duplicates, so a consumer's set comparison depends "
+        f"on how many sections quoted the same value: {shown!r}"
+    )
