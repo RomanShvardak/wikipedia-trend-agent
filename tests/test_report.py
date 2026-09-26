@@ -1120,6 +1120,49 @@ def test_null_growth_renders_not_computable_with_its_reason(tmp_out: Path) -> No
     assert "None" not in text, "the literal None leaked into the document"
     assert "null" not in text, "the literal null leaked into the document"
 
+    # --- the CLEAN reason specifically, not merely "a reason" ---------------
+    #
+    # The golden fixture's window-level and clean-level reasons are the SAME
+    # string, so the assertion above cannot tell them apart. An injected-defect
+    # probe made that concrete: swapping `clean.reason` for the window-level
+    # `reason` inside `_growth_phrase` left this test GREEN (observed:
+    # `1 passed, 16 deselected`), and the rendered row under that defect really
+    # did carry the wrong phrase. A gate never shown to fail has not been shown
+    # to pass, and the distinction is the whole point: the table displays the
+    # CLEAN variant, so the clean variant's explanation is the one that belongs
+    # in its cell. This sub-case derives a document whose two reasons DIFFER, so
+    # the assertion can tell them apart at all.
+    split_dir = tmp_out.parent / "split-reasons"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    split = json.loads((FIXTURES_DIR / "metrics.example.json").read_text(encoding="utf-8"))
+    split["series"][0]["growth"]["y2"]["reason"] = analyze_trends.MISSING_CLEAN_Y1_REASON
+    _copy_chart_inputs(split_dir)
+    _write_metrics(split_dir, split)
+    assert make_charts.main(
+        ["--spec", str(FIXTURES_DIR / "spec.example.json"), "--out", str(split_dir)]
+    ) == 0
+    assert _run_report(split_dir) == 0
+    split_text = split_dir.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+    split_row = _metrics_table_rows(split_text, language)[0]
+
+    clean_phrase = build_report.reason_token(
+        language, analyze_trends.INSUFFICIENT_OBSERVATIONS_REASON
+    )
+    window_phrase = build_report.reason_token(language, analyze_trends.MISSING_CLEAN_Y1_REASON)
+    assert clean_phrase != window_phrase, (
+        "the two reason constants this sub-case depends on must be distinguishable, "
+        "or the assertion below cannot discriminate"
+    )
+    assert build_report.md_cell(clean_phrase) in split_row, (
+        f"the null cell must carry THAT window's own clean.reason "
+        f"({clean_phrase!r}); the row reads {split_row!r}"
+    )
+    assert build_report.md_cell(window_phrase) not in split_row, (
+        f"the null cell carries the window-level reason instead of the clean one "
+        f"({window_phrase!r}) - the table reports the clean variant, so the clean "
+        f"variant's explanation is the one that belongs there"
+    )
+
 
 def test_zero_growth_is_distinct_from_not_computable(tmp_out: Path) -> None:
     """A `clean.pct` of exactly `0.0` is a measured flat window, not an absence.
