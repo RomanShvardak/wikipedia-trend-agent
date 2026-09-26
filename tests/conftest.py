@@ -65,6 +65,14 @@ def spec_example_path() -> Path:
 
 
 @pytest.fixture
+def tmp_out(tmp_path: Path) -> Path:
+    """A per-test output directory under tmp_path; chart tests never write into the repo's out/."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+@pytest.fixture
 def live_spec_path() -> Path:
     """Path to the committed live-article spec fixture (probe-verified pl.wikipedia/Warszawa + en.wikipedia/Albert_Einstein)."""
     return FIXTURES_DIR / "spec.live.example.json"
