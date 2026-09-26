@@ -105,6 +105,223 @@ FORBIDDEN_CALLS = frozenset(
     {"eval", "exec", "compile", "__import__", "system", "popen", "run"}
 )
 
+# --- 06-02 Task 2: the QA-02 fidelity battery --------------------------------
+#
+# The seam below is the reverse-fidelity direction CONTRACTS.md §8.6 names and no
+# test owned before this plan: that no number in the MARKDOWN lacks a source in
+# the documents. `metrics_shown` proves the forward direction (everything
+# required was displayed); nothing proved the reverse, so a number invented by a
+# renderer would have shipped with a manifest that never mentioned it.
+#
+# One function, importable and callable from OUTSIDE pytest with a plain
+# markdown string and a plain source mapping, because 06-03's non-vacuity probe
+# drives it directly. It is not buried inside a test.
+
+# A maximal run of digits, commas and dots. Commas are captured rather than
+# excluded so a grouping separator is part of the token and can be normalized
+# OFF the Markdown side - CONTRACTS.md §8.4's non-locale-aware digits reach the
+# page as `1,720,628`, and a pattern that stopped at the comma would read
+# `1` and `720` and `628` as three separate numbers.
+DIGIT_RUN = re.compile(r"\d[\d,.]*")
+# A numeric literal embedded in a STRING value of a source document.
+STRING_NUMBER = re.compile(r"\d[\d,.]*")
+# The two date shapes the documents carry: `YYYY-MM-DD` and the compact
+# `YYYYMMDD` the analyzer's own anomaly shape uses.
+ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+COMPACT_DATE = re.compile(r"^\d{8}$")
+
+# The per-series fields the report is required to display, in the order the
+# metrics table renders them. The manifest assertion builds its expected set from
+# this tuple AND the fixture's own series list, so neither a count literal nor a
+# hard-coded index can rot: a new display field is a one-line edit here, and a
+# field the report silently stopped showing fails the comparison.
+REQUIRED_SHOWN_FIELDS = (
+    "label",
+    "project",
+    "article",
+    "language",
+    "period.start",
+    "period.end",
+    "period.days",
+    "total_views",
+    "avg_daily_views",
+    "growth.m3.clean.pct",
+    "growth.y1.clean.pct",
+    "growth.y2.clean.pct",
+    "trend_direction",
+    "confidence",
+    "confidence_reasons",
+    "anomaly_share",
+)
+
+# Words that would turn a measurement into a projection. Matched against the
+# document with the `not_a_forecast` phrase REMOVED first, because that phrase is
+# the report's own disclaimer and contains the very word ("прогноз" / "forecast")
+# the prohibition is about: a naive substring search for it would fail on a
+# correct report and pass on one that dropped the disclaimer entirely - the
+# exact inversion the disclaimer exists to prevent.
+FORECAST_VOCABULARY = (
+    # the report language's own words
+    "попит",
+    "виручка",
+    "дохід",
+    "прибуток",
+    "конверс",
+    "прогноз",
+    "платити",
+    "оплатити",
+    # the verbatim English constants, which are NOT redundant: an English
+    # projection sentence leaking into a localized report is precisely the
+    # failure this assertion exists to catch
+    "demand",
+    "revenue",
+    "willingness to pay",
+    "ability to pay",
+    "forecast",
+    "conversion",
+    "monetiz",
+)
+
+# A standalone `inf` / `nan` as a word. Substring matching would be wrong here
+# (`inf` is inside `information`), which is why these two are word-bounded while
+# `None` / `null` / `NaN` / `Infinity` are matched as literals - no English word
+# in either table contains them.
+LEAK_LITERALS = ("None", "null", "nan", "NaN", "Infinity", "-Infinity")
+LEAK_WORDS = ("inf", "nan")
+
+
+def _iter_leaf_values(node: object):
+    """Yield every non-container leaf reachable in a JSON document."""
+    if isinstance(node, Mapping):
+        for value in node.values():
+            yield from _iter_leaf_values(value)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            yield from _iter_leaf_values(value)
+    else:
+        yield node
+
+
+def _add_date_components(text: str, into: set[float]) -> None:
+    """Add the year / month / day of a date string, so a date is matchable.
+
+    A rendered `2026-09-20` reaches the reader as three numeral runs, and each
+    must trace to the document that published the date. Adding the components
+    rather than the whole date is deliberate: a comparison that accepted only
+    the assembled date could not tell `2026-09-20` from `2020-09-26`.
+    """
+    if ISO_DATE.match(text):
+        year, month, day = text.split("-")
+    elif COMPACT_DATE.match(text):
+        year, month, day = text[0:4], text[4:6], text[6:8]
+    else:
+        return
+    for part in (year, month, day):
+        into.add(float(int(part)))
+
+
+def _source_numbers(documents: Sequence[Mapping[str, Any]]) -> set[float]:
+    """Every finite value a numeral in the Markdown could legitimately be.
+
+    Three sources, and the reasoning for each matters because the whole check is
+    only as strong as the looseness of this function:
+
+    1. **Every finite number reachable in the documents.** Taken verbatim - no
+       rounding, no tolerance, no stripping. This is the direction the plan
+       insists is never loosened.
+    2. **Every numeric literal inside every string value of the documents.** The
+       documents carry English reason constants (`"monthly 30-day views at least
+       10000"`) that the report LOCALIZES, and a localized phrase can legitimately
+       contain a numeral the metrics document never held as a number. Excluding
+       them would make the check fail on a correct report, and a gate that must
+       be weakened to pass is a gate nobody trusts. This widens the set only by
+       numerals the documents themselves contain, so an invented number still
+       has no source.
+    3. **The year / month / day of every date string**, per `_add_date_components`.
+    """
+    values: set[float] = set()
+    for document in documents:
+        for leaf in _iter_leaf_values(document):
+            if isinstance(leaf, bool):
+                continue
+            if isinstance(leaf, (int, float)):
+                if math.isfinite(float(leaf)):
+                    values.add(float(leaf))
+            elif isinstance(leaf, str):
+                _add_date_components(leaf, values)
+                for run in STRING_NUMBER.findall(leaf):
+                    cleaned = run.rstrip(",.").replace(",", "")
+                    if cleaned:
+                        values.add(float(cleaned))
+    return values
+
+
+def _markdown_numeric_tokens(markdown: str) -> list[str]:
+    """Every numeral in `markdown` that is a MEASUREMENT rather than a name.
+
+    Two constructs in the rendered document look numeric and are not:
+
+    - a **percent-escape** inside a percent-encoded article slug
+      (`P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD`). `5`, `99`, `1` and `3` are character
+      codes, not measurements, and they are not in any source document as
+      numbers. A run immediately preceded by `%` is skipped.
+    - a **window label** (`3M`, `1Y`, `2Y`). `1`, `2` and `3` name a window, and
+      the report deliberately never states them as `metrics.v1` window lengths.
+      A run immediately followed by a letter or underscore is skipped.
+
+    A trailing `%` is a percentage and is KEPT - the value is the measurement.
+    """
+    tokens: list[str] = []
+    for match in DIGIT_RUN.finditer(markdown):
+        start, end = match.span()
+        before = markdown[start - 1] if start > 0 else ""
+        after = markdown[end] if end < len(markdown) else ""
+        if before == "%" or (before.isalnum() and before.isascii() and not before.isdigit()):
+            continue
+        if after == "%":
+            after = ""
+        if after.isascii() and (after.isalpha() or after == "_"):
+            continue
+        tokens.append(match.group())
+    return tokens
+
+
+def assert_no_invented_numbers(markdown: str, sources: Mapping[str, Any]) -> None:
+    """No numeral in `markdown` may lack a source in `sources`.
+
+    Callable from outside pytest with plain arguments - that is the point, and
+    06-03's non-vacuity probe drives it exactly this way to show the check goes
+    red on an injected wrong number rather than passing on everything.
+
+    Normalization happens on the MARKDOWN side only: grouping separators are
+    removed, a trailing `%` and a leading sign are dropped, and the remainder is
+    coerced to a float. Nothing is stripped, rounded or tolerated on the source
+    side, so the check cannot be made to pass by loosening the documents. A token
+    that cannot be coerced is itself a FAILURE and is named in the message: a
+    number the report cannot even parse is a number nothing vouches for.
+    """
+    available = _source_numbers(list(sources.values()))
+    for raw in _markdown_numeric_tokens(markdown):
+        # `..` is the range separator the period cell renders between two dates
+        # (`2024-09-23..2026-09-20`), so a maximal run can straddle it. Split on
+        # it rather than letting one range swallow both of its endpoints.
+        for piece in raw.split(".."):
+            cleaned = piece.replace(",", "").rstrip(".")
+            if not cleaned:
+                continue
+            try:
+                value = float(cleaned)
+            except ValueError:
+                raise AssertionError(
+                    f"the rendered report carries the numeric token {piece!r}, "
+                    f"which is not a number at all - nothing vouches for it"
+                ) from None
+            if value not in available:
+                raise AssertionError(
+                    f"the rendered report carries {piece!r} ({value!r}), which appears "
+                    f"in no value of any source document: an invented number"
+                )
+
 # The ten ratified report.v1 keys, restated here so the tracer is readable on
 # its own. `test_contracts.REPORT_V1_TOP_LEVEL` is the binding copy, and 06-03
 # adds the field-drift test that asserts the two agree AND that the real emitter
@@ -711,3 +928,530 @@ def test_low_confidence_series_is_framed_as_a_hypothesis(tmp_out: Path) -> None:
         )
 
     assert _fixture_bytes() == before, "the run mutated a committed fixture"
+
+
+# --- 06-02 Task 2: the fidelity battery --------------------------------------
+
+
+def _spec_language() -> str:
+    """The DOCUMENT language, read from the committed spec rather than hardcoded."""
+    return str(json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))["language"])
+
+
+def _render_two_series(tmp_out: Path) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Render the committed two-series document and read all three artifacts back.
+
+    `charts.json` comes from the REAL chart stage, and the returned report text is
+    read from DISK rather than taken from `render_report`'s return value: a
+    fidelity check that reads the planner's output would prove the planner
+    formats what it intends, while the published file is what a reader opens.
+    """
+    before = _fixture_bytes()
+    _render_charts(tmp_out)
+    assert _run_report(tmp_out) == 0
+    text = tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+    metrics = json.loads(tmp_out.joinpath("metrics.json").read_text(encoding="utf-8"))
+    charts = json.loads(tmp_out.joinpath("charts.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        tmp_out.joinpath(build_report.REPORT_MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    assert _fixture_bytes() == before, "the run mutated a committed fixture"
+    return text, metrics, charts, manifest
+
+
+def _metrics_table_header(text: str, language: str) -> str:
+    """The metrics table's header row, located by its FIRST column header."""
+    tokens = build_report.report_tokens(language)
+    prefix = f"| {tokens['series']} |"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line
+    raise AssertionError(f"no metrics table header starting {prefix!r} was rendered")
+
+
+def _metrics_table_rows(text: str, language: str) -> list[str]:
+    """The metrics table's DATA rows, in published order.
+
+    Starts after the header AND its delimiter row, and stops at the first line
+    that is not a row - so a label that broke out of the table would shorten this
+    list rather than silently extend it, and the row-count assertion below is
+    what notices.
+    """
+    header = _metrics_table_header(text, language)
+    lines = text.splitlines()
+    start = lines.index(header)
+    rows: list[str] = []
+    for line in lines[start + 2 :]:
+        if not line.startswith("|"):
+            break
+        rows.append(line)
+    return rows
+
+
+def _unseparated_pipes(line: str) -> int:
+    """The count of REAL cell separators in a table line.
+
+    A `\\|` is an escaped pipe INSIDE a cell, so counting raw `|` characters would
+    report a correctly escaped label as a broken table. The lookbehind is the
+    whole measurement: a cell that split shifts this count, and a cell that did
+    not keeps it equal to the header's.
+    """
+    return len(re.findall(r"(?<!\\)\|", line))
+
+
+def test_no_invented_numbers_in_the_rendered_report(tmp_out: Path) -> None:
+    """Every numeral in the rendered Markdown is a value from a source document.
+
+    The reverse of `metrics_shown`. That list proves everything required was
+    displayed; nothing proved the opposite, so a renderer that computed a
+    percentage of its own would have produced a perfectly well-formed document
+    whose manifest never mentioned the number. No tolerance, no rounding slack
+    and no assertion on prose: one numeral with no source fails here.
+    """
+    text, metrics, charts, _manifest = _render_two_series(tmp_out)
+
+    assert_no_invented_numbers(
+        text,
+        {
+            "metrics.json": metrics,
+            "charts.json": charts,
+        },
+    )
+
+
+def test_metrics_shown_equals_the_frozen_required_set(tmp_out: Path) -> None:
+    """The published `metrics_shown` is the required set, built from the fixture.
+
+    The expected set is derived from the golden fixture's OWN series list crossed
+    with `REQUIRED_SHOWN_FIELDS`, so there is no count literal anywhere: a
+    `metrics.v1` growth does not break this test, and a report that quietly
+    stopped displaying a required field does.
+    """
+    _text, metrics, _charts, manifest = _render_two_series(tmp_out)
+    required = [
+        f"series[{index}].{field}"
+        for index, node in enumerate(metrics["series"])
+        for field in REQUIRED_SHOWN_FIELDS
+    ]
+    shown = manifest["metrics_shown"]
+
+    assert shown, "metrics_shown is empty: the report published no metric pointer at all"
+    assert len(shown) == len(set(shown)), (
+        f"metrics_shown carries duplicates, so a consumer's set comparison would "
+        f"depend on how many sections quoted the same value: {shown}"
+    )
+    assert set(shown) == set(required), (
+        f"metrics_shown does not equal the required set; "
+        f"missing={sorted(set(required) - set(shown))} extra={sorted(set(shown) - set(required))}"
+    )
+
+    # ORDER, as two separate properties, because §8.6's list is ordered by the
+    # order the DOCUMENT rendered (section by section), not grouped by series -
+    # asserting contiguity per series would be asserting a design the contract
+    # does not have.
+    #
+    # (a) the table rendered in `metrics.series[]` order, read off the label
+    #     pointers, which the table emits one per row in that order;
+    # (b) the list is a deterministic function of its inputs, i.e. two runs over
+    #     the same documents publish the same list. This is RPT-02's ordering
+    #     truth stated as a check: a renderer that sorted by `pct` or by
+    #     `confidence` would keep every other assertion in this module green
+    #     while making the document unstable between runs.
+    label_pointers = [pointer for pointer in shown if pointer.endswith(".label")]
+    assert [int(pointer.split("[")[1].split("]")[0]) for pointer in label_pointers] == sorted(
+        int(pointer.split("[")[1].split("]")[0]) for pointer in label_pointers
+    ), f"the table rows do not follow metrics.series[] order: {label_pointers}"
+
+    repeat_dir = tmp_out.parent / "repeat"
+    repeat_dir.mkdir(parents=True, exist_ok=True)
+    _text2, _m2, _c2, manifest2 = _render_two_series(repeat_dir)
+    assert manifest2["metrics_shown"] == shown, (
+        "two runs over the same documents published different metrics_shown lists; "
+        "the published order is not a function of the inputs"
+    )
+
+
+def test_null_growth_renders_not_computable_with_its_reason(tmp_out: Path) -> None:
+    """A null `clean.pct` is the not-computable token plus ITS OWN clean reason.
+
+    ANAL-06 is the rule this whole repository exists to keep, and the reading it
+    forbids is specific: a reader who sees `0` concludes "no growth", where the
+    truth is "not measured". The cell is therefore checked three ways at once -
+    it carries the localized not-computable token, it carries the reason that
+    belongs to the CLEAN variant (the table displays the clean variant, so the
+    window-level reason would be a different sentence's explanation), and it does
+    not degenerate into a bare `0` / `0.0`.
+    """
+    text, metrics, _charts, _manifest = _render_two_series(tmp_out)
+    language = _spec_language()
+    tokens = build_report.report_tokens(language)
+    rows = _metrics_table_rows(text, language)
+    assert len(rows) == len(metrics["series"]), (
+        f"one rendered row per series expected, got {len(rows)} for "
+        f"{len(metrics['series'])}"
+    )
+
+    checked = 0
+    for index, node in enumerate(metrics["series"]):
+        row = rows[index]
+        for window in analyze_trends.GROWTH_WINDOWS:
+            entry = node["growth"][window]
+            if entry["clean"].get("pct") is not None:
+                continue
+            checked += 1
+            reason = build_report.reason_token(language, str(entry["clean"]["reason"]))
+            phrase = (
+                f"{make_charts.WINDOW_LABELS[window]} "
+                f"{tokens['not_computable']} ({build_report.md_cell(reason)})"
+            )
+            assert phrase in row, (
+                f"series[{index}].{window}: the null window's cell must carry the "
+                f"not-computable token and its own clean.reason; expected {phrase!r}"
+            )
+            cell = row.split(f"{make_charts.WINDOW_LABELS[window]} ", 1)[1].split(" / ", 1)[0]
+            assert not re.fullmatch(r"[-+]?0(\.0)?%?", cell.strip()), (
+                f"series[{index}].{window}: a null window rendered as {cell!r} - a "
+                f"reader would conclude 'no growth' where the truth is 'not measured'"
+            )
+    assert checked, (
+        "no null growth window was reached, so this test proved nothing about the "
+        "not-computable rendering"
+    )
+    assert "None" not in text, "the literal None leaked into the document"
+    assert "null" not in text, "the literal null leaked into the document"
+
+
+def test_zero_growth_is_distinct_from_not_computable(tmp_out: Path) -> None:
+    """A `clean.pct` of exactly `0.0` is a measured flat window, not an absence.
+
+    One step from the null case, and the assertion that keeps ANAL-06's "never
+    zero" from being misread as "never a zero": a report that refused to print
+    `+0.0%` because zero looks like the null sentinel would be replacing one
+    misreading with another - a genuinely flat series reported as unmeasured.
+    Both directions are checked on the SAME row, so the two renderings are shown
+    to be structurally distinct rather than merely described as such.
+    """
+    window = "y1"
+    document = json.loads((FIXTURES_DIR / "metrics.example.json").read_text(encoding="utf-8"))
+    entry = document["series"][0]["growth"][window]
+    entry["pct"] = 0.0
+    entry["abs"] = 0
+    entry["clean"]["pct"] = 0.0
+    entry["clean"]["abs"] = 0
+
+    _copy_chart_inputs(tmp_out)
+    _write_metrics(tmp_out, document)
+    assert make_charts.main(
+        ["--spec", str(FIXTURES_DIR / "spec.example.json"), "--out", str(tmp_out)]
+    ) == 0
+    assert _run_report(tmp_out) == 0
+
+    language = _spec_language()
+    tokens = build_report.report_tokens(language)
+    text = tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+    row = _metrics_table_rows(text, language)[0]
+
+    signed_zero = f"{make_charts.WINDOW_LABELS[window]} +0.0%"
+    assert signed_zero in row, (
+        f"a measured 0.0% must render with its sign and its percent mark, "
+        f"expected {signed_zero!r} in the row"
+    )
+    zero_cell = row.split(f"{make_charts.WINDOW_LABELS[window]} ", 1)[1].split(" / ", 1)[0]
+    assert tokens["not_computable"] not in zero_cell, (
+        f"a measured 0.0% rendered as {zero_cell!r} - the two states must be "
+        f"structurally distinct, not merely differently worded"
+    )
+    # And the same row's genuinely-null window still reads as not computable.
+    assert f"{make_charts.WINDOW_LABELS['y2']} {tokens['not_computable']}" in row, (
+        "the null window on the same row lost its not-computable rendering"
+    )
+
+
+def test_every_dynamic_conclusion_states_its_window_pct_and_volume_base(tmp_out: Path) -> None:
+    """Every conclusion line carries its window, its percentage AND its base.
+
+    A growth percentage with no stated volume base is unreadable: `+16.7%` is a
+    very different finding at 100 views/day than at 2,363. The base is the
+    series' OWN `avg_daily_views`, read from `metrics.json` and never recomputed
+    (§7.3), and the plan's own correction for this task is that the base must sit
+    on the SAME line as the percentage rather than in a separate table row where
+    a reader could lose the pairing.
+    """
+    text, metrics, _charts, _manifest = _render_two_series(tmp_out)
+    language = _spec_language()
+    tokens = build_report.report_tokens(language)
+    body = _section_body(text, language, "conclusion")
+
+    checked = 0
+    for node in metrics["series"]:
+        label = build_report.md_cell(node["label"])
+        base = build_report.format_number(node["avg_daily_views"])
+        for window in analyze_trends.GROWTH_WINDOWS:
+            entry = node["growth"][window]
+            if entry["clean"].get("pct") is None:
+                continue
+            checked += 1
+            pct = build_report.format_number(entry["clean"]["pct"], percent=True)
+            line = next(
+                (
+                    candidate
+                    for candidate in body.splitlines()
+                    if candidate.startswith(f"- {label} · {make_charts.WINDOW_LABELS[window]} ")
+                ),
+                None,
+            )
+            assert line is not None, (
+                f"no conclusion line for {node['series_id']} {window}"
+            )
+            assert make_charts.WINDOW_LABELS[window] in line
+            assert f"{pct}%" in line, (
+                f"the conclusion line states no percentage through the single "
+                f"formatting seam: {line!r} lacks {pct!r}"
+            )
+            assert f"{base} {tokens['avg_daily_views']}" in line, (
+                f"the conclusion line does not state the series' own "
+                f"avg_daily_views {base!r} on the same line: {line!r}"
+            )
+    assert checked, "no computable growth window was reached, so this proved nothing"
+
+
+def test_no_none_nan_or_null_leak_paired_with_a_positive_assertion(tmp_out: Path) -> None:
+    """Substring absences, each paired with a positive assertion in THIS body.
+
+    RESEARCH Pitfall 4's all-negative-test trap: a builder that crashed into an
+    empty file satisfies every "X is absent" assertion at once, so the absences
+    below are worthless alone. Each is therefore stated in the same test body as
+    the six headings being present, the manifest being published and
+    `metrics_shown` being non-empty - so a broken builder fails the positives and
+    a working one has to earn the negatives.
+    """
+    text, _metrics, _charts, manifest = _render_two_series(tmp_out)
+    language = _spec_language()
+
+    # --- the positives, first: without these the absences prove nothing ---
+    order = _section_order(text, language)
+    assert order == sorted(order) and len(set(order)) == len(order), (
+        f"the six frozen sections are not all present in order: {order}"
+    )
+    assert manifest["metrics_shown"], "metrics_shown is empty"
+    assert manifest["contract_version"] == build_report.REPORT_CONTRACT_VERSION
+
+    # --- and only then the absences ---
+    for literal in LEAK_LITERALS:
+        assert literal not in text, (
+            f"the rendered report leaks the literal {literal!r} where a number "
+            f"belongs"
+        )
+    for word in LEAK_WORDS:
+        assert not re.search(rf"\b{re.escape(word)}\b", text, re.IGNORECASE), (
+            f"the rendered report leaks the bare token {word!r}"
+        )
+    assert_no_invented_numbers(text, {"metrics.json": _metrics, "charts.json": _charts})
+
+
+def test_gfm_cell_escaping_survives_a_pipe_backslash_and_newline(tmp_out: Path) -> None:
+    """A hostile `label` cannot merge, split or shift a table cell.
+
+    T-6-02, and reachable because `spec.json` is model-authored: a `|` in a label
+    splits one cell into two and shifts every column after it, and a newline ends
+    the row early and can inject a row the report never wrote. The measurement is
+    the count of UNESCAPED separators, which is what a GFM renderer actually
+    splits on - a correctly escaped `\\|` adds no separator and must not be
+    counted as one.
+    """
+    hostile = "Польська | інтервальне\n голодування \\ тест"
+    spec = json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))
+    spec["series"][0]["label"] = hostile
+    spec_path = tmp_out / "spec.hostile.json"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    # Re-validate rather than assume: a derived spec the pipeline would refuse is
+    # a broken test, and `common.validate_spec` is the pipeline's own verdict.
+    assert common.validate_spec(spec) == [], "the derived hostile-label spec must be valid"
+
+    document = json.loads((FIXTURES_DIR / "metrics.example.json").read_text(encoding="utf-8"))
+    document["series"][0]["label"] = hostile
+    _copy_chart_inputs(tmp_out)
+    _write_metrics(tmp_out, document)
+    assert make_charts.main(["--spec", str(spec_path), "--out", str(tmp_out)]) == 0
+    assert _run_report(tmp_out, spec_path) == 0
+
+    language = _spec_language()
+    text = tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8")
+    header = _metrics_table_header(text, language)
+    expected_separators = _unseparated_pipes(header)
+    assert expected_separators > 0
+
+    # A blank line precedes the block, so a stray line inside a cell cannot be
+    # read as the end of the table and the rows after it as a new block.
+    lines = text.splitlines()
+    assert lines[lines.index(header) - 1] == "", (
+        "the metrics table must be preceded by a blank line"
+    )
+
+    rows = _metrics_table_rows(text, language)
+    assert len(rows) == len(document["series"]), (
+        f"the hostile label changed the row count: {len(rows)} rows for "
+        f"{len(document['series'])} series - a newline escaped its cell"
+    )
+    for row in rows:
+        assert _unseparated_pipes(row) == expected_separators, (
+            f"a row carries {_unseparated_pipes(row)} cell separators against the "
+            f"header's {expected_separators}: {row!r}"
+        )
+
+    rendered_label = build_report.md_cell(hostile)
+    assert rendered_label in rows[0], (
+        f"the escaped label is not in its own row: {rendered_label!r}"
+    )
+    assert "\\|" in rows[0], "the raw pipe was not escaped as \\| in the rendered row"
+    assert "\n" not in rendered_label, "md_cell must collapse a newline, not keep it"
+
+
+def test_no_cross_series_rollup_appears_in_the_prose(tmp_out: Path) -> None:
+    """No sentence ranks, counts or totals across series (D-03, T-6-09).
+
+    The phrase list below is the one the plan names; the KEY-NAME vocabulary is
+    reused from `test_contracts.ROLLUP_KEY_BLACKLIST` rather than a second list
+    invented here, because a blacklist that exists in two places is a blacklist
+    that will be updated in one of them. Each series' own row carries its own
+    identity, so a per-series row is demonstrably a per-series row rather than an
+    aggregate wearing a table's clothes.
+
+    The row identity checked is the series' own `article` and `label`, the two
+    values the report actually prints. `series_id` is deliberately NOT the
+    discriminator: §8.6 freezes the table's identity to the label/project/article
+    triple and `metrics_shown` addresses rows by INDEX, so printing `series_id`
+    would be a report-content and manifest change this plan may not make.
+    """
+    from test_contracts import ROLLUP_KEY_BLACKLIST
+
+    text, metrics, _charts, _manifest = _render_two_series(tmp_out)
+    lowered = text.lower()
+
+    for phrase in (
+        "of 2 series",
+        "both series are",
+        "top series",
+        "total across",
+        "overall growth",
+        "ranking",
+        "of the 2 series",
+    ):
+        assert phrase not in lowered, (
+            f"the prose carries the cross-series rollup phrase {phrase!r}"
+        )
+    for key in sorted(ROLLUP_KEY_BLACKLIST):
+        assert not re.search(rf"\b{re.escape(key)}\b", lowered), (
+            f"the document carries the D-03 rollup key name {key!r} as a claim"
+        )
+
+    rows = _metrics_table_rows(text, _spec_language())
+    for index, node in enumerate(metrics["series"]):
+        row = rows[index]
+        assert build_report.md_cell(node["article"]) in row, (
+            f"series[{index}]'s own row does not carry its own article, so it is "
+            f"not demonstrably that series' row: {row!r}"
+        )
+        assert build_report.md_cell(node["label"]) in row, (
+            f"series[{index}]'s own row does not carry its own label: {row!r}"
+        )
+        for other_index, other in enumerate(metrics["series"]):
+            if other_index == index:
+                continue
+            assert other["article"] not in row, (
+                f"series[{index}]'s row also carries series[{other_index}]'s article, "
+                f"so a per-series row has stopped being a per-series row: {row!r}"
+            )
+
+
+def test_report_never_leaks_the_user_agent_or_a_cache_path(tmp_out: Path) -> None:
+    """Neither output file names the transport, its contact or its cache.
+
+    T-6-11. `report.md` is the artefact a reader is most likely to paste into a
+    ticket, a forum post or a deck; a `User-Agent` contact string riding along in
+    it publishes an address nobody asked to publish. The stage's only inputs are
+    the three JSON documents, so nothing here should ever have a chance to appear.
+    """
+    _text, _metrics, _charts, _manifest = _render_two_series(tmp_out)
+    outputs = {
+        "report.md": tmp_out.joinpath(build_report.REPORT_FILENAME).read_text(encoding="utf-8"),
+        "report.manifest.json": tmp_out.joinpath(
+            build_report.REPORT_MANIFEST_FILENAME
+        ).read_text(encoding="utf-8"),
+    }
+    forbidden = (
+        common.DEFAULT_UA,
+        "WTI_USER_AGENT",
+        ".cache/",
+        "user-agent",
+        "User-Agent",
+    )
+    for name, payload in outputs.items():
+        for needle in forbidden:
+            assert needle not in payload, (
+                f"{name} leaks {needle!r} - the report stage opens no connection "
+                f"and has no transport detail to publish"
+            )
+
+
+def test_footer_states_source_as_of_what_was_measured_and_what_this_is_not(tmp_out: Path) -> None:
+    """The named check for ROADMAP SC#3's footer clause and RPT-02's last prohibition.
+
+    A report of pageviews that does not say what it is NOT is the failure this
+    exists to catch: views are not buying intent, and a numeric projection here
+    would be false confidence dressed as a finding. Four localized phrases are
+    asserted by TOKEN LOOKUP rather than as literals, so a localization
+    regression fails this test instead of quietly producing an English footer
+    inside a Ukrainian report.
+
+    The forecast vocabulary is matched against the document with the
+    `not_a_forecast` phrase removed first. That phrase is the disclaimer and it
+    contains the very word being prohibited ("прогноз" / "forecast"), so a naive
+    substring search would fail a correct report and pass one that had dropped
+    the disclaimer - the precise inversion the disclaimer exists to prevent. The
+    disclaimer is asserted present in its own right, one line above.
+
+    Paired with a non-empty document and a published manifest, so a builder that
+    crashed into an empty file cannot pass an all-absence test.
+    """
+    text, metrics, _charts, manifest = _render_two_series(tmp_out)
+    language = _spec_language()
+    tokens = build_report.report_tokens(language)
+
+    # --- the positives ---
+    assert text.strip(), "the rendered report is empty"
+    assert manifest["contract_version"] == build_report.REPORT_CONTRACT_VERSION
+    assert manifest["report_filename"] == build_report.REPORT_FILENAME
+
+    for key in ("source", "measured", "not_a_forecast"):
+        assert tokens[key] in text, f"the footer omits the {key!r} phrase {tokens[key]!r}"
+    assert f"{tokens['as_of']} {metrics['as_of']}" in text, (
+        f"the footer must state the {tokens['as_of']!r} phrase beside the data's own "
+        f"as_of value {metrics['as_of']!r}"
+    )
+    # A footer that says "as of" a different date than the data is the defect this
+    # equality exists to catch, so the two are chained rather than checked once.
+    assert manifest["as_of"] == metrics["as_of"], (
+        f"the manifest's as_of {manifest['as_of']!r} differs from metrics.json's "
+        f"{metrics['as_of']!r}"
+    )
+    assert text.count(f"{tokens['as_of']} {metrics['as_of']}") >= 2, (
+        "the as_of phrase must appear beside the value in BOTH the metrics section "
+        "and the footer, so a reader cannot see two different dates"
+    )
+
+    # --- and only then the absence, with the disclaimer itself removed ---
+    residue = text
+    for _ in range(4):
+        replaced = residue.replace(tokens["not_a_forecast"], " ")
+        if replaced == residue:
+            break
+        residue = replaced
+    assert tokens["not_a_forecast"] not in residue, "the disclaimer phrase never appeared"
+    for word in FORECAST_VOCABULARY:
+        assert word not in residue.lower(), (
+            f"the document projects {word!r} outside its own 'this is not' "
+            f"disclaimer - pageviews are not a demand, revenue or willingness-to-pay "
+            f"forecast"
+        )
+
