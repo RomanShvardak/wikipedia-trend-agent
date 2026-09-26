@@ -18,15 +18,52 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 mypy_path = ["scripts"]
+no_site_packages = true
 
-# matplotlib ships no complete type information, and the repository's gate is
-# `mypy scripts --strict`. Without this override mypy follows matplotlib into
-# numpy's bundled stubs, which use 3.12+ `type` statement syntax that
-# `python_version = "3.11"` cannot parse - so the run aborts on a THIRD-PARTY
-# file before it has checked a line of this project's code. Scoped to matplotlib
-# alone: it is the single permitted relaxation, there is no `# type: ignore`
-# anywhere in the stage module, and every other import in `scripts/` stays fully
-# checked.
+# Typing gate: `mypy scripts --strict` must reach and check THIS project's
+# code, or it is not a gate.
+#
+# The failure it was failing on (05-06 reported "Success" for a run that had
+# never happened):
+#
+#   .venv/Lib/site-packages/numpy/__init__.pyi:737: error: Type statement is
+#   only supported in Python 3.12 and greater  [syntax]
+#   Found 1 error in 1 file (errors prevented further checking)
+#
+# Chain: make_charts.py imports matplotlib -> matplotlib ships a `py.typed`
+# marker, so mypy treats it as a typed, self-checked package and FOLLOWS its
+# real source -> matplotlib imports numpy -> numpy's bundled `__init__.pyi`
+# uses 3.12+ `type` statement syntax that `python_version = "3.11"` cannot
+# parse. The run aborts on a third-party file having checked zero project
+# lines, and the non-zero exit means the gate never actually passed.
+#
+# Why `ignore_missing_imports` could not fix it: it only silences a *missing*
+# import. matplotlib is installed AND typed, so the option is a no-op here.
+#
+# Why `follow_imports = "skip"` alone is not enough either (mypy 2.3.1): to
+# resolve `matplotlib.pyplot` mypy must parse the package root's
+# `__init__.pyi`, and that parse pulls in numpy - before any `follow_imports`
+# decision applies. Reproduced with a synthetic PEP 561 package, so it is not
+# numpy-specific. Every per-module lever was measured and still failed:
+# `follow_imports = "skip"` and `silent` on matplotlib and on numpy, per-module
+# `ignore_errors = true`, and `disable_error_code = ["syntax"]` on numpy. A
+# parse-stage error is raised before per-module error filtering runs.
+#
+# So `no_site_packages = true` above is the load-bearing line: it stops mypy
+# from searching installed PEP 561 packages at all, so `import matplotlib`
+# resolves as a missing import and the scoped override below silences it.
+#
+# What this costs: nothing that is currently checked. matplotlib is the ONLY
+# third-party import anywhere in `scripts/` (verified by AST over all five
+# modules); everything else is stdlib, whose stubs ship inside mypy itself and
+# are unaffected, or a sibling module resolved through `mypy_path`. If a future
+# module genuinely needs third-party types, this flag is the first thing to
+# revisit.
+#
+# Scoped to matplotlib alone: it is the single permitted relaxation, there is
+# no `# type: ignore` anywhere in the stage module, `python_version` stays at
+# 3.11, and `mypy_path = ["scripts"]` is untouched.
 [[tool.mypy.overrides]]
 module = ["matplotlib", "matplotlib.*"]
+follow_imports = "skip"
 ignore_missing_imports = true
