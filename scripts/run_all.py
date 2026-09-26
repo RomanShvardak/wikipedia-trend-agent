@@ -50,6 +50,20 @@ _STAGE_MODULES: dict[str, ModuleType] = {
 }
 
 
+def _parser() -> argparse.ArgumentParser:
+    """Exactly three flags. A fourth would be a contract the stages do not own.
+
+    A module-level factory, like `make_charts._parser` and
+    `build_report._parser`, so the packaging test can read the real option set
+    out of the parser instead of re-deriving it from a docstring.
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spec", required=True, help="path to spec.json")
+    parser.add_argument("--out", default="out", help="output directory (default: out)")
+    parser.add_argument("--verbose", action="store_true", help="enable debug logging")
+    return parser
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -57,11 +71,7 @@ def main(
     today_utc: date | None = None,
 ) -> int:
     """Sequence the four stages and return an actionable exit code."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--spec", required=True, help="path to spec.json")
-    parser.add_argument("--out", default="out", help="output directory (default: out)")
-    parser.add_argument("--verbose", action="store_true", help="enable debug logging")
-    args = parser.parse_args(argv)
+    args = _parser().parse_args(argv)
     setup_logging(args.verbose)
 
     # No mkdir and no pre-validation here: `fetch_pageviews` is the first stage,

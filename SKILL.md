@@ -1,6 +1,6 @@
 ---
 name: wikipedia-trend-agent
-description: Analyzes Wikipedia pageviews trends for topics and language editions via the Wikimedia Pageviews API: compares interest across series, measures growth (3M/1Y/2Y with spike-excluded variants), detects seasonality and anomalies, and produces a metrics.json single source of truth plus a Markdown report with PNG charts. Use when the user asks whether interest in a topic or language is growing («чи зростає інтерес до теми X»), wants a comparison across languages/topics, or needs to know how much a trend can be trusted. Runs on cheap/free models — stdlib-thin, one runtime dependency.
+description: "Analyzes Wikipedia pageviews trends for topics and language editions via the Wikimedia Pageviews API: compares interest across series, measures growth (3M/1Y/2Y with spike-excluded variants), detects seasonality and anomalies, and produces a metrics.json single source of truth plus a Markdown report with PNG charts. Use when the user asks whether interest in a topic or language is growing («чи зростає інтерес до теми X»), wants a comparison across languages/topics, or needs to know how much a trend can be trusted. Runs on cheap/free models — stdlib-thin, one runtime dependency."
 license: Apache-2.0
 compatibility: "Python >= 3.11; HTTPS access to wikimedia.org"
 metadata:
@@ -41,6 +41,7 @@ Load one file per question. This body deliberately does not restate them.
 | What are the UA, throttle, retry, 404 and cache rules? | `references/API_ACCESS.md` |
 | What makes these numbers easy to misread? | `references/DATA_CAVEATS.md` |
 | What does a conforming spec look like? | `assets/example.intermittent-fasting.json` |
+| Which `--projects` codes exist, and where did that list come from? | `assets/wikipedia-projects.json` (`wikipedia-projects.v1`, the catalog `resolve_articles.py` validates against) |
 
 ## Workflow
 

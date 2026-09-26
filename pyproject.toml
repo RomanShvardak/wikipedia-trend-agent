@@ -10,6 +10,12 @@ dev = ["pytest>=9.0", "ruff", "mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Registered so a `-W error` configuration does not warn on the opt-in
+# `skills-ref` test. The marker changes nothing by itself: the test also
+# requires WTI_SKILLS_REF=1, and without it it skips.
+markers = [
+  "slow: opt-in corroboration that needs npx and the network (WTI_SKILLS_REF=1)",
+]
 
 [tool.ruff]
 line-length = 100
