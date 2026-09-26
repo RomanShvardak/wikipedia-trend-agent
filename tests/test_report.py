@@ -959,6 +959,23 @@ def _render_two_series(tmp_out: Path) -> tuple[str, dict[str, Any], dict[str, An
     return text, metrics, charts, manifest
 
 
+def _footer(text: str) -> str:
+    """Everything after the document's last horizontal rule - the footer block.
+
+    Scoped rather than whole-document because «Наступний крок» renders the SAME
+    `not_a_forecast` phrase the footer does. An injected-defect probe made that
+    concrete: deleting the footer's clause entirely left the whole-document
+    assertion green (observed: `1 passed, 16 deselected`), because the next-step
+    line still carried the phrase. The prohibition is specifically that the
+    FOOTER states what the report is not, so the assertion has to read the
+    footer.
+    """
+    marker = "\n---\n"
+    index = text.rfind(marker)
+    assert index != -1, "the rendered document has no closing horizontal rule"
+    return text[index + len(marker) :]
+
+
 def _metrics_table_header(text: str, language: str) -> str:
     """The metrics table's header row, located by its FIRST column header."""
     tokens = build_report.report_tokens(language)
@@ -1460,17 +1477,27 @@ def test_footer_states_source_as_of_what_was_measured_and_what_this_is_not(tmp_o
     text, metrics, _charts, manifest = _render_two_series(tmp_out)
     language = _spec_language()
     tokens = build_report.report_tokens(language)
+    footer = _footer(text)
 
     # --- the positives ---
     assert text.strip(), "the rendered report is empty"
+    assert footer.strip(), "the rendered report has an empty footer"
     assert manifest["contract_version"] == build_report.REPORT_CONTRACT_VERSION
     assert manifest["report_filename"] == build_report.REPORT_FILENAME
 
+    # Read from the FOOTER, not from the whole document. `not_a_forecast` also
+    # appears in «Наступний крок», so a whole-document check is satisfied by that
+    # line alone and the footer could lose its own clause unnoticed - proven by
+    # injected-defect probe 10, which deleted the footer's clause and left this
+    # test green.
     for key in ("source", "measured", "not_a_forecast"):
-        assert tokens[key] in text, f"the footer omits the {key!r} phrase {tokens[key]!r}"
-    assert f"{tokens['as_of']} {metrics['as_of']}" in text, (
+        assert tokens[key] in footer, (
+            f"the footer omits the {key!r} phrase {tokens[key]!r}; the footer reads "
+            f"{footer!r}"
+        )
+    assert f"{tokens['as_of']} {metrics['as_of']}" in footer, (
         f"the footer must state the {tokens['as_of']!r} phrase beside the data's own "
-        f"as_of value {metrics['as_of']!r}"
+        f"as_of value {metrics['as_of']!r}; the footer reads {footer!r}"
     )
     # A footer that says "as of" a different date than the data is the defect this
     # equality exists to catch, so the two are chained rather than checked once.
@@ -1478,9 +1505,9 @@ def test_footer_states_source_as_of_what_was_measured_and_what_this_is_not(tmp_o
         f"the manifest's as_of {manifest['as_of']!r} differs from metrics.json's "
         f"{metrics['as_of']!r}"
     )
-    assert text.count(f"{tokens['as_of']} {metrics['as_of']}") >= 2, (
-        "the as_of phrase must appear beside the value in BOTH the metrics section "
-        "and the footer, so a reader cannot see two different dates"
+    assert f"{tokens['as_of']} {metrics['as_of']}" in _section_body(text, language, "metrics"), (
+        "the as_of phrase must appear beside the value in the metrics section too, "
+        "so a reader cannot meet two different dates in one document"
     )
 
     # --- and only then the absence, with the disclaimer itself removed ---
