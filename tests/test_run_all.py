@@ -638,3 +638,122 @@ def test_the_analysis_stage_consumes_the_fetch_stage_csv_and_the_report_the_metr
 
     metrics, _sha = make_charts.load_metrics(tmp_out / "metrics.json")
     assert metrics["spec_name"] == spec["name"]
+
+
+# The two articles the shipped example measures, pinned because the slugs are
+# LIVE facts and a slug that 404s is a production defect, not a cosmetic one.
+#
+# HISTORY. The asset originally carried `Post_przerywany` (pl) and
+# `P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD` (cs). Both return 404 from AQS and are
+# reported `missing` by the Action API: pl.wikipedia has no intermittent-fasting
+# article at all, and the Czech title had its two words transposed. Every stage
+# still exited 0 over a mocked transport, so nothing in the suite could see it -
+# which is exactly why the two values are pinned here rather than left to the
+# fixture corpus, whose series are a synthetic ramp and whose article column is a
+# label on invented numbers, not a claim about a live page.
+VERIFIED_ARTICLES = {
+    "pl-post-przerywany": "G%C5%82od%C3%B3wka_lecznicza",  # Głodówka lecznicza, pageid 74017
+    "cs-pust-prerusovany": "P%C5%99eru%C5%A1ovan%C3%BD_p%C5%AFst",  # Přerušovaný půst, pageid 1632302
+}
+
+# The 404 slugs the asset used to carry, kept as an explicit deny-list so the
+# correction cannot be reverted by copying the old value back in.
+REJECTED_ARTICLES = ("Post_przerywany", "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD")
+
+
+def test_the_asset_names_the_two_articles_that_actually_exist(asset_spec_path: Path) -> None:
+    """The shipped example's slugs are the probe-verified existing ones.
+
+    Neither value is fetched here - no test may reach the network - so the
+    claim being pinned is the one the suite can still make offline: the asset
+    carries exactly these two slugs. They were verified live against the Action
+    API (`action=query&titles=`, both `ns: 0` with a pageid) and against AQS
+    (both HTTP 200).
+    """
+    spec = json.loads(asset_spec_path.read_text(encoding="utf-8"))
+    by_id = {str(item["id"]): str(item["article"]) for item in spec["series"]}
+
+    assert by_id == VERIFIED_ARTICLES, (
+        "the shipped example's article slugs changed; the asset is the file a "
+        f"reader runs live, so a slug here is a production fact. Expected "
+        f"{VERIFIED_ARTICLES}, found {by_id}"
+    )
+    for series_id, article in by_id.items():
+        assert article not in REJECTED_ARTICLES, (
+            f"{series_id} is back to a slug Wikimedia reports as missing: {article}"
+        )
+        # `resolve_articles.py` emits `quote(title, safe='')`, so a spec slug
+        # the resolver could have produced is percent-encoded. Asserting the
+        # shape keeps the asset copy-pasteable straight out of a resolver run.
+        assert "%" in article, (
+            f"{series_id}'s slug is not percent-encoded, so it is not what "
+            f"resolve_articles.py emits: {article}"
+        )
+
+
+def test_the_asset_discloses_that_the_two_series_are_not_the_same_topic(
+    asset_spec_path: Path,
+) -> None:
+    """The topic asymmetry is stated in the spec, not discovered by the reader.
+
+    `pl.wikipedia` has no intermittent-fasting article; `Głodówka lecznicza`
+    covers fasting generally, so the comparison measures adjacent topics. That
+    is a caveat about what the numbers MEAN, so it belongs in the `assumptions`
+    the report prints - and a report that is silent about it would be asserting
+    a like-for-like comparison the data does not support.
+    """
+    spec = json.loads(asset_spec_path.read_text(encoding="utf-8"))
+    assumptions = " ".join(str(item) for item in spec["assumptions"])
+
+    assert "pl.wikipedia" in assumptions, (
+        "the assumptions no longer name which wiki lacks the dedicated article"
+    )
+    assert "Głodówka lecznicza" in assumptions, (
+        "the assumptions do not name the article actually measured on pl.wikipedia"
+    )
+    assert any(
+        "pl.wikipedia" in str(item) for item in spec["assumptions"]
+    ), "no single assumption carries the pl.wikipedia asymmetry"
+
+    # The pl label must not claim to be the intermittent article it is not: it
+    # is carried into chart titles and the report table, where a reader meets it
+    # before they meet the assumptions.
+    pl = next(item for item in spec["series"] if item["id"] == "pl-post-przerywany")
+    assert "інтервальне голодування" not in str(pl["label"]), (
+        "the pl label still claims to be intermittent fasting, but the article "
+        f"measured is fasting in general: {pl['label']}"
+    )
+
+
+def test_the_fetch_stage_sends_each_asset_slug_unmodified(
+    tmp_out: Path, asset_spec_path: Path, transport_stub
+) -> None:
+    """The percent-encoded spec slug reaches the AQS URL byte for byte.
+
+    `fetch_pageviews.series_url` interpolates the spec's `article` into the
+    request path with no quoting, which is correct ONLY because the resolver
+    already percent-encoded it. That is an invariant nothing else states: the
+    mocked transport is indifferent to what the URL contains, and the live run
+    cannot run in CI. So the pass-through is asserted here directly - each
+    requested URL must contain the spec's own slug, with its `%XX` triplets
+    intact and not double-encoded.
+    """
+    spec = json.loads(asset_spec_path.read_text(encoding="utf-8"))
+    stub, expected_calls = _scripted_transport(transport_stub, asset_spec_path)
+    assert _run(asset_spec_path, tmp_out, transport=stub) == 0
+
+    requested = [url for url, _headers in stub.calls]
+    assert len(requested) == expected_calls
+    for series in spec["series"]:
+        article = str(series["article"])
+        matching = [url for url in requested if f"/{article}/daily/" in url]
+        assert matching, (
+            f"no AQS request carried the spec slug {article!r} verbatim; the "
+            f"fetch stage must not re-encode or decode what the resolver gave it"
+        )
+        for url in matching:
+            assert str(series["project"]) in url
+            assert "%25" not in url, (
+                "the slug was double-encoded on its way into the request URL: "
+                f"{url}"
+            )
