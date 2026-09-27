@@ -58,7 +58,21 @@ def test_skill_frontmatter_fields() -> None:
     assert len(description) <= 1024, f"description is {len(description)} chars (> 1024)"
     assert front["license"] == "Apache-2.0", front["license"]
     assert "Python >= 3.11" in front["compatibility"], front["compatibility"]
-    assert front["metadata.version"] == "0.1.0", front["metadata.version"]
+    # The version is read from `pyproject.toml` rather than pinned as a literal here.
+    # It was a literal ("0.1.0") until Phase 9 bumped the skill to 0.2.0, and the bump
+    # turned this line red — which is the test working, but it also showed the cost: two
+    # places to change for one fact, and a reader who bumps one and not the other gets a
+    # failure that says nothing about which is wrong. Now `pyproject.toml` is the single
+    # source and this asserts the two agree.
+    import tomllib
+
+    declared = tomllib.loads(
+        (SKILL_DIR / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    assert front["metadata.version"] == declared, (
+        f"SKILL.md's frontmatter says {front['metadata.version']!r} while pyproject.toml "
+        f"says {declared!r}; the skill's version is stated in two files and they must agree"
+    )
     assert front["metadata.spec-url"] == "https://agentskills.io/specification"
 
 

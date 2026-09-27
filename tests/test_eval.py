@@ -238,7 +238,7 @@ def test_every_eval_fixture_is_referenced_by_a_test() -> None:
     fixture without wiring it into the matrix is a failing test rather than a
     file nobody reads.
     """
-    referenced = {row[0] for row in FAIL_ROWS} | {CLEAN_ANSWER}
+    referenced = {row[0] for row in FAIL_ROWS} | {CLEAN_ANSWER, DECLINING_ANSWER}
     on_disk = {path.name for path in EVAL_DIR.glob("*.md")}
     assert on_disk, "tests/fixtures/eval/ is empty, so this proves nothing"
     orphans = sorted(on_disk - referenced)
@@ -262,3 +262,198 @@ def test_a_missing_input_is_a_usage_problem_not_an_answer_problem(tmp_path: Path
     assert validate_answer.main(["--answer", str(EVAL_DIR / CLEAN_ANSWER), "--out", str(tmp_path / "void")]) == 2
     # No stub is written for a usage problem either.
     assert not (out_dir / "eval").exists()
+
+
+# ---------------------------------------------------------------------------
+# FINDING-04 (bug.md): a negative metrics value had no quotable spelling.
+#
+# `_normalise` stripped a leading `-` while `_accepted_forms` emitted only
+# signed spellings, so the value's own form was never in the accepted set and
+# no answer could quote a decline. Three neighbouring defects had the same
+# root - the tokeniser could not read the spellings a Ukrainian answer uses.
+#
+# The committed `metrics.example.json` that the five pre-existing fixtures are
+# written against contains NO negative value, which is why none of them could
+# catch this. `metrics.declining.example.json` is the real intermittent-fasting
+# run: y1 clean -38.5% and -44.5%, both series `low`.
+# ---------------------------------------------------------------------------
+
+DECLINING_ANSWER = "pass.declining-growth.example.md"
+DECLINING_METRICS = "metrics.declining.example.json"
+
+
+def test_a_declining_series_has_an_answer_that_passes(tmp_path: Path, capsys) -> None:
+    """The skill's own documented example, passing the skill's own check.
+
+    This is the whole point of the fix. Before it, every declining series had
+    NO valid answer: quoting the correct number and passing property 1 were
+    mutually exclusive, so `manual.md` A.8 failed its own validator.
+    """
+    code, output, out_dir = _check(DECLINING_ANSWER, DECLINING_METRICS, tmp_path, capsys)
+    assert code == 0, output
+    assert all(
+        line.startswith("PASS ") for line in output.splitlines() if line[:5] in ("PASS ", "FAIL ")
+    ), output
+    assert not (out_dir / "eval" / "regression").exists()
+
+
+def test_the_declining_run_checks_property_two_non_vacuously(tmp_path: Path, capsys) -> None:
+    """Both series in this document are `low`, so property 2 has real work.
+
+    `test.md` section 11 recorded `low_is_hypothesis` passing twice on an
+    EMPTY check (`NOTE low_is_hypothesis: no low-confidence series to check`).
+    A harness whose strongest property never fires is a harness nobody has
+    tested, so the same document is used to prove property 2 does fire.
+    """
+    metrics = json.loads((FIXTURES_DIR / DECLINING_METRICS).read_text(encoding="utf-8"))
+    assert [series["confidence"] for series in metrics["series"]] == ["low", "low"]
+    code, output, _ = _check(DECLINING_ANSWER, DECLINING_METRICS, tmp_path, capsys)
+    assert code == 0, output
+    assert "no low-confidence series to check" not in output, (
+        "the vacuous-PASS note must not appear for a document with two low series"
+    )
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        ("-38.5", -38.5),  # ASCII minus, the honest signed form
+        ("\u221238.5", -38.5),  # U+2212, what a word processor produces
+        ("-38,5", -38.5),  # comma decimal separator
+        ("\u221238,5", -38.5),  # both at once - exactly what manual.md A.8 writes
+        ("+14.5", 14.5),  # the control that must survive the fix
+    ],
+    ids=["ascii_minus", "typographic_minus", "comma_decimal", "both", "positive_control"],
+)
+def test_every_legal_spelling_of_a_decline_is_accepted(
+    spelling: str, expected: float
+) -> None:
+    """One source value, the spellings a person actually types."""
+    assert validate_answer._normalise(spelling) == pytest.approx(expected)
+
+
+def test_an_unsigned_decline_is_rejected_and_that_is_deliberate() -> None:
+    """`38.5%` is NOT a legal spelling of a source value of -38.5.
+
+    This is a deliberate refusal, not an oversight. A bare `38.5` and a `+38.5`
+    are the SAME token to this checker, so accepting the unsigned magnitude of a
+    negative value would let an answer claim a 38.5% INCREASE against a source
+    of -38.5 - the exact sign error property 1 exists to catch, and one no
+    surrounding-word analysis can distinguish here. So a decline is quoted WITH
+    its sign, which is what `manual.md` A.8 already does.
+    """
+    assert "-38.5" in validate_answer._accepted_forms(-38.5)
+    assert "\u221238,5" not in validate_answer._accepted_forms(-38.5)
+    metrics = json.loads((FIXTURES_DIR / DECLINING_METRICS).read_text(encoding="utf-8"))
+    assert validate_answer.check_numbers("growth -38.5%", metrics).passed
+    unsigned = validate_answer.check_numbers("growth 38.5%", metrics)
+    assert not unsigned.passed, (
+        "an unsigned decline must not pass, or a sign error is undetectable"
+    )
+    assert validate_answer.check_numbers("growth +38.5%", metrics).passed is False
+
+
+
+def test_a_comma_is_a_decimal_separator_only_when_it_cannot_be_a_thousands_group() -> None:
+    """`52,5` is 52.5. `1,720` is 1720. Getting this backwards invents numbers."""
+    assert validate_answer._normalise("52,5") == pytest.approx(52.5)
+    assert validate_answer._normalise("1,720") == pytest.approx(1720)
+    assert validate_answer._normalise("1,720,628") == pytest.approx(1720628)
+    assert validate_answer._normalise("1,234.5") == pytest.approx(1234.5)
+
+
+def test_the_sign_is_compared_and_not_discarded() -> None:
+    """A negative value must not be satisfied by a positive spelling, or vice versa."""
+    assert validate_answer._normalise("-52.5") == pytest.approx(-52.5)
+    assert validate_answer._normalise("52.5") == pytest.approx(52.5)
+    assert validate_answer._normalise("+14.5") == pytest.approx(14.5)
+    # `-52.5` and `52.5` are DIFFERENT values, so neither accepted set may
+    # contain the other.
+    negative = {validate_answer._normalise(f) for f in validate_answer._accepted_forms(-52.5)}
+    positive = {validate_answer._normalise(f) for f in validate_answer._accepted_forms(52.5)}
+    assert 52.5 not in negative, "a negative value accepted its own unsigned positive"
+    assert -52.5 not in positive, "a positive value accepted a negative spelling"
+
+
+def test_digits_inside_a_proper_name_are_exempt_but_a_standalone_number_is_not() -> None:
+    """`N8n` must be nameable; `8` standing alone must still be checked.
+
+    The exemption is a LETTER on both sides, so it cannot reach a measurement
+    in prose - the second half of this test is what proves that, and it is the
+    half that would be missing if the rule were "any alphabetic neighbour".
+    """
+    metrics = {"as_of": "2026-09-26", "series": []}
+    named = validate_answer.check_numbers("The article N8n was measured.", metrics)
+    assert not named.offending_token, (
+        f"N8n must be nameable, but {named.offending_token!r} was read as a measurement"
+    )
+    standalone = validate_answer.check_numbers("The article had 8 views.", metrics)
+    assert standalone.offending_token is not None
+    assert standalone.offending_token.strip() == "8", (
+        "a standalone number must still be checked; the letter-bounded rule "
+        "must not have become 'any alphabetic neighbour'"
+    )
+
+
+
+def test_numbers_quoted_from_a_rubric_reason_string_are_a_source() -> None:
+    """`period at least 91 days` is mandatory content, so 91 must be a source.
+
+    SKILL.md requires the confidence reasons and the seasonality note to be
+    quoted verbatim. Before FINDING-04 `_numeric_leaves` skipped every string,
+    so an answer that obeyed that rule failed property 1 on the rubric's own
+    thresholds.
+    """
+    metrics = json.loads((FIXTURES_DIR / DECLINING_METRICS).read_text(encoding="utf-8"))
+    dates: set[str] = set()
+    pool = validate_answer._numeric_leaves(metrics, dates)
+    for threshold in (91, 30, 1000, 5):
+        assert float(threshold) in pool, (
+            f"{threshold} appears only inside a confidence_reasons string and "
+            "must still be quotable"
+        )
+
+
+def test_a_reason_string_cannot_inject_a_decimal_a_sign_or_a_percent() -> None:
+    """The reason scan is a bare integer, deliberately narrower than the token regex.
+
+    Without this, any string in `metrics.json` could add a value to the source
+    set that the tool would not itself have produced.
+    """
+    forged = {
+        "as_of": "2026-09-26",
+        "series": [
+            {
+                "series_id": "forged",
+                "confidence_reasons": ["-1234.5%", "0.1", "+7"],
+                "seasonality": {"note": "9999999"},
+            }
+        ],
+    }
+    dates: set[str] = set()
+    pool = validate_answer._numeric_leaves(forged, dates)
+    assert -1234.5 not in pool
+    assert 0.1 not in pool
+    assert 7.0 in pool, "a bare integer in a reason string is a legitimate source"
+    assert 9999999.0 in pool
+
+
+def test_an_invented_number_still_fails_and_there_is_still_no_tolerance_band(
+    tmp_path: Path, capsys
+) -> None:
+    """Widening the accepted SPELLINGS must not widen the accepted VALUES.
+
+    The closed-set property is the whole reason property 1 is a mechanical
+    claim rather than a promise. `4247.7` is a real growth figure in
+    `out-ai-automation`; `4247.9` is not, and a 0.2% band would let it through.
+    """
+    metrics = json.loads(
+        (FIXTURES_DIR / "metrics.declining.example.json").read_text(encoding="utf-8")
+    )
+    for invented in ("-38.6%", "-38.4%", "-99.9%", "-38,6%", "38.5%", "+38.5%"):
+        result = validate_answer.check_numbers(f"growth {invented}", metrics)
+        assert not result.passed, f"{invented} was accepted; the check has a band"
+    for real in ("-38.5%", "\u221238.5%", "-38,5%"):
+        result = validate_answer.check_numbers(f"growth {real}", metrics)
+        assert result.passed, f"{real} was rejected but is a real spelling"
+

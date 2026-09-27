@@ -1,10 +1,10 @@
 ---
 name: wikipedia-trend-agent
-description: "Analyzes Wikipedia pageviews trends for topics and language editions via the Wikimedia Pageviews API: compares interest across series, measures growth (3M/1Y/2Y with spike-excluded variants), detects seasonality and anomalies, and produces a metrics.json single source of truth plus a Markdown report with PNG charts. Use when the user asks whether interest in a topic or language is growing («чи зростає інтерес до теми X»), wants a comparison across languages/topics, or needs to know how much a trend can be trusted. Runs on cheap/free models — stdlib-thin, one runtime dependency."
+description: "Analyzes Wikipedia pageviews trends for topics and language editions via the Wikimedia Pageviews API: compares interest across series, measures growth (3M/1Y/2Y with spike-excluded variants), detects seasonality and anomalies, and produces a metrics.json single source of truth plus a Markdown report with PNG charts (and, on request, an A4 PDF of the same numbers). Use when the user asks whether interest in a topic or language is growing («чи зростає інтерес до теми X»), wants a comparison across languages/topics, or needs to know how much a trend can be trusted. Runs on cheap/free models — stdlib-thin, one runtime dependency."
 license: Apache-2.0
 compatibility: "Python >= 3.11; HTTPS access to wikimedia.org"
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   spec-url: https://agentskills.io/specification
   data-source: Wikimedia Pageviews API
 ---
@@ -86,10 +86,28 @@ Load one file per question. This body deliberately does not restate them.
    names it on stderr (`run_all: stage <name> failed: …`), so no later stage
    ever runs and no later artifact is written. `resolve_articles.py` is
    **not** part of it: it is the human-confirmed pre-stage in steps 1–3, and
-   `run_all.py` runs only after `spec.json` exists. The command takes exactly
-   `--spec`, `--out` and `--verbose`; it passes no `--log-scale`, so the one
-   command always produces the linear chart regime, and the opt-in log regime
-   is a deliberate second run of the chart stage.
+   `run_all.py` runs only after `spec.json` exists. The command takes
+   `--spec`, `--out`, `--verbose` and `--pdf`; it passes no `--log-scale`, so
+   the one command always produces the linear chart regime, and the opt-in log
+   regime is a deliberate second run of the chart stage.
+
+   **A fifth stage, `--pdf`, is opt-in and OFF by default.** With the flag, a
+   `pdf` stage runs after `report` and publishes `out/report.pdf` beside
+   `report.md`, appending one object to the manifest's `formats[]`
+   (`references/CONTRACTS.md` §8.1.1). It shows **the same numbers and the same
+   localized strings** as the Markdown — the 11-column metrics table becomes one
+   card per series, because eleven columns do not fit A4 — and it adds no
+   runtime dependency: `requirements.txt` is still one line. It needs two
+   optional things, and refuses with the exact command when either is missing:
+
+   ```bash
+   pip install -r requirements-pdf.txt                            # pypandoc
+   winget install Typst.Typst --silent --accept-package-agreements  # the engine
+   ```
+
+   Without `--pdf` the pipeline is **byte-for-byte unchanged** — no new file,
+   no new line on stdout, the same exit code. A PDF failure is a real failure
+   and fails the pipeline; it is never downgraded to a warning.
 
    **The diagnostic path — the four stages individually.** Use this when one
    stage must be re-run with different options, or when you need its own
@@ -100,10 +118,13 @@ Load one file per question. This body deliberately does not restate them.
    python scripts/analyze_trends.py --spec out/spec.json --out out   # -> metrics.json
    python scripts/make_charts.py  --spec out/spec.json --out out      # -> PNG charts + charts.json
    python scripts/build_report.py --spec out/spec.json --out out     # -> report.md + report.manifest.json
+   python scripts/build_pdf.py    --spec out/spec.json --out out     # -> report.pdf (optional 5th)
    ```
 
    `make_charts.py` also accepts `--log-scale`; `run_all.py` deliberately does
-   not forward it.
+   not forward it. `build_pdf.py` is called directly exactly as `--log-scale`
+   is — the two are the same kind of thing: a capability of one stage, invoked
+   on its own or switched on by the orchestrator.
 7. **Answer from `metrics.json` only.** Copy `confidence`, `confidence_reasons`,
    `as_of` and growth numbers verbatim; cite the charts. Read
    `references/INTERPRETATION.md` before writing a sentence about a trend.

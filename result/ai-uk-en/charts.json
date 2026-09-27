@@ -1,0 +1,165 @@
+{
+  "contract_version": "charts.v1",
+  "spec_name": "artificial_intelligence_uk_en",
+  "as_of": "2026-09-26",
+  "language": "uk",
+  "generated_from": "result\\ai-uk-en\\metrics.json",
+  "metrics_sha256": "5e268eaa5a7e9d9354d11c1fe49c2a8346df1d9e1dc9dad078703298fb50dada",
+  "charts": [
+    {
+      "kind": "timeseries",
+      "label": "Українська: Штучний інтелект",
+      "language": "uk",
+      "filename": "chart_uk-shtuchnyi-intelekt_timeseries.png",
+      "yscale": "linear",
+      "log_masked_points": 0,
+      "y_limits": [
+        0.0,
+        1918.3500000000001
+      ],
+      "points": 1096,
+      "gaps": [],
+      "anomalies_drawn": 18,
+      "subtitle": "Українська: Штучний інтелект - сирі дані / медіана 7 днів / аномалія",
+      "x_limits": [
+        "2023-09-27",
+        "2026-09-26"
+      ],
+      "series_id": "uk-shtuchnyi-intelekt",
+      "spec_index": 0
+    },
+    {
+      "kind": "growth",
+      "label": "Українська: Штучний інтелект",
+      "language": "uk",
+      "filename": "chart_uk-shtuchnyi-intelekt_growth.png",
+      "yscale": "linear",
+      "log_masked_points": 0,
+      "y_limits": [
+        -43.23,
+        3.9299999999999997
+      ],
+      "points": 0,
+      "gaps": [],
+      "anomalies_drawn": 0,
+      "subtitle": "Українська: Штучний інтелект - чисте зростання (без аномалій)",
+      "series_id": "uk-shtuchnyi-intelekt",
+      "spec_index": 0,
+      "bars": [
+        {
+          "window": "m3",
+          "label": "3M",
+          "base_avg_daily_views": 342.1,
+          "bar_null": false,
+          "pct": -39.3,
+          "abs": -89
+        },
+        {
+          "window": "y1",
+          "label": "1Y",
+          "base_avg_daily_views": 342.1,
+          "bar_null": false,
+          "pct": -35.4,
+          "abs": -126
+        },
+        {
+          "window": "y2",
+          "label": "2Y",
+          "base_avg_daily_views": 342.1,
+          "bar_null": true,
+          "reason": "insufficient observations in one or both equal-length windows"
+        }
+      ]
+    },
+    {
+      "kind": "timeseries",
+      "label": "Англійська: Artificial intelligence",
+      "language": "en",
+      "filename": "chart_en-artificial-intelligence_timeseries.png",
+      "yscale": "linear",
+      "log_masked_points": 0,
+      "y_limits": [
+        0.0,
+        49422.450000000004
+      ],
+      "points": 1096,
+      "gaps": [],
+      "anomalies_drawn": 42,
+      "subtitle": "Англійська: Artificial intelligence - сирі дані / медіана 7 днів / аномалія",
+      "x_limits": [
+        "2023-09-27",
+        "2026-09-26"
+      ],
+      "series_id": "en-artificial-intelligence",
+      "spec_index": 1
+    },
+    {
+      "kind": "growth",
+      "label": "Англійська: Artificial intelligence",
+      "language": "en",
+      "filename": "chart_en-artificial-intelligence_growth.png",
+      "yscale": "linear",
+      "log_masked_points": 0,
+      "y_limits": [
+        -2.07,
+        22.77
+      ],
+      "points": 0,
+      "gaps": [],
+      "anomalies_drawn": 0,
+      "subtitle": "Англійська: Artificial intelligence - чисте зростання (без аномалій)",
+      "series_id": "en-artificial-intelligence",
+      "spec_index": 1,
+      "bars": [
+        {
+          "window": "m3",
+          "label": "3M",
+          "base_avg_daily_views": 12255.3,
+          "bar_null": false,
+          "pct": 20.7,
+          "abs": 2159
+        },
+        {
+          "window": "y1",
+          "label": "1Y",
+          "base_avg_daily_views": 12255.3,
+          "bar_null": false,
+          "pct": 4.2,
+          "abs": 454
+        },
+        {
+          "window": "y2",
+          "label": "2Y",
+          "base_avg_daily_views": 12255.3,
+          "bar_null": true,
+          "reason": "insufficient observations in one or both equal-length windows"
+        }
+      ]
+    },
+    {
+      "kind": "overlay",
+      "label": "усі теми порівняно",
+      "language": "uk",
+      "filename": "chart_overlay.png",
+      "yscale": "linear",
+      "log_masked_points": 0,
+      "y_limits": [
+        0.0,
+        49422.450000000004
+      ],
+      "points": 2192,
+      "gaps": [],
+      "anomalies_drawn": 60,
+      "subtitle": "усі теми порівняно - сирі дані / аномалія",
+      "x_limits": [
+        "2023-09-27",
+        "2026-09-26"
+      ],
+      "series_ids": [
+        "uk-shtuchnyi-intelekt",
+        "en-artificial-intelligence"
+      ],
+      "note": "comparative view; per-series scales differ"
+    }
+  ]
+}

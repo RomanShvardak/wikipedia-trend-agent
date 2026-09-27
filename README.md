@@ -23,6 +23,7 @@ a model's answer against the run's own `metrics.json` (see
 | analyze | `scripts/analyze_trends.py` | `series.csv` | `metrics.json` |
 | charts | `scripts/make_charts.py` | `series.csv`, `metrics.json` | `charts.json` + PNGs |
 | report | `scripts/build_report.py` | `metrics.json`, `charts.json` | `report.md`, `report.manifest.json` |
+| pdf *(optional, `--pdf`)* | `scripts/build_pdf.py` | `metrics.json`, `charts.json`, `report.manifest.json` | `report.pdf` (A4, the same numbers) |
 
 `scripts/resolve_articles.py` is a **separate, human-confirmed pre-stage** and
 is *not* part of the command below: it discovers candidate articles for a topic
@@ -49,7 +50,7 @@ Before any network call, set a descriptive User-Agent (Wikimedia returns 403
 without one):
 
 ```bash
-export WTI_USER_AGENT="wikipedia-trend-agent/0.1.0 (you@yourdomain.tld) python-urllib"
+export WTI_USER_AGENT="wikipedia-trend-agent/0.2.0 (you@yourdomain.tld) python-urllib"
 ```
 
 ## The one command
@@ -61,6 +62,7 @@ python scripts/run_all.py --spec out/spec.json --out out
 | Exit | Meaning | What to do |
 |---|---|---|
 | 0 | all four stages succeeded | read `out/metrics.json`, `out/report.md`, `out/charts.json` |
+| 0 | all stages succeeded | read `out/metrics.json`, `out/report.md`, `out/charts.json` (and `out/report.pdf` with `--pdf`) |
 | 2 | the spec is invalid | fix the spec against `references/CONTRACTS.md` §1 and re-run; stderr lists every violation at once |
 | 1 | fatal — empty series, no fetchable chunks, an unreadable input, a refused report language, or a missing User-Agent | read stderr, fix the article slug, the window, the `quality` flag or `WTI_USER_AGENT` |
 | 3 | partial — at least one series failed to fetch and at least one succeeded | read the per-series `series_id: message` stderr lines, fix that slug, re-run |
@@ -299,6 +301,15 @@ The four properties:
   failure by design. Fix the prompt, or `references/INTERPRETATION.md`; do
   **not** loosen the check. There is no tolerance band, and adding one is
   exactly what would let a wrong number through.
+
+  Before concluding the model invented something, check the four spellings
+  that are *supposed* to pass and used not to (FINDING-04, fixed 2026-09-27):
+  a decline written `−38.5%` (U+2212) or `−38,5%` (comma decimal), digits
+  inside an article title such as `N8n`, and the numbers quoted from the
+  confidence reasons (`period at least 91 days`). A **bare** `38.5%` for a
+  source value of `-38.5` is still a failure on purpose — a bare `38.5` and a
+  `+38.5` are the same token, so accepting one would let a sign error pass.
+  `references/INTERPRETATION.md` §2.1 is the model-facing version of this list.
 - `low_is_hypothesis` — a wording failure. The BEFORE/AFTER pairs in
   `references/INTERPRETATION.md` exist to prevent exactly this; quote them at
   the model.
@@ -377,18 +388,77 @@ stage that published it (ANAL-06). No tolerance bands on checked numbers. No
 new runtime dependency without an explicit decision — one package is the whole
 point of the dependency budget.
 
+## Project journal (`result/`)
+
+`result/` is **published output, not scratch**. Every run writes into its own
+folder there and everything inside it is committed, because these artifacts are
+the evidence a visitor opens to judge the skill: `report.md`, the PNGs,
+`series.csv`, `metrics.json`, the answer a model gave, and the validator verdict
+on that answer. Three documents describe the work in Ukrainian, for the owner:
+
+| File | What it is |
+|---|---|
+| [`result/result.md`](result/result.md) | **The build journal** — how the idea became a repository: the brief, the decisions, the 9 phases, the defects found and the follow-ups |
+| [`result/desc.md`](result/desc.md) | Full technical teardown, section by section, of every stage and contract |
+| [`result/manual.md`](result/manual.md) | Operator runbook — how to actually run, extend and debug the skill |
+
+**The journal in five lines.** (1) The whole architecture follows from one
+observation: *the model phrases the request well and computes badly* — so all
+arithmetic lives in `scripts/` and the model only cites `metrics.json`.
+(2) The stack is one dependency (`matplotlib`) because the skill runs inside
+someone else's agent runtime, where every extra package is a `ModuleNotFoundError`
+a cheap model cannot diagnose. (3) Built through GSD in 9 phases / 40 plans / 281
+commits, each phase a working end-to-end slice; phases 3, 4 and 6 grew past their
+plan because verification kept finding real defects — including a live-host bug in
+the resolver that the offline suite had *ratified* by freezing the wrong `netloc`.
+(4) The verification rule that mattered: **a gate never shown red is not yet
+written green** — 3 of 10 injected-defect probes found a real defect instead of
+confirming the gate. (5) Status: phases 1–8 done, phase 9 (PDF) at 7 of 8 plans,
+open item is human visual acceptance of the PDF. Read
+[`result/result.md`](result/result.md) for the reasoning, the numbers, and the
+eight proposed follow-ups.
+
+**Run folders.** One folder per request, named for it. `result/ai-uk-en/` is the
+one run committed so far — a 1096-day comparison of "Artificial intelligence"
+in `uk.wikipedia` vs `en.wikipedia`:
+
+| Artifact | What to read it for |
+|---|---|
+| `spec.json`, `resolved.json` | the request as written, and the human-confirmed article selection (each project resolved to one exact saved candidate) |
+| `series.csv` | the raw per-day rows the other artifacts are derived from |
+| `metrics.json` | the single source of truth: growth windows, anomalies, `trend_direction`, `confidence` + reasons. Verdict — `uk` **down** at 342.1 views/day, `en` **flat** at 12,255.3, both `high`; the 2Y window is `null`, not `0` |
+| `report.md`, `report.manifest.json`, `report.pdf` | the one-page report, its SHA-256 digests, and the opt-in PDF |
+| `chart_*.png`, `charts.json` | the rendered charts; `logscale/` holds the same charts from the opt-in `--log-scale` re-run, which `run_all.py` deliberately does not forward |
+| `answer.md` | what a model actually replied given only `metrics.json` + `report.md` + the skill instructions |
+| `eval/regression/` | the validator's verdict on that answer — a `numbers_present` **failure** stub, kept rather than deleted: the answer's own `metrics_sha256` and the offending token, so a real failure can be promoted to a regression fixture |
+
+**Why study this folder.** It is the only place where the skill's claims meet
+evidence from an actual run: the resolver chose real articles, the analyzer
+returned `null` for a window it could not measure, the report printed its own
+confidence reasons, and the answer validator caught a number in the model's
+prose that no metric produced. Read the chain in order — `spec.json` →
+`series.csv` → `metrics.json` → `report.md` → `answer.md` → `eval/` — and the
+number-provenance rule is visible end to end: each stage publishes an artifact
+and the next one quotes it.
+
 ## Status
 
-**v0.1 does:** fetch → analyze → chart → report in one command, with a
+**v0.2.0 does:** fetch → analyze → chart → report in one command, with a
 human-confirmed article-resolution pre-stage, a frozen JSON contract
 (`references/CONTRACTS.md`), a four-property answer validator, and one-command
 clone rehearsal.
 
-**v0.1 deliberately does not:**
+**v0.2.0 adds an opt-in PDF** (`--pdf`). The renderer was chosen by a spike on
+real data: matplotlib `PdfPages`, which adds no dependency, over `pandoc +
+typst` — the spike measured 12 properties of both candidates and found the TZ's
+own recipe broken in four places, including a promise that Cyrillic "can never
+disappear" that was in fact the reverse. The dependency budget did not move:
+`requirements.txt` is still one line, the PDF extras live in
+`requirements-pdf.txt`, and the `typst` binary remains external. What is *not*
+done is human visual acceptance of the output — the one open item in Phase 9.
 
-- **PDF.** The `report.manifest.json` `formats` array is the ready-made slot;
-  a PDF is one appended `{format, filename}` object and one more file, not a
-  rename of the Markdown slot.
+**v0.2.0 deliberately does not:**
+
 - **Cross-series rollups.** The report deliberately publishes no number that
   combines series, because any such number is a second derivation.
 - **Forecasting.** Nothing here projects; the field is a measured past window.

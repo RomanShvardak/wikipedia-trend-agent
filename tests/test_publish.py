@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import build_report
 import clean_clone_check
 import make_charts
+import pytest
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 README = SKILL_DIR / "README.md"
@@ -52,6 +53,13 @@ CHART_INPUTS = (
 
 # The generated paths the .gitignore must exclude. Nothing beyond this list is
 # asserted: an over-strict ignore test is a nuisance, not a gate.
+#
+# `result` LEFT this list with the owner's revised ruling of 2026-09-27: a run folder is
+# the skill's public evidence, so it is published. The run folder still lives under
+# `result/` and nowhere else - that half of the ruling is unchanged, and it is what makes
+# publication reviewable instead of scattering artifacts at the skill root. The
+# never-committed half now belongs to `out/`, which is the `--out` scratch default:
+# `test_result_is_published_not_ignored` holds both ends.
 REQUIRED_IGNORES = frozenset(
     {"out", ".cache", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
 )
@@ -474,3 +482,349 @@ def test_the_rehearsal_full_mode_is_documented_not_run() -> None:
             "a test in test_publish.py passes --full to the rehearsal tool; the install "
             "half is the owner's command and must never run inside the suite"
         )
+
+# ---------------------------------------------------------------------------
+# FINDING-03 (bug.md): the 256-code-point bound on `--reason` was undocumented.
+#
+# A ~500-character justification was refused with
+#   projects[0].selection.reason must be bounded and control-free
+# which names neither the number nor the remedy, and appears in no document. The
+# reader had no way to learn the bound except by failing.
+#
+# A documentation claim with no gate behind it is the 06-01 failure mode, so
+# these assertions make the docs load-bearing.
+# ---------------------------------------------------------------------------
+
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _doc(name: str) -> str:
+    return (SKILL_ROOT / name).read_text(encoding="utf-8")
+
+
+# The two operator documents that live under `result/` rather than the skill root.
+#
+# They were moved there with the rest of the published material, and the owner's revised
+# ruling publishes `result/` - so they are still TRACKED and still gated, just at a
+# different path. Listed as data rather than as a per-test `result/` prefix so that a
+# later move fails here by name, in one place.
+PUBLISHED_DOCUMENTS = {
+    "manual.md": "result/manual.md",
+    "desc.md": "result/desc.md",
+}
+
+
+def _document_path(name: str) -> Path:
+    """Resolve a gated document to its published path.
+
+    `Path(name)` is returned unchanged for the root documents; the two under
+    `result/` are redirected through `PUBLISHED_DOCUMENTS`. Both halves must be
+    TRACKED - that is the point of the gate - and `test_result_is_published_not_ignored`
+    is what holds the `result/` half of the ruling.
+    """
+    return SKILL_ROOT / PUBLISHED_DOCUMENTS.get(name, name)
+
+
+def _tracked_doc(name: str) -> str:
+    """Read a document that MUST be in the repository, or fail loudly.
+
+    Everything reachable through this helper is tracked, so a missing one is a
+    real packaging defect and the test must say so rather than skip. That is the
+    whole point: a documentation gate that silently stops running when its
+    subject disappears is not a gate.
+    """
+    path = _document_path(name)
+    assert path.is_file(), (
+        f"{name} is not in the skill directory (looked for {path.name} at "
+        f"{path.parent.name}/). The tracked operator documents are README.md, "
+        "SKILL.md, result/manual.md, result/desc.md and references/*.md, and "
+        "each one is gated by a test in this module."
+    )
+    return path.read_text(encoding="utf-8")
+
+
+
+TRACKED_OPERATOR_DOCUMENTS = (
+    "README.md",
+    "SKILL.md",
+    "manual.md",
+    "desc.md",
+    "references/CONTRACTS.md",
+    "references/INTERPRETATION.md",
+    "references/API_ACCESS.md",
+    "references/DATA_CAVEATS.md",
+)
+
+
+def test_the_owners_private_test_reports_are_never_committed() -> None:
+    """`bug.md` and `test.md` must not be tracked, and `.gitignore` must say why.
+
+    Both are the owner's private 2026-09-27 simulation-test record. `test.md`
+    line 35 carries a REAL personal email address in a `WTI_USER_AGENT` example,
+    and this repository is PUBLIC. `bug.md` was committed once by mistake in
+    Phase 8 and untracked in the next commit; this test is what stops it being
+    re-added by a well-meaning `git add -A`.
+
+    Asserted on `git ls-files`, not on the filesystem: the point is what a clone
+    would RECEIVE, and a file can sit on disk forever without ever being tracked.
+    The assertion is skipped when git is unavailable, because a packaging test
+    that fails because VCS is missing teaches the reader nothing.
+    """
+    import subprocess
+
+    def tracked(name: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", name],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+        )
+
+    probe = subprocess.run(["git", "ls-files"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("git is not available in this environment")
+
+    published = [name for name in ("bug.md", "test.md") if tracked(name)]
+    assert not published, (
+        f"the owner's private test reports must never be published: {published}. "
+        "Use `git rm --cached <file>` - do NOT delete them from disk, they are "
+        "the source of truth for the Phase 8 verification."
+    )
+
+    # The RULES, not the file text. Phase 8 already learned this the hard way
+    # with `assert "256" in manual`, which passed because the manual documented
+    # 256 code points for an unrelated variable. Here the .gitignore COMMENT
+    # names both files, so a substring search over the whole file is satisfied
+    # by the explanation of the rule rather than by the rule - and deleting the
+    # rules would leave the test green. Comment lines are dropped first.
+    rules = [
+        line.strip()
+        for line in (SKILL_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    for name in ("bug.md", "test.md"):
+        assert name in rules, (
+            f"{name} is untracked but not an ignore RULE, so the next "
+            f"`git add -A` re-adds it. Current rules: {rules}"
+        )
+    # The rule must carry its reason. A bare name in a .gitignore invites the
+    # next reader to "clean it up" as an accident, and the accident is a
+    # published personal email address.
+    ignore_text = (SKILL_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "WTI_USER_AGENT" in ignore_text, (
+        "the .gitignore comment must state WHY these are excluded, so nobody "
+        "removes the rules as cruft"
+    )
+
+
+def test_every_tracked_operator_document_is_present_and_non_empty() -> None:
+    """The set this module gates, asserted as a set.
+
+    Phase 8 added documentation gates for `manual.md` and `API_ACCESS.md` while
+    both `manual.md` and `desc.md` were still UNTRACKED - so the manual's gate
+    could only skip, and a documentation test that silently stops running when
+    its subject is not in the repository is not a gate. Tracking the documents
+    closed that, and this test is what keeps it closed: a deleted or renamed
+    operator document fails here by name, instead of quietly removing the
+    assertions that read it.
+
+    `EXPECTED_CLONE_FILES` above cannot do this job - it is a subset check over
+    the files the clean-clone rehearsal copies, so a document can be absent from
+    the repository and still pass it.
+    """
+    for name in TRACKED_OPERATOR_DOCUMENTS:
+        path = _document_path(name)
+        assert path.is_file(), f"tracked operator document is missing: {name} ({path})"
+        text = path.read_text(encoding="utf-8")
+        assert text.strip(), f"tracked operator document is empty: {name}"
+        assert len(text) > 500, (
+            f"{name} is {len(text)} characters; a truncated paste is not a "
+            "document, and 07-03 already had to defend against exactly that "
+            "for LICENSE"
+        )
+
+
+def test_the_manual_states_the_reason_bound_before_the_reader_hits_it() -> None:
+    """`manual.md` §11 step 4, not just the error message.
+
+    The assertion is scoped to the `--reason` ROW and the step-4 paragraph, not
+    to the file. The manual already documented 256 code points for
+    `WTI_USER_AGENT`, so a bare `assert "256" in manual` was satisfied before
+    this plan wrote a word - a documentation gate that passes on an unrelated
+    sentence is the 06-01 failure mode with extra steps, and the injected-defect
+    probe caught exactly that.
+    """
+    manual = _tracked_doc("manual.md")
+
+    lines = manual.splitlines()
+
+    # The flag-table row, which is what a reader consults BEFORE running.
+    reason_row = [line for line in lines if line.startswith("| `--reason")]
+    assert reason_row, "the --reason flag row is gone from the manual's flag table"
+    assert "256" in reason_row[0], (
+        "the flag table must state the bound, because that table is what a "
+        "reader consults before running the command"
+    )
+
+    # The step-4 paragraph, which explains it. Asserted over a WINDOW of lines
+    # rather than one line: the paragraph is hard-wrapped, so the number sits on
+    # a continuation line and a per-line check would pass only by accident of
+    # the current wrapping.
+    step_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.lstrip().startswith("4.") and "`--reason`" in line
+        ),
+        None,
+    )
+    assert step_index is not None, (
+        "manual.md no longer describes the --reason requirement at step 4"
+    )
+    window = "\n".join(lines[step_index : step_index + 14])
+    assert "256" in window, (
+        "the step-4 paragraph must name the bound within its own text, not "
+        "only in the flag table"
+    )
+    assert "code point" in window, (
+        "the bound is stated without its unit, so a Cyrillic reason is "
+        "misjudged by a reader who assumed bytes - `len()` counts code points"
+    )
+
+
+
+def test_api_access_states_the_bound_as_a_family_rule() -> None:
+    """`--reason` and `--topic-for` share one bound; the doc says so once."""
+    api = _tracked_doc("references/API_ACCESS.md")
+    assert "256" in api
+    assert "code points" in api
+    assert "--reason" in api and "--topic-for" in api, (
+        "the bound is documented for one flag only, so it reads as that flag's "
+        "quirk rather than a rule the resolver enforces everywhere"
+    )
+
+
+def test_data_caveats_records_the_one_select_per_project_limit() -> None:
+    """`test.md` §7's resolver limitation, recorded rather than fixed.
+
+    It is a scope limit, not a defect: `validate_resolved_document` requires a
+    populated `selection` per project and `selections` is keyed by project code.
+    """
+    caveats = _tracked_doc("references/DATA_CAVEATS.md")
+    assert "per project" in caveats
+    assert "--select" in caveats
+    assert "spec.json" in caveats, (
+        "the workaround (two independent confirmed runs) is the part a reader "
+        "actually needs"
+    )
+
+
+def test_the_error_message_names_the_bound_and_the_remedy() -> None:
+    """The number is INTERPOLATED, not typed, so it cannot drift from the rule.
+
+    Asserting on the source rather than on a rendered message is what makes the
+    second half provable: a literal `256` in the message would pass a test that
+    only checked the rendered text, and would then lie the moment
+    `MAX_DISPLAY_CODE_POINTS` changed - which is how the bound came to be
+    undocumented in the first place.
+    """
+    source = (SKILL_ROOT / "scripts" / "resolve_articles.py").read_text(encoding="utf-8")
+    assert "must be bounded and control-free" in source
+    assert "MAX_DISPLAY_CODE_POINTS} code points" in source, (
+        "the bound is typed as a literal rather than interpolated"
+    )
+    # No message may hardcode the number.
+    for line in source.splitlines():
+        if "code points" in line and "MAX_DISPLAY_CODE_POINTS" not in line:
+            assert "256" not in line, f"a bound is hardcoded here: {line.strip()}"
+
+
+def test_the_bound_is_still_enforced_and_never_silently_truncated() -> None:
+    """Documenting the limit must not have relaxed it or truncated the input.
+
+    A truncated justification is a false record of why an article was chosen,
+    so over-long input is still refused rather than shortened.
+    """
+    import resolve_articles as resolver
+
+    assert resolver.MAX_DISPLAY_CODE_POINTS == 256
+    with pytest.raises(resolver.ResolveInputError) as caught:
+        resolver._required_text("x" * 257, "--reason")
+    assert "256" in str(caught.value)
+
+    long_reason = "y" * 400
+    with pytest.raises(resolver.ResolveInputError):
+        resolver._contract_text(long_reason, "projects[0].selection.reason")
+    # Exactly at the bound is still accepted: the limit is inclusive.
+    assert resolver._contract_text("z" * 256, "field") == "z" * 256
+
+
+# --- The owner's workspace ruling of 2026-09-27, and the gate that holds it ----------
+
+
+def test_result_is_published_not_ignored() -> None:
+    """`result/` holds every run's output AND it is published, subfolders included.
+
+    The ruling, in two halves, and the second half is the one that can rot:
+
+      * one folder per request, always under `result/`, never a sibling `out-<name>/` at
+        the skill root. That is why the `out-bizproc-uk-en/`, `out-ai-automation/` and
+        `out-ai-automation-n8n/` siblings were noise: untracked run output is one
+        `git add -A` away from a public repository - which is how `bug.md` got committed
+        in Phase 8 - and it was scattered to review.
+      * the run folders are PUBLISHED. `report.md`, the PNGs, `series.csv`,
+        `metrics.json` and the optional `report.pdf` are the evidence a visitor reads, so
+        the folder that holds them is tracked. `out/` remains ignored because it is the
+        `--out` scratch default of a bare stage invocation.
+
+    Three assertions, and each one catches a distinct silent failure:
+      * there is no `result` rule in `.gitignore` at all - a stale rule from the earlier
+        ruling would unpublish everything here, and `.gitignore` would still LOOK right;
+      * a run folder is actually TRACKED (`git ls-files`, not the working tree) - a
+        `git rm --cached` or a forgotten `git add` leaves the files on disk and the
+        README links to a folder a GitHub visitor cannot open;
+      * a subfolder of a run folder is tracked too, because "published together with its
+        subfolders" is the actual requirement and `report.pdf`/`logscale/` live one level
+        below the run folder. A rule of the form `result/*/` would pass a top-level-only
+        check.
+    """
+    import subprocess
+
+    result_dir = SKILL_DIR / "result"
+    assert result_dir.is_dir(), (
+        f"{result_dir} is gone. The ruling publishes it, so its absence means the folder "
+        f"was deleted rather than moved."
+    )
+
+    rules = {
+        line.strip().rstrip("/")
+        for line in _read(SKILL_DIR / ".gitignore").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert "result" not in rules, (
+        f".gitignore still excludes result/ (its rules are {sorted(rules)}). The owner's "
+        f"revised ruling publishes the run folders - a stale rule here silently keeps "
+        f"every report.md, PNG and series.csv out of the repository."
+    )
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", "wikipedia-trend-agent/result"],
+        capture_output=True, text=True, cwd=str(SKILL_DIR.parents[1]), check=False,
+    )
+    if tracked.returncode != 0:
+        # No git repository above the skill (a shipped copy, a temp tree). The ruling's
+        # ignore-side assertion above already ran; there is nothing further to check.
+        return
+    files = [line for line in tracked.stdout.splitlines() if line.strip()]
+    assert files, (
+        "nothing under `result/` is TRACKED. The files are on disk but not published - a "
+        "clone of this repository would not contain them and every README link into "
+        "`result/` would 404."
+    )
+    assert any("/result/" in line and line.count("/") >= 3 for line in files), (
+        f"only the top level of `result/` is tracked, so the ruling's 'together with its "
+        f"subfolders' half is unmet: {files}. `report.pdf` and `logscale/` sit one level "
+        f"below a run folder."
+    )

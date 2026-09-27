@@ -1,0 +1,361 @@
+{
+  "contract_version": "resolved.v1",
+  "run_mode": "confirm",
+  "status": "confirmed",
+  "topic": "artificial intelligence",
+  "topic_overrides": [
+    {
+      "project": "uk.wikipedia",
+      "query": "штучний інтелект"
+    }
+  ],
+  "generated_at": "2026-09-27T09:16:14.495270+00:00",
+  "volume_window": {
+    "start": "2026-08-28",
+    "end": "2026-09-26",
+    "days": 30,
+    "access": "all-access",
+    "agent": "user",
+    "granularity": "daily"
+  },
+  "projects": [
+    {
+      "project": "uk.wikipedia",
+      "effective_query": "штучний інтелект",
+      "query_source": "project_override",
+      "status": "ambiguous",
+      "recommendation": null,
+      "search_hits": [
+        {
+          "title": "Штучний інтелект",
+          "rank": 1
+        },
+        {
+          "title": "Загальний штучний інтелект",
+          "rank": 2
+        },
+        {
+          "title": "Слабкий штучний інтелект",
+          "rank": 3
+        },
+        {
+          "title": "Музика і штучний інтелект",
+          "rank": 4
+        },
+        {
+          "title": "Штучний інтелект: сучасний підхід",
+          "rank": 5
+        }
+      ],
+      "candidates": [
+        {
+          "status": "selectable",
+          "article": "%D0%A8%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82",
+          "title": "Штучний інтелект",
+          "namespace": 0,
+          "input_titles": [
+            "Штучний інтелект"
+          ],
+          "redirect_chain": [],
+          "search_rank": 1,
+          "exact_title_match": true,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 6185,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": false,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "%D0%97%D0%B0%D0%B3%D0%B0%D0%BB%D1%8C%D0%BD%D0%B8%D0%B9_%D1%88%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82",
+          "title": "Загальний штучний інтелект",
+          "namespace": 0,
+          "input_titles": [
+            "Загальний штучний інтелект"
+          ],
+          "redirect_chain": [],
+          "search_rank": 2,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 898,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": true,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "%D0%A1%D0%BB%D0%B0%D0%B1%D0%BA%D0%B8%D0%B9_%D1%88%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82",
+          "title": "Слабкий штучний інтелект",
+          "namespace": 0,
+          "input_titles": [
+            "Слабкий штучний інтелект"
+          ],
+          "redirect_chain": [],
+          "search_rank": 3,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 48,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 25,
+            "last_observed_date": "2026-09-26",
+            "low_volume": true,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "%D0%9C%D1%83%D0%B7%D0%B8%D0%BA%D0%B0_%D1%96_%D1%88%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82",
+          "title": "Музика і штучний інтелект",
+          "namespace": 0,
+          "input_titles": [
+            "Музика і штучний інтелект"
+          ],
+          "redirect_chain": [],
+          "search_rank": 4,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 184,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": true,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "%D0%A8%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82%3A_%D1%81%D1%83%D1%87%D0%B0%D1%81%D0%BD%D0%B8%D0%B9_%D0%BF%D1%96%D0%B4%D1%85%D1%96%D0%B4",
+          "title": "Штучний інтелект: сучасний підхід",
+          "namespace": 0,
+          "input_titles": [
+            "Штучний інтелект: сучасний підхід"
+          ],
+          "redirect_chain": [],
+          "search_rank": 5,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 32,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 23,
+            "last_observed_date": "2026-09-26",
+            "low_volume": true,
+            "reason": null
+          }
+        }
+      ],
+      "selection": {
+        "article": "%D0%A8%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82",
+        "title": "Штучний інтелект",
+        "reason": "uk: Штучний інтелект is the exact title match and the only candidate above the 1000 views/month floor (6185). en: Artificial intelligence is the exact title match and the highest-volume candidate (488242).",
+        "source": "model_confirmation"
+      },
+      "reason": null,
+      "error": null
+    },
+    {
+      "project": "en.wikipedia",
+      "effective_query": "artificial intelligence",
+      "query_source": "shared",
+      "status": "ambiguous",
+      "recommendation": null,
+      "search_hits": [
+        {
+          "title": "Artificial intelligence",
+          "rank": 1
+        },
+        {
+          "title": "Artificial general intelligence",
+          "rank": 2
+        },
+        {
+          "title": "A.I. Artificial Intelligence",
+          "rank": 3
+        },
+        {
+          "title": "History of artificial intelligence",
+          "rank": 4
+        },
+        {
+          "title": "Existential risk from artificial intelligence",
+          "rank": 5
+        }
+      ],
+      "candidates": [
+        {
+          "status": "selectable",
+          "article": "Artificial_intelligence",
+          "title": "Artificial intelligence",
+          "namespace": 0,
+          "input_titles": [
+            "Artificial intelligence"
+          ],
+          "redirect_chain": [],
+          "search_rank": 1,
+          "exact_title_match": true,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 488242,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": false,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "Artificial_general_intelligence",
+          "title": "Artificial general intelligence",
+          "namespace": 0,
+          "input_titles": [
+            "Artificial general intelligence"
+          ],
+          "redirect_chain": [],
+          "search_rank": 2,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 123856,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": false,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "A.I._Artificial_Intelligence",
+          "title": "A.I. Artificial Intelligence",
+          "namespace": 0,
+          "input_titles": [
+            "A.I. Artificial Intelligence"
+          ],
+          "redirect_chain": [],
+          "search_rank": 3,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 69189,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": false,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "History_of_artificial_intelligence",
+          "title": "History of artificial intelligence",
+          "namespace": 0,
+          "input_titles": [
+            "History of artificial intelligence"
+          ],
+          "redirect_chain": [],
+          "search_rank": 4,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 67410,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": false,
+            "reason": null
+          }
+        },
+        {
+          "status": "selectable",
+          "article": "Existential_risk_from_artificial_intelligence",
+          "title": "Existential risk from artificial intelligence",
+          "namespace": 0,
+          "input_titles": [
+            "Existential risk from artificial intelligence"
+          ],
+          "redirect_chain": [],
+          "search_rank": 5,
+          "exact_title_match": false,
+          "disambiguation": false,
+          "reason": null,
+          "volume": {
+            "status": "available",
+            "total_views": 106834,
+            "window": {
+              "start": "2026-08-28",
+              "end": "2026-09-26"
+            },
+            "observed_days": 30,
+            "last_observed_date": "2026-09-26",
+            "low_volume": false,
+            "reason": null
+          }
+        }
+      ],
+      "selection": {
+        "article": "Artificial_intelligence",
+        "title": "Artificial intelligence",
+        "reason": "uk: Штучний інтелект is the exact title match and the only candidate above the 1000 views/month floor (6185). en: Artificial intelligence is the exact title match and the highest-volume candidate (488242).",
+        "source": "model_confirmation"
+      },
+      "reason": null,
+      "error": null
+    }
+  ]
+}

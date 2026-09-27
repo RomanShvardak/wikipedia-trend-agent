@@ -361,6 +361,101 @@ class ReportError(RuntimeError):
     """A model-readable local input or report failure."""
 
 
+# --- CONTRACTS.md 8.1.1: the formats[] membership rule (Phase 9) ------------------
+#
+# The property worth freezing is not "one element", it is "a CLOSED SET of shapes". Phase
+# 9 ratifies a second legal entry (the PDF rendering), and before this the two tests that
+# care asserted the array held EXACTLY one element -- which the PDF stage's entire purpose
+# turns red. The `==` was replaced rather than deleted, because a bare `==` is trivially
+# satisfiable by deleting the assertion.
+#
+# It lives in PRODUCTION, not in a test, and `build_pdf._append_format` calls it on the
+# value it is about to publish. A contract rule that only a test knows cannot stop the code
+# that writes the document from breaking it.
+#: What the v1 report stage writes today. The report stage's own output is unchanged
+#: by Phase 9: it still writes exactly this, so this constant is still a statement
+#: about the emitter and not only about the contract.
+RATIFIED_V1_FORMATS: list[dict[str, str]] = [
+    {"format": "markdown", "filename": "report.md"},
+]
+
+#: The one appended entry CONTRACTS.md 8.1.1 clause 2 permits. The PDF stage (09-05)
+#: appends this object verbatim; nothing else may be appended.
+RATIFIED_PDF_FORMAT: dict[str, str] = {"format": "pdf", "filename": "report.pdf"}
+
+#: Every `format` value `report.v1` recognises. Clause 3's closed set. Kept as data so a
+#: test can assert the production stage knows no others, not just that these two exist.
+REPORT_V1_FORMATS: frozenset[str] = frozenset({"markdown", "pdf"})
+
+#: Clause 4's shape rule: an entry is an object carrying EXACTLY these two keys, and
+#: `filename` is a bare relative name a consumer joins against the directory it was
+#: given. Unchanged by Phase 9 and still enforced here.
+_ENTRY_KEYS = frozenset({"format", "filename"})
+
+
+def assert_formats_contract(formats: object) -> None:
+    """CONTRACTS.md 8.1.1, all five clauses, for one `formats` value.
+
+    Raises `AssertionError` naming the clause that failed. Clause numbering in the
+    messages is the document's, so a failure points at the text a reader can go read.
+
+    The order is deliberate: clause 4 (per-entry shape and name safety) is checked
+    BEFORE clause 3 (the closed set), because a malformed entry is the more dangerous
+    one and its message should not be masked by a complaint about its position.
+    """
+    # --- clause 1 + the structural precondition: a list, non-empty -------------
+    assert isinstance(formats, list) and formats, (
+        f"8.1.1: formats is an ordered array of objects and must be non-empty, got "
+        f"{formats!r}"
+    )
+    for entry in formats:
+        # --- clause 4: shape and name safety, per entry ------------------------
+        assert isinstance(entry, dict) and set(entry) == _ENTRY_KEYS, (
+            f"8.1.1 clause 4: a formats entry is an object carrying exactly "
+            f"{sorted(_ENTRY_KEYS)}, got {entry!r}"
+        )
+        name = entry["filename"]
+        assert not ("/" in name or "\\" in name or ".." in name or ":" in name), (
+            f"8.1.1 clause 4: formats[].filename must be a bare relative name a "
+            f"consumer resolves against the directory it was given, got {name!r} - "
+            f"the day a second rendering exists, a path-shaped value here is a "
+            f"traversal vector"
+        )
+        kind = entry["format"]
+        assert isinstance(kind, str), (
+            f"8.1.1 clause 4: formats[].format is a string, got {kind!r}"
+        )
+        # --- clause 3: the closed set -----------------------------------------
+        assert kind in REPORT_V1_FORMATS, (
+            f"8.1.1 clause 3: {kind!r} is not a format report.v1 recognises; the "
+            f"recognised set is {sorted(REPORT_V1_FORMATS)} and an unratified format "
+            f"is a contract change, not a convenience"
+        )
+
+    # --- clause 1: the Markdown slot is always first, byte for byte ----------
+    assert formats[0] == RATIFIED_V1_FORMATS[0], (
+        f"8.1.1 clause 1: formats[0] is always "
+        f"{RATIFIED_V1_FORMATS[0]!r} -- the slot report_filename names, which the "
+        f"report stage writes on every run -- got {formats[0]!r}"
+    )
+
+    # --- clause 2: one appended entry, and only the ratified one --------------
+    rest = formats[1:]
+    assert len(rest) <= 1, (
+        f"8.1.1 clause 2: at most one appended entry is permitted, got {len(rest)}: "
+        f"{rest!r}"
+    )
+    for entry in rest:
+        assert entry == RATIFIED_PDF_FORMAT, (
+            f"8.1.1 clause 2: the one permitted appended entry is "
+            f"{RATIFIED_PDF_FORMAT!r}, got {entry!r}"
+        )
+
+    # --- clause 5: the version literal is unchanged by an append --------------
+    # (asserted by the caller against the manifest's own contract_version; stated
+    # here so the five clauses live in one place.)
+
+
 def report_tokens(language: str) -> Mapping[str, str]:
     """D-16: the report's own words for `language`, or a refusal — never English.
 
@@ -648,10 +743,18 @@ def require_display_fields(metrics: Mapping[str, Any]) -> None:
                 _require_str(clean, "reason", f"{where}.growth.{window}.clean")
 
 
-def _growth_phrase(
+def growth_phrase(
     tokens: Mapping[str, str], language: str, window_node: Mapping[str, Any]
 ) -> str:
     """One window's displayed percentage: `clean.pct`, or the refusal with its reason.
+
+    PUBLIC as of Phase 9 (was `_growth_phrase`). It was promoted, not copied: this is
+    the ONE function in the repository that encodes the null-display rule, and the
+    PDF stage renders the same growth windows into a different layout. A second
+    implementation would let a `build_report` wording change tomorrow leave the PDF
+    claiming a contract it no longer meets - which is the drift `report.v1` §8.4
+    exists to prevent. Two consumers, one rule, called once. The rename changes no
+    behaviour and no byte of `report.md`; a test asserts that.
 
     D-03: the CLEAN variant is displayed and the raw `pct` never is, for the same
     reason the growth chart plots only the clean variant — the raw value carries
@@ -661,7 +764,9 @@ def _growth_phrase(
     A null is the localized not-computable token followed by that window's own
     `clean.reason`: never `0`, never `0.0`, never an em-dash, never an empty
     cell. `0` would read as "no growth" (ANAL-06) and an em-dash would read as an
-    absence the report never diagnosed.
+    absence the report never diagnosed. **An empty cell is the worst of the four in
+    a PDF specifically**: in a bordered card a blank reads as "measured, result
+    zero", so the card layout inherits this rule rather than restating it.
     """
     clean = window_node["clean"]
     pct = clean.get("pct")
@@ -723,7 +828,7 @@ def render_report(
     for index, node in enumerate(series_nodes):
         label = md_cell(node["label"])
         for window in analyze_trends.GROWTH_WINDOWS:
-            phrase = _growth_phrase(tokens, language, node["growth"][window])
+            phrase = growth_phrase(tokens, language, node["growth"][window])
             base = format_number(node["avg_daily_views"])
             lines.append(
                 f"- {label} · {make_charts.WINDOW_LABELS[window]} "
@@ -758,7 +863,7 @@ def render_report(
         period = node["period"]
         growth = " / ".join(
             f"{make_charts.WINDOW_LABELS[window]} "
-            f"{_growth_phrase(tokens, language, node['growth'][window])}"
+            f"{growth_phrase(tokens, language, node['growth'][window])}"
             for window in analyze_trends.GROWTH_WINDOWS
         )
         row = [
@@ -818,16 +923,20 @@ def render_report(
     for entry in chart_entries:
         alt = f"{tokens['chart_image_alt']}: {md_cell(entry['label'])}".strip()
         lines.append(f"![{alt}]({entry['filename']})")
-        # The overlay's own disclosure, quoted VERBATIM from the sibling
-        # manifest rather than written out again here. charts.v1 §7.2.4 is the
-        # reason the two strings differ in general: the manifest note is a stable
-        # ASCII interface string, and a second hand-written copy of it is a
-        # second sentence that can drift from the first. Membership, not
-        # truthiness — a note that is present must be a string, and `load_charts`
-        # has already said so.
+        # The overlay's own disclosure. The WORD comes from the localized
+        # `scales_differ` token, NOT from the entry's `note` field, which is the
+        # sibling manifest's stable ASCII interface string (charts.v1 §7.2.4).
+        #
+        # This stage used to quote that field verbatim, which put an English
+        # sentence into a Ukrainian document (FINDING-05) — precisely the
+        # bilingual artefact D-16 exists to prevent, and one no test of the
+        # arithmetic would have caught, because every number was right. The
+        # `note` field is still what decides WHETHER this chart carries a
+        # disclosure at all, and it is still what a machine consumer reads; only
+        # the language of the sentence printed to a reader is localized here.
         if "note" in entry:
             lines.append("")
-            lines.append(str(entry["note"]))
+            lines.append(str(make_charts.chart_tokens(language)["scales_differ"]))
     lines.append("")
 
     # --- 5. Обмеження та припущення: only data that already exists ---

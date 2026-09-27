@@ -18,6 +18,7 @@ Imports `common` and `make_charts` through the conftest.py sys.path shim
 """
 from __future__ import annotations
 
+import ast
 import json
 import math
 from datetime import date
@@ -667,6 +668,21 @@ REPORT_V1_TOP_LEVEL = frozenset(
 )
 
 
+# --- 09-02 / 09-05: the formats[] rule is DEFINED IN PRODUCTION --------------------
+#
+# It began here, in wave 1, because the two tests that needed it were the two that went red
+# when the PDF stage arrived. Wave 4 moved it into `build_report`, and the direction of that
+# move is the point: PRODUCTION owns the contract and its own writer enforces it, and the
+# tests verify the rule rather than supplying it. A rule that lives only in a test can be
+# satisfied while the code that writes the document breaks it - and the writer is the thing
+# that has to obey.
+from build_report import (  # noqa: E402
+    REPORT_V1_FORMATS,
+    RATIFIED_PDF_FORMAT,
+    RATIFIED_V1_FORMATS,
+    assert_formats_contract,
+)
+
 def test_report_v1_contract_section_is_complete() -> None:
     """CONTRACTS.md section 8 exists and states the whole frozen report.v1 surface.
 
@@ -712,6 +728,15 @@ def test_report_v1_contract_section_is_complete() -> None:
         "python scripts/build_report.py",
         "--verbose",
         "No test may reach the network",
+        # 8.1.1, the formats[] membership rule ratified by Phase 9. The markers are
+        # chosen to be phrases that appear ONLY in 8.1.1: a marker already satisfied
+        # elsewhere in the document is not a gate (Phase 8's "a gate satisfied by an
+        # unrelated sentence is not a gate").
+        "8.1.1 The `formats[]` membership rule",
+        "closed set of shapes",
+        "No other `format` value is legal at this version",
+        "Appending an array element is NOT a contract version bump",
+        '{"format": "pdf", "filename": "report.pdf"}',
     ):
         assert marker in text, f"report.v1 contract must document {marker!r}"
 
@@ -806,24 +831,24 @@ def test_report_manifest_emits_only_documented_fields(tmp_out: Path) -> None:
         f"report_filename must be the bare relative name 'report.md', got "
         f"{manifest['report_filename']!r}"
     )
-    formats = manifest["formats"]
-    assert formats == [{"format": "markdown", "filename": "report.md"}], (
-        f"v1 writes exactly one markdown entry, got {formats!r}; a v1.x PDF is one "
-        "appended object, so a renamed or reshaped slot is exactly the drift this "
-        "assertion prevents"
+    # 09-02: the whole formats[] rule, all five clauses, in one call. This USED to be
+    # `== [{"format": "markdown", ...}]`, which the PDF stage's whole purpose turned
+    # red. The property worth freezing was never "exactly one element" -- it is "a
+    # closed set of shapes", and 8.1.1 states which. `assert_formats_contract` is
+    # imported by test_report.py too, so there is one rule and not two.
+    assert_formats_contract(manifest["formats"])
+    # --- the v1 writer's OWN output is unchanged by the ratification -----------
+    assert manifest["formats"] == RATIFIED_V1_FORMATS, (
+        f"Phase 9 appended a second legal shape; it did not change what the report "
+        f"stage writes, which is still {RATIFIED_V1_FORMATS!r}, got "
+        f"{manifest['formats']!r}"
     )
-    for entry in formats:
-        assert isinstance(entry, dict) and set(entry) == {"format", "filename"}, (
-            f"a formats entry is an object carrying both keys, got {entry!r}"
-        )
-        name = entry["filename"]
-        assert not (
-            "/" in name or "\\" in name or ".." in name or ":" in name
-        ), (
-            f"formats[].filename must be a bare relative name a consumer resolves "
-            f"against the directory it was given, got {name!r} - the day a PDF "
-            f"entry appears, a path-shaped value here is a traversal vector"
-        )
+    # --- clause 5, asserted here where the manifest is in hand ---------------
+    assert manifest["contract_version"] == "report.v1", (
+        "8.1.1 clause 5: appending a formats[] element is not a contract version "
+        f"bump, so the literal stays 'report.v1', got "
+        f"{manifest['contract_version']!r}"
+    )
 
     shown = manifest["metrics_shown"]
     assert isinstance(shown, list) and shown, (
@@ -836,4 +861,157 @@ def test_report_manifest_emits_only_documented_fields(tmp_out: Path) -> None:
     assert len(shown) == len(set(shown)), (
         f"metrics_shown carries duplicates, so a consumer's set comparison depends "
         f"on how many sections quoted the same value: {shown!r}"
+    )
+
+
+# --- 09-02 Task 3: the ratified APPEND is accepted, before any PDF code exists ----
+#
+# This test runs in 09-02, BEFORE plan 09-05 writes the stage that appends. That order
+# is the whole point: a rule amended in the same commit as the code that first needs it
+# is a rule that was never proven to accept the new shape. Here the contract accepts the
+# append on its own evidence, and 09-05's code must then obey a standing property rather
+# than dictate a new one to a test rewritten to accept it.
+
+
+def test_the_formats_append_of_a_pdf_rendering_is_legal() -> None:
+    """The second legal array -- Markdown plus an appended PDF entry -- is accepted.
+
+    Positive half. The three probes below are the negative half, and per STATE.md a
+    positive assertion is only meaningful beside a rule shown to refuse.
+
+    The manifest here is a literal, not a produced one, on purpose: the producing code
+    is plan 09-05 and asserting against a hand-written document would prove nothing
+    about the emitter. What it proves is the CONTRACT: that the array 09-05 will write
+    is legal today, under a rule that is already frozen, and that the top-level surface
+    and the version literal are untouched by it (clauses 5, and REPORT_V1_TOP_LEVEL).
+    """
+    appended = [
+        {"format": "markdown", "filename": "report.md"},
+        {"format": "pdf", "filename": "report.pdf"},
+    ]
+    assert_formats_contract(appended)
+
+    # The append is an ARRAY change and nothing else. Clause 5: not a version bump.
+    manifest = {
+        "contract_version": "report.v1",
+        **{key: None for key in REPORT_V1_TOP_LEVEL if key != "contract_version"},
+        "formats": appended,
+    }
+    assert set(manifest) == REPORT_V1_TOP_LEVEL, (
+        f"the append introduced a top-level key: {sorted(set(manifest) - REPORT_V1_TOP_LEVEL)}"
+    )
+    assert manifest["contract_version"] == "report.v1"
+
+    # And the entry is APPENDED, never substituted: dropping the Markdown slot is not
+    # one of the two legal arrays, which is the property clause 1 exists to hold.
+    with pytest.raises(AssertionError, match="clause 1"):
+        assert_formats_contract([RATIFIED_PDF_FORMAT])
+
+
+@pytest.mark.parametrize(
+    ("label", "formats_value", "clause"),
+    [
+        (
+            "a third, unratified rendering",
+            [
+                {"format": "markdown", "filename": "report.md"},
+                {"format": "pdf", "filename": "report.pdf"},
+                {"format": "html", "filename": "report.html"},
+            ],
+            "clause 3",
+        ),
+        (
+            "the Markdown slot renamed",
+            [
+                {"format": "markdown", "filename": "summary.md"},
+                {"format": "pdf", "filename": "report.pdf"},
+            ],
+            "clause 1",
+        ),
+        (
+            "a path-shaped appended filename",
+            [
+                {"format": "markdown", "filename": "report.md"},
+                {"format": "pdf", "filename": "out/report.pdf"},
+            ],
+            "clause 4",
+        ),
+        (
+            "an unratified format in place of the PDF entry",
+            [
+                {"format": "markdown", "filename": "report.md"},
+                {"format": "docx", "filename": "report.docx"},
+            ],
+            "clause 3",
+        ),
+        (
+            "an entry that is a bare string rather than an object",
+            [
+                {"format": "markdown", "filename": "report.md"},
+                "pdf",
+            ],
+            "clause 4",
+        ),
+        (
+            "an entry carrying a third key",
+            [
+                {"format": "markdown", "filename": "report.md"},
+                {"format": "pdf", "filename": "report.pdf", "pages": 3},
+            ],
+            "clause 4",
+        ),
+        (
+            "two appended entries, neither of them ratified",
+            [
+                {"format": "markdown", "filename": "report.md"},
+                {"format": "pdf", "filename": "a.pdf"},
+                {"format": "pdf", "filename": "b.pdf"},
+            ],
+            "clause 2",
+        ),
+    ],
+)
+def test_the_formats_contract_refuses_every_unratified_shape(
+    label: str, formats_value: object, clause: str
+) -> None:
+    """The negative half: seven ways to be wrong, each refused by a NAMED clause.
+
+    A rule stated only as "Markdown first, PDF optionally" passes the first four of
+    these -- which is exactly why 8.1.1 enumerates clauses instead. Each case carries the
+    clause it is meant to trip, so a future weakening of the rule fails HERE with a
+    readable diff rather than silently admitting a shape.
+    """
+    with pytest.raises(AssertionError, match=clause):
+        assert_formats_contract(formats_value)
+
+
+def test_the_report_stage_knows_no_format_beyond_the_ratified_pair() -> None:
+    """The production module's own vocabulary, not a copy of the test's.
+
+    A rule that lives only in a test can be satisfied while production invents a fourth
+    format string nobody ratified. This reads the literals out of the module itself, so
+    the two cannot drift -- the same discipline 05-06 applied to chart text, where a
+    hardcoded English word became a build failure instead of a review habit.
+    """
+    source = Path(build_report.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    declared = {
+        entry["format"]
+        for entry in RATIFIED_V1_FORMATS + [RATIFIED_PDF_FORMAT]
+    }
+    # Every format-looking literal the report stage writes must be ratified. The set
+    # below is the RATIFIED set, so an unratified format fails here by name.
+    unratified = {
+        lit for lit in literals
+        if lit in {"markdown", "pdf", "html", "docx", "csv", "json", "xml", "svg", "png"}
+        and lit not in declared
+    }
+    assert not unratified, (
+        f"the report stage writes unratified format names: {sorted(unratified)}; "
+        f"report.v1 recognises {sorted(REPORT_V1_FORMATS)}"
     )

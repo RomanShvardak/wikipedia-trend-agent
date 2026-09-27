@@ -103,6 +103,37 @@ full scan, rather than silently producing an empty series.
 The cache is the primary defence against re-fetching a window you already have,
 and it is why a repeated or refining question costs no additional requests.
 
+## Bounded display strings: 256 code points
+
+`resolved.json` keeps every externally-supplied or human-readable string
+**bounded at 256 code points and free of C0/C1 control characters** (D-04).
+The bound is a family rule, not one flag's quirk, and it applies to:
+
+| Input | Rule |
+|---|---|
+| `--reason` | at most 256 code points, as one string |
+| `--topic-for PROJECT=QUERY` | at most 256 code points for `PROJECT` + `QUERY` together |
+| any `article` / `title` / `message` in the manifest | the same bound |
+
+Three things worth knowing before you hit the limit:
+
+1. **Code points, not bytes.** `len()` on a Python `str` counts code points. A
+   Ukrainian or Czech justification of 200 characters is ~400 UTF-8 bytes but
+   still 200 code points. A reader who assumes bytes will misjudge a Cyrillic
+   `--reason` by exactly 2×.
+2. **Over-long input is refused, never truncated.** A truncated justification
+   is a false record of why an article was chosen, so the input must be
+   rejected. The error message names the bound and the remedy, so a refusal is
+   self-explanatory:
+   `must be bounded and control-free (at most 256 code points, no C0/C1
+   controls; how to fix: keep --reason under 256 code points)`.
+3. **One sentence per project is the practical limit.** A `--reason` is a record
+   of a human decision, not an essay; the worked example in `manual.md` §11 is
+   183 code points for two projects.
+
+The number is interpolated from `MAX_DISPLAY_CODE_POINTS` into every message,
+so the text can never claim a bound the code does not enforce.
+
 ## The 2026 REST-Gateway limits
 
 The Wikimedia REST Gateway began deploying rate limiting in early 2026. For

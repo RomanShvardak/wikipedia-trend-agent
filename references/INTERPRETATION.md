@@ -107,6 +107,31 @@ findings. "The direction is inconclusive over this window" is a true sentence;
 silently omitting the series, or reporting its raw percentage as a direction,
 is not.
 
+### 2.1 How to write a percentage, so the answer stays checkable
+
+`tools/validate_answer.py` re-reads every number in the answer against
+`metrics.json` (property 1). The following spellings are all accepted, and
+using them costs you nothing:
+
+| You may write | It means |
+|---|---|
+| `-38.5%`, `−38.5%` (U+2212) | the source value `-38.5` |
+| `-38,5%`, `−38,5%` | the same value, comma decimal separator |
+| `+9.1%` | the source value `9.1` |
+| `1 720 628` (space or U+00A0) | the source value `1720628` |
+
+Two rules, both learned the hard way:
+
+1. **A decline is quoted WITH its sign.** Write `−38.5%`, never `38.5%`. A bare
+   `38.5` and a `+38.5` are the same token to the checker, so it cannot tell
+   "fell by 38.5%" from "+38.5%" — and accepting the unsigned one would let a
+   sign error pass. The checker rejects the unsigned form on purpose.
+2. **Quote the confidence reasons and the seasonality note verbatim.** Their
+   numbers (`period at least 91 days`, `fewer than two aligned 365-day halves
+   are available`) are legitimate sources, so quoting them is safe. Numbers you
+   *derived* from two `metrics.json` values are not: a derived ratio is a new
+   number and property 1 will reject it. The remedy is to not compute it.
+
 ---
 
 ## 3. Why `pct: null` is not `0`

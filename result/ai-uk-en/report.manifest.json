@@ -1,0 +1,54 @@
+{
+  "contract_version": "report.v1",
+  "spec_name": "artificial_intelligence_uk_en",
+  "as_of": "2026-09-26",
+  "language": "uk",
+  "generated_from": "result\\ai-uk-en\\metrics.json",
+  "metrics_sha256": "5e268eaa5a7e9d9354d11c1fe49c2a8346df1d9e1dc9dad078703298fb50dada",
+  "charts_sha256": "61727b4883fb50fafebfb027b21e22a16cf53da0753e55ab9728ba62ff1104a2",
+  "report_filename": "report.md",
+  "metrics_shown": [
+    "series[0].growth.m3.clean.pct",
+    "series[0].avg_daily_views",
+    "series[0].growth.y1.clean.pct",
+    "series[0].growth.y2.clean.pct",
+    "series[1].growth.m3.clean.pct",
+    "series[1].avg_daily_views",
+    "series[1].growth.y1.clean.pct",
+    "series[1].growth.y2.clean.pct",
+    "series[0].label",
+    "series[0].project",
+    "series[0].article",
+    "series[0].language",
+    "series[0].period.start",
+    "series[0].period.end",
+    "series[0].period.days",
+    "series[0].total_views",
+    "series[0].trend_direction",
+    "series[0].confidence",
+    "series[0].anomaly_share",
+    "series[1].label",
+    "series[1].project",
+    "series[1].article",
+    "series[1].language",
+    "series[1].period.start",
+    "series[1].period.end",
+    "series[1].period.days",
+    "series[1].total_views",
+    "series[1].trend_direction",
+    "series[1].confidence",
+    "series[1].anomaly_share",
+    "series[0].confidence_reasons",
+    "series[1].confidence_reasons"
+  ],
+  "formats": [
+    {
+      "format": "markdown",
+      "filename": "report.md"
+    },
+    {
+      "format": "pdf",
+      "filename": "report.pdf"
+    }
+  ]
+}

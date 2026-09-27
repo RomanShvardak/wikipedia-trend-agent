@@ -18,7 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, unquote, urlencode
 
 import common
 import fetch_pageviews
@@ -133,7 +133,8 @@ def _required_text(value: object, field: str) -> str:
         for character in value
     ):
         raise ResolveInputError(
-            f"{field} must be at most 256 code points without C0/C1 controls"
+            f"{field} must be at most {MAX_DISPLAY_CODE_POINTS} code points "
+            "without C0/C1 controls"
         )
     return value.strip()
 
@@ -154,7 +155,8 @@ def parse_assignment(value: object, flag_name: str) -> tuple[str, str]:
         for character in project + expression
     ):
         raise ResolveInputError(
-            f"{flag_name} must be bounded and contain no C0/C1 controls"
+            f"{flag_name} must be bounded and contain no C0/C1 controls "
+            f"(at most {MAX_DISPLAY_CODE_POINTS} code points in total)"
         )
     return project, expression
 
@@ -691,7 +693,20 @@ def parse_metadata(
 
 
 def recommend_candidates(candidates: Sequence[Mapping[str, object]]) -> str | None:
-    """Recommend only one selectable target or one direct exact-title target."""
+    """Recommend only when there is nothing to choose between.
+
+    A single `selectable` candidate is a `ready` project and carries a
+    recommendation. TWO OR MORE is `ambiguous`, and `ambiguous` requires
+    `recommendation is None` in `validate_resolved_document` - so a hint here
+    would make the manifest discovery just published impossible to confirm.
+
+    An earlier version also recommended when exactly one of several candidates
+    was an `exact_title_match`. That is the whole multi-candidate space, and it
+    deadlocked the confirmation step with no escape (FINDING-02). The candidate
+    flag itself is untouched and still reaches the reader: it is evidence about
+    which candidate matched the query, which is exactly what a person needs in
+    order to choose. What is removed is using it to pre-empt the choice.
+    """
     selectable = [
         candidate
         for candidate in candidates
@@ -699,11 +714,6 @@ def recommend_candidates(candidates: Sequence[Mapping[str, object]]) -> str | No
     ]
     if len(selectable) == 1:
         return cast(str, selectable[0]["article"])
-    exact = [
-        candidate for candidate in selectable if candidate.get("exact_title_match") is True
-    ]
-    if len(exact) == 1:
-        return cast(str, exact[0]["article"])
     return None
 
 
@@ -755,7 +765,16 @@ def validate_volume_payload(
         item = cast(dict[str, object], raw_item)
         for field, expected in expected_identity.items():
             actual = item.get(field)
-            if not isinstance(actual, str) or actual != expected:
+            # AQS answers with the percent-DECODED title, so `article` is
+            # compared against the decoded form of the slug we asked for. The
+            # break is the UNRESERVED set, not non-ASCII: `Strix_%28security%29`
+            # comes back as `Strix_(security)` and used to fail identically to
+            # every Cyrillic title. The stored slug stays ENCODED -- it is the
+            # AQS cache key and `fetch_pageviews.series_url` interpolates it
+            # unquoted -- so only the comparison changes, never the contract.
+            # Every other identity field keeps exact comparison.
+            comparable = unquote(expected) if field == "article" else expected
+            if not isinstance(actual, str) or actual != comparable:
                 raise ResolveVolumeError(f"AQS item {index} has an invalid {field}")
 
         timestamp = item.get("timestamp")
@@ -1194,7 +1213,19 @@ def _contract_text(value: object, field: str, *, allow_none: bool = False) -> st
         0 <= ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
         for character in value
     ):
-        raise _contract_error(f"{field} must be bounded and control-free")
+        # The bound is INTERPOLATED, never typed as a literal, because a literal
+        # is how it went undocumented in the first place: three messages spelled
+        # `256` while the rule was `MAX_DISPLAY_CODE_POINTS`, so changing the
+        # constant would have left all three lying. The number and the remedy are
+        # both in the message, because a reader who meets this has just had
+        # their confirmation refused and cannot see the constant (FINDING-03).
+        # The unit is CODE POINTS: `len()` on a `str` counts them, and a reader
+        # who assumed bytes would misjudge a Cyrillic justification by 2x.
+        raise _contract_error(
+            f"{field} must be bounded and control-free "
+            f"(at most {MAX_DISPLAY_CODE_POINTS} code points, no C0/C1 controls; "
+            f"how to fix: keep --reason under {MAX_DISPLAY_CODE_POINTS} code points)"
+        )
     return value
 
 

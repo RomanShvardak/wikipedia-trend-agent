@@ -1,0 +1,10 @@
+# OPT-IN. The base install stays exactly one package (`requirements.txt`), so the
+# skill's install contract needs no resolution step. Install this only when you ask
+# `run_all.py` for `--pdf`; `build_pdf.py` refuses with this exact command when a
+# dependency is missing. The `typst` binary is external and is NOT pip-installable.
+#
+#   pip install -r requirements-pdf.txt
+#
+# Mirrors the `pdf` extra in pyproject.toml; `pypdf` is dev-only and stays out.
+pypandoc-binary
+PyYAML

@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 import analyze_trends
+import build_pdf
 import build_report
 import common
 import fetch_pageviews
@@ -428,6 +429,15 @@ def test_the_orchestrator_adds_no_third_party_import() -> None:
     matplotlib arrives transitively when `make_charts` is imported and nothing
     in the orchestrator needs it directly, so the shipped dependency budget is
     unchanged: `requirements.txt` stays the single line `matplotlib>=3.11`.
+
+    `build_pdf` joined this whitelist in Phase 9 and the claim is UNCHANGED, which is the
+    point of the closed list: it enumerates the orchestrator's first-party SIBLINGS, not its
+    dependencies. The PDF stage's optional `pypandoc` is imported lazily inside
+    `build_pdf.render_pdf` precisely so that importing the orchestrator costs nothing — a
+    module-level import would make the whole skill require the optional toolchain, which is
+    the one thing Phase 9 promised it would not do.
+    `test_build_pdf.test_the_renderer_imports_pypandoc_lazily_and_never_asks_for_a_root`
+    holds the laziness.
     """
     import ast
 
@@ -441,6 +451,12 @@ def test_the_orchestrator_adds_no_third_party_import() -> None:
     assert "matplotlib" not in imported
     assert "numpy" not in imported
     assert "pandas" not in imported
+    # The PDF toolchain specifically. An orchestrator that imported `pypandoc` would make
+    # the WHOLE skill require the optional toolchain, which is the promise this phase makes.
+    assert "pypandoc" not in imported, (
+        "the orchestrator must not import pypandoc; the PDF stage imports it lazily so that "
+        "`--pdf` stays opt-in and the base install stays one package"
+    )
     assert imported <= {
         "__future__",
         "argparse",
@@ -451,6 +467,7 @@ def test_the_orchestrator_adds_no_third_party_import() -> None:
         "typing",
         "common",
         "analyze_trends",
+        "build_pdf",
         "build_report",
         "fetch_pageviews",
         "make_charts",
@@ -462,14 +479,25 @@ def test_the_orchestrator_adds_no_third_party_import() -> None:
     ]
 
 
-def test_the_orchestrator_cli_offers_exactly_three_flags(tmp_path: Path, capsys) -> None:
-    """`--spec`, `--out` and `--verbose` only, and nothing else.
+def test_the_three_shared_flags_plus_one_stage_switch_are_accepted(
+    tmp_path: Path, capsys
+) -> None:
+    """The three flags every stage shares, plus `--pdf`, and nothing else.
 
-    A `--stages` subset switch would let a caller publish a `report.md` from a
-    `charts.json` it did not render; `--ttl-hours` and `--log-scale` already
-    belong to the stage CLIs that own them. The refusal half is what makes the
-    positive half meaningful: an unknown flag must be rejected by argparse, not
-    quietly absorbed.
+    RENAMED in Phase 9 from `test_the_orchestrator_cli_offers_exactly_three_flags`, and the
+    rename is the point rather than a cosmetic edit. The old test argued that a fourth flag
+    "would be a contract the stages do not own" — and the reasoning HELD, so the argument
+    was kept and the count changed. `--pdf` switches on a whole STAGE; `--ttl-hours` and
+    `--log-scale` configure one stage and stay off this parser; a `--stages` subset switch
+    would still let a caller publish a `report.md` from a `charts.json` it did not render, and
+    is still refused below.
+
+    A test whose NAME states a rule the code deliberately breaks teaches the next reader to
+    delete the rule, so the name moved with the behaviour and
+    `test_the_orchestrator_no_longer_claims_exactly_three_flags` holds it there.
+
+    The refusal half is what makes the positive half meaningful: an unknown flag must be
+    rejected by argparse, not quietly absorbed.
     """
     accepted = tmp_path / "accepted.json"
     accepted.write_text("{}", encoding="utf-8")
@@ -757,3 +785,236 @@ def test_the_fetch_stage_sends_each_asset_slug_unmodified(
                 "the slug was double-encoded on its way into the request URL: "
                 f"{url}"
             )
+
+
+# ============================ wave 5: the orchestrator's opt-in PDF stage (T13-T17)
+
+
+# --- Phase 9: the opt-in PDF stage's integration tests need the optional toolchain -----
+#
+# They SKIP with a reason naming both install commands rather than failing, and they skip
+# ONLY the ones that genuinely cannot run. The offline half of the orchestrator contract --
+# no `--pdf` changes nothing, a failing report stops the run, a failing PDF fails the
+# pipeline -- is asserted with NO toolchain at all, so the default suite still proves the
+# feature is opt-in on a machine that never installed it.
+def _pdf_toolchain_available() -> bool:
+    import shutil
+
+    try:
+        import pypandoc  # noqa: F401
+    except ImportError:
+        return False
+    return shutil.which("typst") is not None
+
+
+needs_toolchain = pytest.mark.skipif(
+    not _pdf_toolchain_available(),
+    reason="optional PDF toolchain absent: pip install -r requirements-pdf.txt, then "
+           "winget install Typst.Typst",
+)
+
+
+def _offline_fetch(argv: list[str], **_ignored: object) -> int:
+    """A `fetch_pageviews.main` stand-in that publishes the committed fixture series.
+
+    Every orchestrator test below is about ROUTING and about what the flag does to the
+    output directory, not about HTTP. Scripting the transport for that would be a lot of
+    machinery to prove a stage order, and the real fetch already runs end to end in
+    `test_the_shipped_asset_runs_end_to_end_with_no_network`. This writes the one file the
+    downstream stages read, so analyze, charts, report and pdf all run for real.
+
+    It takes the stage's own `argv` list, exactly as `run_all` invokes every stage, and reads
+    `--out` out of it — so the stand-in cannot drift from the calling convention it replaces.
+    """
+    out_dir = Path(argv[argv.index("--out") + 1])
+    (out_dir / "series.csv").write_bytes(
+        (FIXTURES_DIR / "series.example.csv").read_bytes()
+    )
+    return 0
+
+
+@pytest.fixture
+def offline_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the fetch stage with `_offline_fetch` for the rest of the test."""
+    monkeypatch.setattr(fetch_pageviews, "main", _offline_fetch)
+
+
+def _pipeline_argv(out_dir: Path, *extra: str) -> list[str]:
+    return [
+        "--spec", str(FIXTURES_DIR / "spec.example.json"), "--out", str(out_dir), *extra,
+    ]
+
+
+def test_the_stage_list_is_unchanged_and_the_optional_one_is_separate() -> None:
+    """T14. `STAGES` is still exactly the four core stages.
+
+    The whole reason `OPTIONAL_STAGES` is a separate registry. An implementation that
+    appended `("pdf", "build_pdf")` to `STAGES` would satisfy every behavioural test and
+    break the frozen contract this asserts — the pipeline's order is not a bag features are
+    poured into.
+    """
+    assert [name for name, _ in run_all.STAGES] == ["fetch", "analyze", "charts", "report"]
+    assert [name for name, _, _ in run_all.OPTIONAL_STAGES] == ["pdf"]
+    assert [flag for _, _, flag in run_all.OPTIONAL_STAGES] == ["--pdf"]
+    assert "build_pdf" not in {module for _, module in run_all.STAGES}
+    assert [module for _, module, _ in run_all.OPTIONAL_STAGES] == ["build_pdf"]
+
+
+def test_the_orchestrator_parser_offers_the_three_shared_flags_plus_pdf() -> None:
+    """T13, the parser half. Four flags, and the fourth is the stage switch.
+
+    The three shared ones exist for every stage; `--pdf` is consumed by the loop and never
+    forwarded, which is the same ownership split that keeps `--ttl-hours` and `--log-scale`
+    off this parser entirely.
+    """
+    defined = {
+        action.option_strings[0]
+        for action in run_all._parser()._actions
+        if action.option_strings and action.option_strings[0] != "-h"
+    }
+    assert defined == {"--spec", "--out", "--verbose", "--pdf"}, (
+        f"the orchestrator's flag set drifted: {sorted(defined)}"
+    )
+
+
+def test_without_the_pdf_flag_the_output_directory_is_byte_identical(
+    tmp_out: Path, capsys, offline_pipeline: None
+) -> None:
+    """T13, the load-bearing half, proven with sha256 over EVERY file.
+
+    The claim is not "the PDF stage is not called" — it is "a run without `--pdf` publishes
+    exactly what it published before this phase, byte for byte". That is the promise that
+    makes the feature safe to ship, and hashing the directory is the only way to check it: a
+    new file, a rewritten manifest, a reordered array, anything.
+
+    Two full pipelines run into the SAME directory sequentially, because `generated_from`
+    records the `metrics.json` path and two directories would differ in exactly the field
+    being compared.
+    """
+    import hashlib
+
+    assert run_all.main(_pipeline_argv(tmp_out)) == 0
+    capsys.readouterr()
+
+    def snapshot() -> dict[str, str]:
+        return {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(tmp_out.iterdir()) if p.is_file()
+        }
+
+    before = snapshot()
+    assert before, "the baseline run published nothing to compare against"
+    assert build_pdf.PDF_FILENAME not in before, "the precondition: no PDF yet"
+    assert "report.manifest.json" in before
+
+    assert run_all.main(_pipeline_argv(tmp_out)) == 0
+    stdout = capsys.readouterr().out
+    after = snapshot()
+    assert set(after) == set(before), (
+        f"a run without --pdf changed which files exist: "
+        f"added {sorted(set(after) - set(before))}, "
+        f"removed {sorted(set(before) - set(after))}"
+    )
+    changed = sorted(k for k in before if before[k] != after[k])
+    assert not changed, f"a run without --pdf rewrote {changed}"
+    assert "Wrote PDF" not in stdout, f"the default path must not publish a PDF: {stdout!r}"
+
+
+@needs_toolchain
+def test_the_pdf_flag_runs_the_pdf_stage_last_and_publishes(
+    tmp_out: Path, capsys, offline_pipeline: None
+) -> None:
+    """T15. `--pdf` publishes a PDF, and the manifest records it.
+
+    The real analyze, charts, report and pdf stages all run; only the fetch is stood in for.
+    """
+    assert run_all.main(_pipeline_argv(tmp_out)) == 0
+    manifest_path = tmp_out / build_report.REPORT_MANIFEST_FILENAME
+    before = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert before["formats"] == build_report.RATIFIED_V1_FORMATS, "precondition"
+
+    assert run_all.main(_pipeline_argv(tmp_out, "--pdf")) == 0
+    stdout = capsys.readouterr().out
+    assert "Wrote PDF" in stdout, f"the pipeline must report the PDF it published: {stdout!r}"
+    assert (tmp_out / build_pdf.PDF_FILENAME).read_bytes()[:5] == b"%PDF-"
+
+    after = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert after["formats"] == [
+        *build_report.RATIFIED_V1_FORMATS, build_report.RATIFIED_PDF_FORMAT,
+    ]
+    assert after["contract_version"] == "report.v1"
+    assert set(after) == set(before), "no top-level key may appear or vanish"
+    assert build_report.report_is_stale(tmp_out) is False
+
+
+def test_a_failing_report_stage_means_the_pdf_stage_never_runs(
+    tmp_out: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T16. First non-zero stops the run, for the optional stage too.
+
+    `build_pdf` is last precisely because it reads `report.manifest.json`. A pipeline that
+    carried on to render a PDF after the report stage failed would publish a document whose
+    manifest was never written — a file no consumer could resolve.
+    """
+    import build_pdf as build_pdf_module
+
+    calls: list[str] = []
+
+    def recorder(name: str, code: int):
+        def run(argv: list[str], **_ignored: object) -> int:
+            calls.append(name)
+            return code
+        return run
+
+    monkeypatch.setattr(fetch_pageviews, "main", recorder("fetch", 0))
+    monkeypatch.setattr(analyze_trends, "main", recorder("analyze", 0))
+    monkeypatch.setattr(make_charts, "main", recorder("charts", 0))
+    monkeypatch.setattr(build_report, "main", recorder("report", 3))
+    monkeypatch.setattr(build_pdf_module, "main", recorder("pdf", 0))
+
+    code = run_all.main(_pipeline_argv(tmp_out, "--pdf"))
+    assert code == 3, f"the report stage's exit code must pass through unchanged, got {code}"
+    assert calls == ["fetch", "analyze", "charts", "report"], (
+        f"the pdf stage ran after a failing report stage: {calls}"
+    )
+
+
+@needs_toolchain
+def test_a_failing_pdf_stage_fails_the_pipeline_with_a_named_message(
+    tmp_out: Path, capsys, monkeypatch: pytest.MonkeyPatch, offline_pipeline: None
+) -> None:
+    """T17. A PDF failure is a REAL failure, not a warning.
+
+    The tempting design — warn, exit 0, because `report.md` is already written — would make
+    `--pdf` a flag whose failure is invisible, and a caller who asked for a document would
+    be told the pipeline succeeded while holding none. That is the one outcome this test
+    exists to prevent.
+    """
+    import build_pdf as build_pdf_module
+
+    assert run_all.main(_pipeline_argv(tmp_out)) == 0
+    monkeypatch.setattr(build_pdf_module, "main", lambda argv, **_: 1)
+    code = run_all.main(_pipeline_argv(tmp_out, "--pdf"))
+    assert code == 1
+    assert "run_all: stage pdf failed: exit 1" in capsys.readouterr().err
+
+
+def test_the_orchestrator_no_longer_claims_exactly_three_flags() -> None:
+    """The stale name is gone, and stays gone.
+
+    `test_the_orchestrator_cli_offers_exactly_three_flags` argued that a fourth flag "would
+    be a contract the stages do not own". Phase 9 added one on purpose and the reasoning
+    held, so the test was RENAMED rather than deleted or left to rot. A test whose name
+    states a rule the code deliberately breaks teaches the next reader to delete the rule, so
+    this asserts the rename is in place.
+    """
+    import inspect
+
+    import test_run_all
+
+    names = {n for n, _ in inspect.getmembers(test_run_all, inspect.isfunction)}
+    assert "test_the_orchestrator_cli_offers_exactly_three_flags" not in names, (
+        "the 'exactly three flags' test must be renamed: run_all defines four now, and the "
+        "old name states a rule the code deliberately breaks"
+    )
+    assert "test_the_three_shared_flags_plus_one_stage_switch_are_accepted" in names

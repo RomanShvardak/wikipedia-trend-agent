@@ -1022,6 +1022,213 @@ def test_volume_valid_payload_sums_identity_bound_observations():
     }
 
 
+# ---------------------------------------------------------------------------
+# FINDING-01 (bug.md): AQS returns the percent-DECODED `article`.
+#
+# The identity check compared `item["article"]` against the percent-ENCODED
+# slug the manifest carries, so every title containing a character outside the
+# unreserved set (all Cyrillic, and equally `Strix_(security)`) was rejected
+# with `aqs_error` and the whole project died. This blocks the skill's headline
+# scenario -- comparing interest across language editions.
+#
+# The boundary is "outside the unreserved set", NOT "non-ASCII": the
+# `strix_security_parentheses` case below is pure Latin. That case is the one
+# most likely to be deleted as redundant, so it is named for the boundary it
+# proves rather than for the script it uses.
+# ---------------------------------------------------------------------------
+
+# (project, percent-ENCODED slug as the manifest stores it, what AQS actually
+#  returns, total views) -- all three rows are from bug.md's live-probe table.
+DECODED_ARTICLE_CASES = [
+    (
+        "uk.wikipedia",
+        "%D0%90%D0%B2%D1%82%D0%BE%D0%BC%D0%B0%D1%82%D0%B8%D0%B7%D0%B0%D1%86%D1%96%D1%8F",
+        "Автоматизація",
+        1234,
+    ),
+    (
+        "cs.wikipedia",
+        "P%C5%99eru%C5%A1ovan%C3%BD_p%C5%AFst",
+        "Přerušovaný_půst",
+        5678,
+    ),
+    (
+        "en.wikipedia",
+        "Strix_%28security%29",
+        "Strix_(security)",
+        91011,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("project", "encoded", "decoded", "total"),
+    DECODED_ARTICLE_CASES,
+    ids=["cyrillic", "czech", "latin_parentheses"],
+)
+def test_volume_accepts_the_percent_decoded_article_aqs_actually_returns(
+    project: str, encoded: str, decoded: str, total: int
+):
+    """A real AQS response whose `article` is decoded must validate."""
+    assert hasattr(resolve_articles, "parse_volume_response")
+    response = _volume_response(
+        {
+            "items": [
+                _volume_item(
+                    project=project, article=decoded, views=total
+                )
+            ]
+        }
+    )
+
+    result = resolve_articles.parse_volume_response(
+        response,
+        expected_project=project,
+        expected_article=encoded,
+        start=VOLUME_START,
+        end=VOLUME_END,
+    )
+
+    assert result["status"] == "available", (
+        "A percent-decoded article is the only form AQS ever returns; rejecting "
+        "it kills the project"
+    )
+    assert result["total_views"] == total
+
+
+@pytest.mark.parametrize(
+    ("project", "encoded", "decoded", "total"),
+    DECODED_ARTICLE_CASES,
+    ids=["cyrillic", "czech", "latin_parentheses"],
+)
+def test_volume_still_rejects_a_different_article(project, encoded, decoded, total):
+    """FINDING-01 fixed a FALSE REJECTION; it must not become a false acceptance.
+
+    Without this the three positive cases would also pass under a substring
+    match, a casefold, or a check that dropped the `article` field entirely.
+    """
+    assert hasattr(resolve_articles, "parse_volume_response")
+    response = _volume_response(
+        {
+            "items": [
+                _volume_item(project=project, article="Some_other_article", views=total)
+            ]
+        }
+    )
+
+    with pytest.raises(resolve_articles.ResolveVolumeError) as caught:
+        resolve_articles.parse_volume_response(
+            response,
+            expected_project=project,
+            expected_article=encoded,
+            start=VOLUME_START,
+            end=VOLUME_END,
+        )
+
+    assert "article" in str(caught.value), (
+        "the failure must name the offending field, because that string is "
+        "what an operator reads in bug.md's symptom"
+    )
+
+
+@pytest.mark.parametrize(
+    "article", ["AI_agent", "Automatisation", "Barack_Obama"]
+)
+def test_volume_still_accepts_an_unreserved_only_article(article: str):
+    """The ASCII path must be untouched by the decoded-form comparison."""
+    assert hasattr(resolve_articles, "parse_volume_response")
+    response = _volume_response(
+        {"items": [_volume_item(article=article, views=42)]}
+    )
+
+    result = resolve_articles.parse_volume_response(
+        response,
+        expected_project="en.wikipedia",
+        expected_article=article,
+        start=VOLUME_START,
+        end=VOLUME_END,
+    )
+
+    assert result["total_views"] == 42
+
+
+def test_volume_rejects_a_mismatched_non_article_identity_field():
+    """Only the `article` field gained a decoded-form alternative.
+
+    `access`, `agent`, `granularity` and `project` keep exact comparison --
+    unquoting them would let a wrong access class or agent through.
+    """
+    assert hasattr(resolve_articles, "parse_volume_response")
+    for field, value in (
+        ("access", "desktop"),
+        ("agent", "spider"),
+        ("granularity", "hourly"),
+        ("project", "cs.wikipedia"),
+    ):
+        response = _volume_response(
+            {"items": [{**_volume_item(), field: value}]}
+        )
+        with pytest.raises(resolve_articles.ResolveVolumeError) as caught:
+            resolve_articles.parse_volume_response(
+                response,
+                expected_project="en.wikipedia",
+                expected_article="Intermittent_fasting",
+                start=VOLUME_START,
+                end=VOLUME_END,
+            )
+        assert field in str(caught.value)
+
+
+def test_the_committed_non_ascii_aqs_capture_really_is_decoded(resolve_fixture):
+    """Bind the real uk.wikipedia capture to the production parser.
+
+    The 04-07/04-08 decision: a real capture is committed as evidence bound to
+    the production parser by its own test, because a fixture no test reads is
+    decoration. This asserts the ONE fact the whole defect turns on - a real
+    AQS response carries the DECODED title - and then that the production
+    parser accepts it when handed the ENCODED slug the manifest would store.
+
+    It also pins the blind spot that let FINDING-01 ship: 25 fixtures existed
+    and not one had a non-ASCII `article`. This file is the answer to that.
+    """
+    assert hasattr(resolve_articles, "parse_volume_response")
+    body = _response_body(
+        resolve_fixture, "resolve.pageviews.30d.uk.wikipedia.json"
+    )
+    payload = json.loads(body.decode("utf-8"))
+    observed_articles = {item["article"] for item in payload["items"]}
+
+    assert observed_articles == {"Автоматизація"}, (
+        "the capture must carry a DECODED non-ASCII title - that is the API "
+        "fact FINDING-01 contradicted, and it is what makes the fixture a "
+        "witness rather than a duplicate of the ASCII ones"
+    )
+
+    # The ENCODED slug is whatever the PRODUCTION encoder emits, not a literal
+    # pasted from bug.md. Handing the parser a hand-written slug would let the
+    # two halves of the resolver drift apart unnoticed - which is the class of
+    # defect 04-08 already fixed once, for the Action API host.
+    encoded = resolve_articles.canonical_article("Автоматизація")
+    assert "%" in encoded and " " not in encoded
+
+    result = resolve_articles.parse_volume_response(
+        _volume_response(payload),
+        expected_project="uk.wikipedia",
+        expected_article=encoded,
+        start=VOLUME_START,
+        end=VOLUME_END,
+    )
+
+    assert result["status"] == "available"
+    assert result["total_views"] == 142
+    assert result["low_volume"] is True, (
+        "142 views in 30 days is under the 1000/month floor; the fixture "
+        "proves the identity check, not the volume, and the low verdict must "
+        "not be 'fixed' to make it look like a better example"
+    )
+
+
+
 def test_volume_404_is_unavailable_not_numeric_zero(resolve_fixture):
     assert hasattr(resolve_articles, "parse_volume_response")
     response = _volume_response(
@@ -1267,19 +1474,33 @@ def test_assignment_and_conservative_recommendation_contract():
         "pl.wikipedia",
         "Post przerywany",
     )
+    # FINDING-02. A multi-candidate project carries NO recommendation even when
+    # exactly one candidate is an exact title match, because
+    # `validate_resolved_document` requires `ambiguous => recommendation is
+    # None`. This assertion used to read `== "Exact"`; it encoded the defect.
+    # It is rewritten, not deleted - the blind spot was a test asserting the
+    # wrong contract, and deleting it would restore that blind spot.
     assert resolve_articles.recommend_candidates(
         [
             {"status": "selectable", "article": "Lower", "exact_title_match": False},
             {"status": "selectable", "article": "Exact", "exact_title_match": True},
             {"status": "selectable", "article": "Higher", "exact_title_match": False},
         ]
-    ) == "Exact"
+    ) is None
     assert resolve_articles.recommend_candidates(
         [
             {"status": "selectable", "article": "One", "exact_title_match": False},
             {"status": "selectable", "article": "Two", "exact_title_match": False},
         ]
     ) is None
+    # The single-candidate `ready` path is the one case that keeps a hint.
+    assert resolve_articles.recommend_candidates(
+        [
+            {"status": "selectable", "article": "Only", "exact_title_match": False},
+            {"status": "unresolved", "article": "Other", "exact_title_match": False},
+        ]
+    ) == "Only"
+
 
 
 def test_preflight_aggregates_over_fanout_and_bad_assignments_before_side_effects(
@@ -2074,9 +2295,15 @@ def test_live_batched_evidence_yields_five_ordered_namespace_0_candidates(
 ):
     """Real `srlimit=5` behavior: five distinct ns=0 pages come back.
 
-    The recommendation is still unambiguous, but only through the second clause
-    of the policy -- exactly one candidate is a direct exact-title match for the
-    effective query, while the other four are merely selectable.
+    Five selectables is `ambiguous`, and `ambiguous` carries NO recommendation
+    (FINDING-02). This test used to assert the opposite and to defend it in its
+    docstring -- "the recommendation is still unambiguous ... only through the
+    second clause". That clause is gone: emitting a recommendation for a
+    multi-candidate project made the manifest unconfirmable, with no escape.
+
+    The candidate-level `exact_title_match` flag is untouched and is asserted
+    below, because it is the evidence a reader needs in order to choose. What
+    changed is that it no longer pre-empts the choice.
     """
     search = json.loads(
         _response_body(resolve_fixture, "resolve.search.batched.en.wikipedia.json")
@@ -2098,10 +2325,13 @@ def test_live_batched_evidence_yields_five_ordered_namespace_0_candidates(
     assert all(c["status"] == "selectable" for c in candidates)
     exact = [c for c in candidates if c["exact_title_match"] is True]
     assert [c["title"] for c in exact] == ["Intermittent fasting"]
-    # Five selectables is not a single recommendation; only the exact-title
-    # clause resolves it. With two exact matches the policy must decline.
-    assert resolve_articles.recommend_candidates(candidates) == "Intermittent_fasting"
+    # The reader still gets the exact-match evidence...
+    assert exact[0]["article"] == "Intermittent_fasting"
+    # ...but the project does not pre-empt their choice, so the manifest is
+    # confirmable.
+    assert resolve_articles.recommend_candidates(candidates) is None
     assert resolve_articles.recommend_candidates([*candidates, dict(candidates[0])]) is None
+
 
 
 def test_live_30d_pageviews_evidence_validates_and_sums_exactly(resolve_fixture):
@@ -2132,3 +2362,182 @@ def test_live_30d_pageviews_evidence_validates_and_sums_exactly(resolve_fixture)
         f"{(start + timedelta(days=offset)):%Y%m%d}" for offset in range(30)
     }
     assert all(i["views"] > 0 for i in items)
+
+
+# ---------------------------------------------------------------------------
+# FINDING-02 (bug.md): discovery published a manifest its own validator rejects.
+#
+# `recommend_candidates` returned an article whenever exactly one of several
+# selectable candidates was an exact title match, but
+# `validate_resolved_document` requires `ambiguous => recommendation is None`.
+# Those two statements cover the ENTIRE multi-candidate space, so such a
+# project was permanently unconfirmable - and there was no escape:
+#   * confirming a subset fails on `topic_overrides` ordering
+#   * re-running discovery with a different --topic-for is a different request
+# Both verified live on 2026-09-27; all three projects of a three-language
+# comparison deadlocked, including en.wikipedia/AI_agent.
+#
+# The tests below drive the ROUND TRIP, not `recommend_candidates` alone. The
+# defect was a disagreement BETWEEN the emitter and the validator, so a test
+# of either in isolation passes both before and after the fix.
+# ---------------------------------------------------------------------------
+
+
+def _candidate(article: str, *, selectable: bool = True, exact: bool = False, rank: int = 1):
+    candidate = {
+        "status": "selectable" if selectable else "unresolved",
+        # An unresolved candidate has no canonical article - the contract
+        # requires null there, which is also why `recommend_candidates` can
+        # never recommend one.
+        "article": article if selectable else None,
+        "title": article.replace("_", " "),
+        "namespace": 0 if selectable else 14,
+        "input_titles": [article],
+        "redirect_chain": [],
+        "search_rank": rank,
+        "exact_title_match": exact,
+        "disambiguation": False,
+        "reason": None if selectable else "non_article_namespace",
+    }
+    # An unresolved candidate carries no volume: nothing was probed for it.
+    if selectable:
+        candidate["volume"] = {
+            "status": "available",
+            "total_views": 5000,
+            "window": {"start": "2026-08-26", "end": "2026-09-24"},
+            "observed_days": 30,
+            "last_observed_date": "2026-09-24",
+            "low_volume": False,
+            "reason": None,
+        }
+    return candidate
+
+
+def _discovery_shaped_document(candidates) -> dict[str, object]:
+    """The exact `resolved.v1` discovery document discovery would publish."""
+    selectable = [c for c in candidates if c["status"] == "selectable"]
+    recommendation = resolve_articles.recommend_candidates(candidates)
+    status = "ready" if len(selectable) == 1 else "ambiguous"
+    return {
+        "contract_version": "resolved.v1",
+        "run_mode": "discover",
+        "status": "awaiting_confirmation",
+        "topic": "AI automation",
+        "topic_overrides": [{"project": "en.wikipedia", "query": "AI agent"}],
+        "generated_at": "2026-09-27T00:00:00Z",
+        "volume_window": {
+            "start": "2026-08-26",
+            "end": "2026-09-24",
+            "days": 30,
+            "access": "all-access",
+            "agent": "user",
+            "granularity": "daily",
+        },
+        "projects": [
+            {
+                "project": "en.wikipedia",
+                "effective_query": "AI agent",
+                "query_source": "project_override",
+                "status": status,
+                "recommendation": recommendation,
+                "search_hits": [
+                    {"title": candidate["title"], "rank": rank}
+                    for rank, candidate in enumerate(candidates, start=1)
+                ],
+                "candidates": candidates,
+                "selection": None,
+                "reason": None,
+                "error": None,
+            }
+        ],
+    }
+
+
+def _validate_as_discovery_manifest(document: dict[str, object]) -> None:
+    """Feed a discovery-shaped document through the validator that refused it."""
+    resolve_articles.validate_resolved_document(
+        document,
+        expected_topic="AI automation",
+        expected_projects=["en.wikipedia"],
+        expected_overrides=[{"project": "en.wikipedia", "query": "AI agent"}],
+        mode="discover",
+    )
+
+
+
+def test_a_multi_candidate_project_with_one_exact_match_is_still_confirmable():
+    """The exact combination no test covered, and the one bug.md names.
+
+    5 selectable candidates, exactly one with `exact_title_match is True`.
+    Before the fix discovery published `recommendation: <article>` under
+    `status: "ambiguous"`, and confirmation refused the saved manifest.
+    """
+    candidates = [
+        _candidate("AI_agent", exact=True),
+        _candidate("OpenAI"),
+        _candidate("Automation_Anywhere"),
+        _candidate("Human-centered_AI"),
+        _candidate("AI-driven_design_automation"),
+    ]
+
+    document = _discovery_shaped_document(candidates)
+    project = document["projects"][0]
+    assert project["status"] == "ambiguous"
+    assert project["recommendation"] is None, (
+        "an ambiguous project must carry no recommendation, or the saved "
+        "manifest cannot be confirmed"
+    )
+
+    _validate_as_discovery_manifest(document)
+
+
+@pytest.mark.parametrize("selectable_count", [1, 2, 5])
+@pytest.mark.parametrize("exact_count", [0, 1, 2])
+def test_every_candidate_count_and_exact_count_pair_publishes_a_valid_manifest(
+    selectable_count: int, exact_count: int
+):
+    """The totality claim: whatever discovery recommends, the validator accepts.
+
+    Crossed over selectable count and exact-match count because those are the
+    only two inputs `recommend_candidates` reads. `exact_count` is clamped to
+    `selectable_count`, since a non-selectable candidate cannot be an exact
+    match that anyone would recommend.
+    """
+    assert hasattr(resolve_articles, "recommend_candidates")
+    effective_exact = min(exact_count, selectable_count)
+    # The search ceiling is 5, so the sweep caps total candidates at 5 and only
+    # adds the unresolved one when there is room.
+    candidates = [
+        _candidate(f"Article_{index}", exact=index < effective_exact, rank=index + 1)
+        for index in range(selectable_count)
+    ]
+    if len(candidates) < resolve_articles.MAX_SEARCH_RESULTS:
+        candidates.append(
+            _candidate(
+                "Unresolved_one",
+                selectable=False,
+                exact=False,
+                rank=len(candidates) + 1,
+            )
+        )
+
+    document = _discovery_shaped_document(candidates)
+    project = document["projects"][0]
+    if selectable_count == 1:
+        assert project["status"] == "ready"
+        assert project["recommendation"] == "Article_0"
+    else:
+        assert project["status"] == "ambiguous"
+        assert project["recommendation"] is None
+
+    _validate_as_discovery_manifest(document)
+
+
+def test_no_selectable_candidate_at_all_never_recommends():
+    """The degenerate end of the sweep: nothing selectable means nothing to say."""
+    assert resolve_articles.recommend_candidates(
+        [
+            _candidate("Gone_one", selectable=False),
+            _candidate("Gone_two", selectable=False),
+        ]
+    ) is None

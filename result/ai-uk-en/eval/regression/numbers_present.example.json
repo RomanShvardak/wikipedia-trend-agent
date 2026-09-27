@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "property": "numbers_present",
+  "metrics_sha256": "5e268eaa5a7e9d9354d11c1fe49c2a8346df1d9e1dc9dad078703298fb50dada",
+  "answer_sha256": "be2eed71715cdee12106504be69ab8428889613fb9ad3d65c1cee02ea9f5ce14",
+  "answer_filename": "answer.md",
+  "detail": "token '1' at line 14 offset 29 matches no metrics.json value; nearest source values: 0.03832116788321168, 0.016423357664233577, 4.2; line reads: За чистим річним вікном (`y1`) зростання **−35.4%** на базі 342.1",
+  "offending_token": "1",
+  "created_from_metrics": "result\\ai-uk-en\\metrics.json",
+  "answer_excerpt": "За чистим річним вікном (`y1`) зростання **−35.4%** на базі 342.1"
+}

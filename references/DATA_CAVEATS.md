@@ -9,6 +9,35 @@ field tables** — `references/CONTRACTS.md` owns the frozen shapes, and
 `trend_direction` and `pct`. What follows is only the judgement those two
 cannot make for you.
 
+One resolver scope limit is recorded at the end as well. It is not a data
+caveat — it never reaches `metrics.json` — but a reader who trips over it
+should find it here rather than infer it from a refusal.
+
+---
+
+## 0. One `--select` per project code
+
+The resolver confirms **exactly one article per project code per run**, and
+this is by design: `validate_resolved_document` requires a populated
+`selection` in every project, and `selections` is keyed by project code.
+
+How it shows up: comparing `AI agent` (35564 views/month) with `N8n`
+(11307 views/month) — **both on `en.wikipedia`** — is not possible in one run.
+The second `--select` for the same project is not additive, and a
+`--topic-for` naming only one of them is a different discovery request, so it
+does not merge either.
+
+What to do instead: two independent confirmed runs, each with its own
+`spec.json` and its own `metrics.json`. This is what the 2026-09-27
+simulation test did, and it is honest rather than a workaround: the two runs
+measure two articles, and two runs make the reader see that.
+
+What **not** to conclude: a refusal here is not a sign that the articles are
+unrelated, and it is not a bug to route around by confirming one of them
+without discovery. A cross-project comparison (`uk` vs `en`, `pl` vs `cs`) is
+unaffected — that is one article per project code, which is exactly what the
+resolver accepts.
+
 ---
 
 ## 1. The 2015-05-01 methodology break

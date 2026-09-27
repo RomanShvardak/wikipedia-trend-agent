@@ -25,6 +25,7 @@ import re
 from collections.abc import Mapping, Sequence
 from fractions import Fraction
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -33,7 +34,7 @@ import analyze_trends
 import build_report
 import common
 import make_charts
-from test_contracts import _iter_values
+from test_contracts import _iter_values, assert_formats_contract
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -292,37 +293,76 @@ def _source_numbers(documents: Sequence[Mapping[str, Any]]) -> set[float]:
     return values
 
 
-def _markdown_numeric_tokens(markdown: str) -> list[str]:
-    """Every numeral in `markdown` that is a MEASUREMENT rather than a name.
+#: A pandoc ATTRIBUTE span: `{width=100%}`, `{height=3cm}`. Phase 9 added this third
+#: exemption when the PDF body began carrying image-sizing directives, whose `100` is a
+#: layout instruction and not a figure anyone measured. The rule is "inside braces", not
+#: "followed by a percent sign", so it cannot exempt a real percentage that happens to sit
+#: near an attribute - and a measurement never lives inside `{...}`, because a brace in
+#: this document only ever opens an attribute.
+_ATTRIBUTE_SPAN = re.compile(r"\{[^{}\n]*\}")
 
-    Two constructs in the rendered document look numeric and are not:
+
+def _attribute_spans(text: str) -> list[tuple[int, int]]:
+    return [(match.start(), match.end()) for match in _ATTRIBUTE_SPAN.finditer(text)]
+
+
+def _is_measurement(text: str, match: re.Match[str], skip: Sequence[tuple[int, int]]) -> str:
+    """The token `match` stands for, or `""` when it is not a measurement.
+
+    THE single predicate. Three constructs in a rendered document look numeric and are
+    not, and each has a reason:
 
     - a **percent-escape** inside a percent-encoded article slug
-      (`P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD`). `5`, `99`, `1` and `3` are character
-      codes, not measurements, and they are not in any source document as
-      numbers. A run immediately preceded by `%` is skipped.
-    - a **window label** (`3M`, `1Y`, `2Y`). `1`, `2` and `3` name a window, and
-      the report deliberately never states them as `metrics.v1` window lengths.
-      A run immediately followed by a letter or underscore is skipped.
+      (`P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD`). `5`, `99`, `1` and `3` are character codes,
+      not measurements. A run immediately preceded by `%` is skipped.
+    - a **window label** (`3M`, `1Y`, `2Y`). `1`, `2` and `3` name a window, and the report
+      deliberately never states them as `metrics.v1` window lengths. A run immediately
+      followed by a letter or underscore is skipped.
+    - a **pandoc attribute** (`{width=100%}`), added by Phase 9 for the PDF body's image
+      directives. A run inside `{...}` is a layout instruction.
 
     A trailing `%` is a percentage and is KEPT - the value is the measurement.
+
+    `skip` carries the caller's extra exemptions (the PDF stage's decoded article titles).
+    It is a parameter rather than a second code path so that the pre-Phase-9 callers and
+    the PDF caller cannot drift apart: the Phase 8 lesson is that two tokenisers which
+    must agree are one tokeniser called once, and that lesson was learned when
+    `check_numbers` stripped separators on one side and tokenised differently on the other,
+    so the two disagreed about `38,5`.
     """
-    tokens: list[str] = []
-    for match in DIGIT_RUN.finditer(markdown):
-        start, end = match.span()
-        before = markdown[start - 1] if start > 0 else ""
-        after = markdown[end] if end < len(markdown) else ""
-        if before == "%" or (before.isalnum() and before.isascii() and not before.isdigit()):
-            continue
-        if after == "%":
-            after = ""
-        if after.isascii() and (after.isalpha() or after == "_"):
-            continue
-        tokens.append(match.group())
-    return tokens
+    start, end = match.span()
+    if any(start < skip_end and skip_start < end for skip_start, skip_end in skip):
+        return ""
+    before = text[start - 1] if start > 0 else ""
+    after = text[end] if end < len(text) else ""
+    if before == "%" or (before.isalnum() and before.isascii() and not before.isdigit()):
+        return ""
+    if after == "%":
+        after = ""
+    if after.isascii() and (after.isalpha() or after == "_"):
+        return ""
+    return match.group()
 
 
-def assert_no_invented_numbers(markdown: str, sources: Mapping[str, Any]) -> None:
+def _markdown_numeric_tokens(markdown: str) -> list[str]:
+    """Every numeral in `markdown` that is a MEASUREMENT rather than a directive or a name.
+
+    A thin list comprehension over `_is_measurement`, so this and
+    `assert_no_invented_numbers` cannot disagree about what a number is.
+    """
+    spans = _attribute_spans(markdown)
+    return [
+        token
+        for match in DIGIT_RUN.finditer(markdown)
+        if (token := _is_measurement(markdown, match, spans))
+    ]
+
+
+def assert_no_invented_numbers(
+    markdown: str,
+    sources: Mapping[str, Any],
+    name_spans: Sequence[tuple[int, int]] = (),
+) -> None:
     """No numeral in `markdown` may lack a source in `sources`.
 
     Callable from outside pytest with plain arguments - that is the point, and
@@ -335,9 +375,24 @@ def assert_no_invented_numbers(markdown: str, sources: Mapping[str, Any]) -> Non
     side, so the check cannot be made to pass by loosening the documents. A token
     that cannot be coerced is itself a FAILURE and is named in the message: a
     number the report cannot even parse is a number nothing vouches for.
+
+    `name_spans` (Phase 9) exempts character ranges that are NAMES rather than
+    measurements, and it exists for one caller: the PDF stage displays the article
+    title PERCENT-DECODED, so a title like `Бізнес-процес-2024` puts a `2024` in
+    the body that is a character of a name and not a figure anyone measured. A
+    letter-neighbour regex would be the wrong instrument - it is a heuristic, and
+    Phase 8's lesson is that heuristics here are how both English leaks and false
+    gates get in. The caller instead passes spans derived FROM THE SOURCE DOCUMENT
+    (the decoded title of each series, located in the body), so the exemption is the
+    document's own text and cannot cover a number the author invented elsewhere.
+    Defaulting to empty keeps every pre-Phase-9 call site byte-identical.
     """
     available = _source_numbers(list(sources.values()))
-    for raw in _markdown_numeric_tokens(markdown):
+    skip = _span_mask(markdown, _attribute_spans(markdown) + list(name_spans))
+    for match in DIGIT_RUN.finditer(markdown):
+        raw = _is_measurement(markdown, match, skip)
+        if not raw:
+            continue
         # `..` is the range separator the period cell renders between two dates
         # (`2024-09-23..2026-09-20`), so a maximal run can straddle it. Split on
         # it rather than letting one range swallow both of its endpoints.
@@ -357,6 +412,24 @@ def assert_no_invented_numbers(markdown: str, sources: Mapping[str, Any]) -> Non
                     f"the rendered report carries {piece!r} ({value!r}), which appears "
                     f"in no value of any source document: an invented number"
                 )
+
+
+def _span_mask(text: str, spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """`spans`, normalised to non-overlapping, in-range ranges of `text`.
+
+    Out-of-range and inverted spans are CLAMPED, not trusted: a caller that computed an
+    offset wrong must not get a silently larger exemption than it asked for, and a
+    negative-index slice in Python would otherwise wrap to the end of the document and
+    exempt the wrong region entirely.
+    """
+    masked: list[tuple[int, int]] = []
+    for start, end in spans:
+        low, high = max(0, min(start, end)), min(len(text), max(start, end))
+        if low < high:
+            masked.append((low, high))
+    return masked
+
+
 
 # The ten ratified report.v1 keys, restated here so the tracer is readable on
 # its own. `test_contracts.REPORT_V1_TOP_LEVEL` is the binding copy, and 06-03
@@ -590,7 +663,12 @@ def test_tracer_publishes_every_section_and_the_frozen_manifest(tmp_out: Path) -
     )
     assert manifest["contract_version"] == "report.v1"
     assert manifest["report_filename"] == "report.md"
-    assert manifest["formats"] == [{"format": "markdown", "filename": "report.md"}]
+    # 09-02: the formats[] rule is DEFINED once in test_contracts and imported here,
+    # because a second hand-written copy of a contract rule is a second rule that can
+    # drift. This USED to be a local `== [{"format": "markdown", ...}]`, which the PDF
+    # stage's whole purpose turns red; the property was never "exactly one element" but
+    # "a closed set of shapes" (CONTRACTS.md 8.1.1).
+    assert_formats_contract(manifest["formats"])
     assert manifest["language"] == language
     assert manifest["spec_name"] == charts["spec_name"]
     assert manifest["as_of"] == charts["as_of"]
@@ -618,7 +696,16 @@ def test_tracer_publishes_every_section_and_the_frozen_manifest(tmp_out: Path) -
     # The never-recompute rule, observable in the output: a null window is never
     # a zero and never an em-dash, and the raw pct never reaches the page.
     assert "0.0%" not in text, "a null clean.pct must not render as 0.0%"
-    assert make_charts.OVERLAY_NOTE in text, "the overlay note is quoted verbatim"
+    # FINDING-05. This used to read `assert OVERLAY_NOTE in text` — which
+    # passes exactly when the defect is present, because the manifest's ASCII
+    # interface note was being quoted verbatim into the document. The disclosure
+    # is still printed (the `note` field still decides that a chart carries
+    # one), but in the reader's language. `test_the_overlay_disclosure_is_localized_not_the_manifest_ascii_note`
+    # states the same property with the negative assertion spelled out.
+    assert make_charts.OVERLAY_NOTE not in text, (
+        "the manifest's ASCII interface note must not reach the document"
+    )
+    assert "scales_differ" not in text, "the token KEY is not reader-facing text"
 
     # Anomaly share is a bounded [0, 1] quantity, not a signed growth rate. It
     # once rendered through the percent seam and came out as "+0.0", whose sign
@@ -3001,4 +3088,109 @@ def test_manifest_write_failure_keeps_the_prior_manifest_and_is_detectable_as_st
         "describing input it no longer describes"
     )
 
+
+
+
+# ---------------------------------------------------------------------------
+# FINDING-05 (bug.md): a Ukrainian report carried one English sentence.
+#
+# `charts.v1` publishes the overlay disclosure as `OVERLAY_NOTE`, a stable
+# ASCII interface string. The report stage quoted it VERBATIM into the
+# document, so a `language: "uk"` report shipped an English line under its
+# charts section. The report's own D-16 rule says a language with no table is
+# refused rather than served English, and the test that pinned the verbatim
+# quote was asserting the defect.
+#
+# Fixed by printing the localized `scales_differ` token instead. The manifest
+# keeps its ASCII note; `charts.v1` gains no key and no version bump.
+# ---------------------------------------------------------------------------
+
+
+def _render_for_language(tmp_out: Path, language: str) -> str:
+    """Render the real report in `language` and return the document text.
+
+    The spec's own `language` is rewritten rather than a second fixture
+    committed, because the point under test is the report's WORD TABLE, not
+    the shape of a spec file.
+    """
+    _render_charts(tmp_out)
+    spec = json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))
+    spec["language"] = language
+    spec_path = tmp_out / f"spec.{language}.json"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    assert _run_report(tmp_out, spec_path) == 0
+    return tmp_out.joinpath("report.md").read_text(encoding="utf-8")
+
+
+def test_the_overlay_disclosure_is_localized_not_the_manifest_ascii_note(
+    tmp_out: Path,
+) -> None:
+    """A Ukrainian report must not contain the manifest's ASCII note.
+
+    The negative assertion IS the property. The long-standing
+    `assert OVERLAY_NOTE in text` elsewhere in this file passes exactly when
+    this defect is present, so the two assertions are mutually exclusive by
+    construction - which is why that one was rewritten rather than kept.
+    """
+    report = _render_for_language(tmp_out, "uk")
+    assert make_charts.OVERLAY_NOTE not in report, (
+        "the manifest's ASCII interface string reached a Ukrainian document; a "
+        "reader gets a bilingual artefact no arithmetic test would catch"
+    )
+    tokens = make_charts.chart_tokens("uk")
+    assert tokens["scales_differ"] in report, (
+        "the localized disclosure must be printed in its place"
+    )
+    assert tokens["scales_differ"] != make_charts.OVERLAY_NOTE
+
+
+def test_the_localized_disclosure_is_present_for_every_supported_language(
+    tmp_out: Path,
+) -> None:
+    """Every supported language prints its own `scales_differ` token.
+
+    The negative assertion is scoped to the languages whose token DIFFERS from
+    the manifest's ASCII note. For `en` the two strings are the same English
+    sentence, so forbidding the note there would forbid the correct output.
+    """
+    for language in ("en", "uk"):
+        report = _render_for_language(tmp_out, language)
+        token = make_charts.chart_tokens(language)["scales_differ"]
+        assert token in report, language
+        if token != make_charts.OVERLAY_NOTE:
+            assert make_charts.OVERLAY_NOTE not in report, language
+
+
+def test_the_disclosure_fails_closed_when_the_language_has_no_translation(
+    tmp_out: Path, monkeypatch
+) -> None:
+    """A missing translation must be a refusal, never an English fallback.
+
+    This is the half that matters most: an English fallback here would
+    reintroduce exactly the defect being fixed, and it would do so silently on
+    a language nobody had tested.
+
+    The charts are rendered BEFORE the table is broken, so the refusal under
+    test is the report stage's own. (Breaking it earlier would make the chart
+    stage refuse first, which is also fail-closed but tests a different layer.)
+    """
+    _render_charts(tmp_out)
+    spec = json.loads((FIXTURES_DIR / "spec.example.json").read_text(encoding="utf-8"))
+    spec["language"] = "uk"
+    spec_path = tmp_out / "spec.uk.json"
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+    broken = {key: dict(value) for key, value in make_charts.CHART_TOKENS.items()}
+    del broken["uk"]["scales_differ"]
+    monkeypatch.setattr(build_report.make_charts, "CHART_TOKENS", broken)
+
+    with pytest.raises((build_report.ReportError, make_charts.ChartError)) as caught:
+        build_report.render_report(
+            spec=spec,
+            metrics=json.loads((FIXTURES_DIR / "metrics.example.json").read_text(encoding="utf-8")),
+            charts=json.loads((tmp_out / "charts.json").read_text(encoding="utf-8")),
+        )
+    assert "chart tokens" in str(caught.value), (
+        f"the refusal must name what is missing, got: {caught.value}"
+    )
 

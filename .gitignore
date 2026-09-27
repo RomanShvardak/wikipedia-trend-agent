@@ -5,3 +5,42 @@ out/
 .venv/
 .mypy_cache/
 .pytest_cache/
+
+# `result/` is PUBLISHED, not ignored (owner's ruling, 2026-09-27, revised).
+#
+# One subfolder per request under `result/`, never a sibling `out-<name>/` at the skill
+# root - that rule is unchanged, and it is what makes `result/` safe to publish: a run's
+# artifacts are all in one reviewable place instead of scattered at the skill root.
+#
+# Why it is now tracked: the run folders ARE the public evidence of what the skill
+# produces - `report.md`, the PNGs, `series.csv`, `metrics.json`, the optional
+# `report.pdf`. A visitor reads them in place. Two subfolders currently live here and
+# both are publishable as-is: `ai-uk-en/` (a real run) and the run-independent docs
+# `desc.md`, `manual.md`, `result.md` (the description, the user manual, the results
+# write-up - all referenced by README.md).
+#
+# `out/` stays ignored: it is the scratch default of the `--out` flag for a bare
+# `scripts/build_report.py` invocation, so whatever sits there is a throwaway rerun, not
+# a curated artifact.
+#
+# The gate moved with the ruling:
+# `tests/test_publish.py::test_result_is_published_not_ignored` asserts there is NO
+# `result` rule here, and that a run folder is actually TRACKED - because a stale rule
+# left over from the earlier ruling would silently unpublish all of it.
+
+# The owner's private simulation-test record, kept on disk and never published.
+#
+# bug.md and test.md are the 2026-09-27 free-model test report and the five
+# defects it found. They are the source of truth Phase 8 worked from and are
+# cited by .planning/, but they are an internal working record rather than part
+# of the skill:
+#   * test.md line 35 carries a REAL personal email address in a
+#     WTI_USER_AGENT example, and this repository is public;
+#   * both files name a real person and a real model identifier for the run.
+# The five findings themselves are not secret - they are all fixed, all fixed in
+# code, and all covered by committed regressions - so the repository loses
+# nothing by excluding the two reports. `git rm --cached` was used, not a
+# delete: both files remain on disk and remain the reference for the Phase 8
+# verification.
+bug.md
+test.md

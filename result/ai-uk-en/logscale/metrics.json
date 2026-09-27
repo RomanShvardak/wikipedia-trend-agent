@@ -1,0 +1,431 @@
+{
+  "spec_name": "artificial_intelligence_uk_en",
+  "as_of": "2026-09-26",
+  "generated_from": "result/ai-uk-en/spec.json",
+  "series": [
+    {
+      "series_id": "uk-shtuchnyi-intelekt",
+      "project": "uk.wikipedia",
+      "article": "%D0%A8%D1%82%D1%83%D1%87%D0%BD%D0%B8%D0%B9_%D1%96%D0%BD%D1%82%D0%B5%D0%BB%D0%B5%D0%BA%D1%82",
+      "label": "Українська: Штучний інтелект",
+      "language": "uk",
+      "total_views": 374909,
+      "avg_daily_views": 342.1,
+      "period": {
+        "start": "2023-09-27",
+        "end": "2026-09-26",
+        "days": 1096
+      },
+      "growth": {
+        "m3": {
+          "pct": -38.8,
+          "abs": -87,
+          "start": "2026-06-28",
+          "end": "2026-09-26",
+          "clean": {
+            "pct": -39.3,
+            "abs": -89
+          }
+        },
+        "y1": {
+          "pct": -35.2,
+          "abs": -125,
+          "start": "2025-09-27",
+          "end": "2026-09-26",
+          "clean": {
+            "pct": -35.4,
+            "abs": -126
+          }
+        },
+        "y2": {
+          "pct": null,
+          "abs": null,
+          "start": "2024-09-27",
+          "end": "2026-09-26",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
+        }
+      },
+      "anomaly_share": 0.016423357664233577,
+      "trend_direction": "down",
+      "confidence": "high",
+      "confidence_reasons": [
+        "period at least 730 days",
+        "monthly 30-day views at least 10000",
+        "anomaly share within 5 percent"
+      ],
+      "seasonality": {
+        "months": [],
+        "note": "no recurring peak months identified"
+      },
+      "anomalies": [
+        {
+          "date": "2023-10-25",
+          "value": 1827,
+          "median": 634
+        },
+        {
+          "date": "2023-11-18",
+          "value": 465,
+          "median": 711
+        },
+        {
+          "date": "2023-12-16",
+          "value": 388,
+          "median": 685
+        },
+        {
+          "date": "2024-01-20",
+          "value": 418,
+          "median": 612
+        },
+        {
+          "date": "2024-04-12",
+          "value": 346,
+          "median": 474
+        },
+        {
+          "date": "2024-04-13",
+          "value": 283,
+          "median": 474
+        },
+        {
+          "date": "2024-04-14",
+          "value": 307,
+          "median": 495
+        },
+        {
+          "date": "2024-07-25",
+          "value": 178,
+          "median": 137
+        },
+        {
+          "date": "2024-08-05",
+          "value": 177,
+          "median": 159
+        },
+        {
+          "date": "2024-11-09",
+          "value": 359,
+          "median": 642
+        },
+        {
+          "date": "2025-03-02",
+          "value": 299,
+          "median": 373
+        },
+        {
+          "date": "2025-08-06",
+          "value": 214,
+          "median": 176
+        },
+        {
+          "date": "2025-09-13",
+          "value": 178,
+          "median": 356
+        },
+        {
+          "date": "2025-09-20",
+          "value": 187,
+          "median": 324
+        },
+        {
+          "date": "2026-03-14",
+          "value": 178,
+          "median": 310
+        },
+        {
+          "date": "2026-04-04",
+          "value": 127,
+          "median": 223
+        },
+        {
+          "date": "2026-07-08",
+          "value": 131,
+          "median": 99
+        },
+        {
+          "date": "2026-07-15",
+          "value": 91,
+          "median": 84
+        }
+      ]
+    },
+    {
+      "series_id": "en-artificial-intelligence",
+      "project": "en.wikipedia",
+      "article": "Artificial_intelligence",
+      "label": "Англійська: Artificial intelligence",
+      "language": "en",
+      "total_views": 13431833,
+      "avg_daily_views": 12255.3,
+      "period": {
+        "start": "2023-09-27",
+        "end": "2026-09-26",
+        "days": 1096
+      },
+      "growth": {
+        "m3": {
+          "pct": 20.0,
+          "abs": 2092,
+          "start": "2026-06-28",
+          "end": "2026-09-26",
+          "clean": {
+            "pct": 20.7,
+            "abs": 2159
+          }
+        },
+        "y1": {
+          "pct": 6.4,
+          "abs": 684,
+          "start": "2025-09-27",
+          "end": "2026-09-26",
+          "clean": {
+            "pct": 4.2,
+            "abs": 454
+          }
+        },
+        "y2": {
+          "pct": null,
+          "abs": null,
+          "start": "2024-09-27",
+          "end": "2026-09-26",
+          "clean": {
+            "pct": null,
+            "abs": null,
+            "reason": "insufficient observations in one or both equal-length windows"
+          },
+          "reason": "insufficient observations in one or both equal-length windows"
+        }
+      },
+      "anomaly_share": 0.03832116788321168,
+      "trend_direction": "flat",
+      "confidence": "high",
+      "confidence_reasons": [
+        "period at least 730 days",
+        "monthly 30-day views at least 10000",
+        "anomaly share within 5 percent"
+      ],
+      "seasonality": {
+        "months": [],
+        "note": "no recurring peak months identified"
+      },
+      "anomalies": [
+        {
+          "date": "2023-10-15",
+          "value": 15434,
+          "median": 18786
+        },
+        {
+          "date": "2023-11-04",
+          "value": 14114,
+          "median": 18017
+        },
+        {
+          "date": "2024-03-10",
+          "value": 15507,
+          "median": 19361
+        },
+        {
+          "date": "2024-05-19",
+          "value": 10032,
+          "median": 13617
+        },
+        {
+          "date": "2024-06-30",
+          "value": 8365,
+          "median": 10555
+        },
+        {
+          "date": "2024-07-27",
+          "value": 7242,
+          "median": 9098
+        },
+        {
+          "date": "2024-07-28",
+          "value": 7190,
+          "median": 9120
+        },
+        {
+          "date": "2024-09-07",
+          "value": 8003,
+          "median": 10612
+        },
+        {
+          "date": "2024-09-28",
+          "value": 8559,
+          "median": 11844
+        },
+        {
+          "date": "2024-10-19",
+          "value": 8673,
+          "median": 11680
+        },
+        {
+          "date": "2024-10-26",
+          "value": 8375,
+          "median": 11748
+        },
+        {
+          "date": "2024-10-27",
+          "value": 8634,
+          "median": 11687
+        },
+        {
+          "date": "2024-11-10",
+          "value": 9236,
+          "median": 12686
+        },
+        {
+          "date": "2024-11-16",
+          "value": 9131,
+          "median": 12564
+        },
+        {
+          "date": "2024-11-17",
+          "value": 9925,
+          "median": 12564
+        },
+        {
+          "date": "2024-11-26",
+          "value": 17124,
+          "median": 10714
+        },
+        {
+          "date": "2024-12-07",
+          "value": 8401,
+          "median": 11565
+        },
+        {
+          "date": "2024-12-08",
+          "value": 8670,
+          "median": 11565
+        },
+        {
+          "date": "2025-02-22",
+          "value": 9897,
+          "median": 12813
+        },
+        {
+          "date": "2025-03-23",
+          "value": 8173,
+          "median": 10808
+        },
+        {
+          "date": "2025-04-27",
+          "value": 7672,
+          "median": 9863
+        },
+        {
+          "date": "2025-05-17",
+          "value": 7696,
+          "median": 10745
+        },
+        {
+          "date": "2025-05-31",
+          "value": 8050,
+          "median": 9944
+        },
+        {
+          "date": "2025-06-01",
+          "value": 7996,
+          "median": 9944
+        },
+        {
+          "date": "2025-06-22",
+          "value": 7859,
+          "median": 9604
+        },
+        {
+          "date": "2025-06-28",
+          "value": 7677,
+          "median": 9211
+        },
+        {
+          "date": "2025-07-26",
+          "value": 7835,
+          "median": 10516
+        },
+        {
+          "date": "2025-07-27",
+          "value": 8031,
+          "median": 10626
+        },
+        {
+          "date": "2025-08-10",
+          "value": 8365,
+          "median": 10722
+        },
+        {
+          "date": "2025-08-17",
+          "value": 8106,
+          "median": 10232
+        },
+        {
+          "date": "2025-09-07",
+          "value": 8725,
+          "median": 11312
+        },
+        {
+          "date": "2025-11-22",
+          "value": 8763,
+          "median": 11650
+        },
+        {
+          "date": "2025-12-11",
+          "value": 15119,
+          "median": 10920
+        },
+        {
+          "date": "2026-02-05",
+          "value": 15882,
+          "median": 11974
+        },
+        {
+          "date": "2026-03-15",
+          "value": 9049,
+          "median": 11553
+        },
+        {
+          "date": "2026-03-24",
+          "value": 47069,
+          "median": 11574
+        },
+        {
+          "date": "2026-06-02",
+          "value": 12125,
+          "median": 11256
+        },
+        {
+          "date": "2026-06-12",
+          "value": 9085,
+          "median": 10227
+        },
+        {
+          "date": "2026-07-11",
+          "value": 8335,
+          "median": 10179
+        },
+        {
+          "date": "2026-07-15",
+          "value": 11483,
+          "median": 10179
+        },
+        {
+          "date": "2026-07-19",
+          "value": 8131,
+          "median": 10105
+        },
+        {
+          "date": "2026-09-19",
+          "value": 15367,
+          "median": 19196
+        }
+      ]
+    }
+  ]
+}

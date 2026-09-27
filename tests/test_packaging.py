@@ -422,29 +422,37 @@ def test_the_skill_documents_exactly_the_flags_run_all_defines() -> None:
         for option in action.option_strings
         if option.startswith("--")
     }
-    assert {"--spec", "--out", "--verbose"} <= defined, (
+    assert {"--spec", "--out", "--verbose", "--pdf"} <= defined, (
         f"run_all's parser no longer defines the documented flags: {sorted(defined)}"
     )
 
     text = _read(SKILL_MD)
     documented = set(re.findall(r"--[a-z][a-z-]*", text))
-    for flag in ("--spec", "--out", "--verbose"):
+    for flag in ("--spec", "--out", "--verbose", "--pdf"):
         assert flag in documented, f"SKILL.md does not document {flag}"
 
-    # `run_all` owns exactly three flags, so anything else SKILL.md mentions
-    # must belong to a DIFFERENT CLI (the resolver's, or the chart stage's
-    # opt-in --log-scale) - which is checked against the real sibling parsers
-    # rather than against a hand-kept list.
+    # `run_all` owns four flags, so anything else SKILL.md mentions must belong to a
+    # DIFFERENT CLI (the resolver's, or the chart stage's opt-in --log-scale) - which is
+    # checked against the real sibling parsers rather than against a hand-kept list.
     other_stage_flags = {
         option
-        for module in (build_report, __import__("make_charts"), __import__("resolve_articles"))
+        for module in (
+            build_report, __import__("make_charts"),
+            __import__("resolve_articles"), __import__("build_pdf"),
+        )
         for action in module._parser()._actions
         for option in action.option_strings
         if option.startswith("--")
     }
-    known = defined | other_stage_flags
+    # NOT pipeline flags, and named as such rather than left to be "fixed" by a reader who
+    # assumes every `--word` in SKILL.md is one. These belong to the EXTERNAL `winget`
+    # command that installs the typst binary, and the document would be wrong without them
+    # - a `winget install` line that silently drops `--silent` and the agreement flag
+    # prompts, or refuses, on the machine the reader is standing at.
+    external_tool_flags = {"--silent", "--accept-package-agreements"}
+    known = defined | other_stage_flags | external_tool_flags
     unknown = sorted(documented - known)
-    assert not unknown, f"SKILL.md documents flags no stage CLI defines: {unknown}"
+    assert not unknown, f"SKILL.md documents flags no CLI defines: {unknown}"
 
 
 @pytest.mark.slow

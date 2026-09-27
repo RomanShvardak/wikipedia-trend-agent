@@ -480,13 +480,36 @@ consumer reads "not computable" from a field rather than from an absence.
 | `reason` | string | Present exactly when `pct` is absent; the contract's own `reason` for the null window (§2.1). |
 | `bar_null` | boolean | Always written. `true` marks the explicit "hatched n/a" bar. |
 
-#### 7.2.4 The manifest `note` and the on-image disclosure are not the same string
+#### 7.2.4 The manifest `note`, the on-image disclosure, and the report sentence are three readers
 
 The manifest `note` is a **stable ASCII interface string** — the same constant
 regardless of the spec's language, because a machine quotes it verbatim. The
 equivalent disclosure drawn **on the image** is the localized token for the
 document's language, because a reader needs it in their own words. A consumer
 must not assume the two strings are equal, and a test asserts the asymmetry.
+
+**The report's sentence is the localized token too, not the manifest note.**
+This was `FINDING-05` (2026-09-27): `build_report.py` quoted `note` verbatim,
+which put an English line into a `language: "uk"` document — exactly the
+bilingual artefact D-16 exists to prevent, and invisible to every test of the
+arithmetic, because all the numbers were correct.
+
+So the split is by **reader**, not by artifact:
+
+| Reader | String | Language |
+|---|---|---|
+| a machine consuming `charts.json` | `note` | always ASCII, stable |
+| a reader of a PNG | `scales_differ` token | the document's language |
+| a reader of `report.md` | `scales_differ` token | the document's language |
+
+The report still reads the `note` field for one thing: **whether the entry
+carries a disclosure at all**. Membership, not truthiness — `load_charts` has
+already checked that a present note is a string. The `note` key stays in the
+manifest and no key was added, so `charts.v1` is unchanged and this section is
+a clarification, not a version bump.
+
+A missing `scales_differ` translation **fails closed**. The report does not fall
+back to English, because an English fallback here is the defect itself.
 
 ### 7.3 The never-recompute rule
 
@@ -610,12 +633,57 @@ published by an earlier stage, so there is nothing here for it to derive.
 | `charts_sha256` | 64-char lowercase hex | SHA-256 of the **exact `charts.json` bytes the stage read**. |
 | `report_filename` | string | The bare relative name `report.md` — no directory component, so §8.5's join needs no path work. |
 | `metrics_shown` | ordered array of strings | The metric paths the document rendered, grammar `series[i].field` and `series[i].growth.<window>.clean.pct` (§8.6). |
-| `formats` | ordered array of objects | One `{format, filename}` object per published rendering. v1 writes exactly `[{"format": "markdown", "filename": "report.md"}]`. |
+| `formats` | ordered array of objects | One `{format, filename}` object per published rendering, in publication order. §8.1.1 is the membership rule; it is a closed set, not a pattern. |
 
 `formats` is an array of **objects**, not of bare strings, and that is the whole
 point of the shape: a v1.x PDF entry is one appended object and one more file,
 never a rename of the Markdown slot. `report_filename` is the bare relative name
 for the same reason — a consumer resolves it against the directory it was given.
+
+### 8.1.1 The `formats[]` membership rule
+
+`formats` is a **closed set of shapes**, not a free list. Exactly two arrays are legal at
+`report.v1`:
+
+```json
+"formats": [{"format": "markdown", "filename": "report.md"}]
+```
+```json
+"formats": [{"format": "markdown", "filename": "report.md"},
+            {"format": "pdf",     "filename": "report.pdf"}]
+```
+
+Five clauses, each of which a test enforces:
+
+1. **`formats[0]` is always the Markdown entry**, byte for byte
+   `{"format": "markdown", "filename": "report.md"}`. It is the slot `report_filename`
+   names, and the report stage writes it on every run.
+2. **One appended entry is permitted**: `{"format": "pdf", "filename": "report.pdf"}`.
+   The PDF stage (Phase 9) is the first and, at this version, the only consumer of this
+   clause. It **appends**; it never reorders and never rewrites the Markdown slot.
+3. **No other `format` value is legal at this version** — not a third entry, not a
+   renamed Markdown slot, not a speculative future format. An unratified format is a
+   contract change, and a contract change is a version bump plus a decision, not a
+   convenience. A rule that only said "Markdown first, PDF optionally" would silently
+   tolerate a fourth rendering nobody approved; this clause is the one a lazy amendment
+   drops, and the one that keeps the array a contract rather than a suggestion.
+4. **Each entry is an object carrying exactly the two keys `format` and `filename`, and
+   `filename` is a bare relative name** — no `/`, no `\`, no `..`, no drive letter. A
+   consumer joins it against the directory it was given and opens it there; the day a
+   second rendering exists, a path-shaped value here is a traversal vector, not a
+   convenience.
+5. **Appending an array element is NOT a contract version bump.**
+   `contract_version` stays `"report.v1"`. This is the entire reason `formats` was frozen
+   as an array of objects rather than a single string or a scalar slot: the PDF rendering
+   arrives as one appended object, so the contract's version, its top-level key set, and
+   every `§1`–`§8` field it already froze are all untouched. A consumer that reads
+   `report.v1` and does not know the `pdf` format ignores the entry it does not
+   recognise rather than failing on a document it could have read.
+
+The `metrics_shown` pointer list is **not** extended by a second rendering: it enumerates
+the *numbers* a document shows, and a second rendering of the same numbers shows no number
+that is not already listed. A future need to distinguish them is a new key, which is a
+version bump by clause 5's own logic.
 
 `metrics_sha256` and `charts_sha256` are an **integrity and staleness
 mechanism, not a security control**. A consumer compares them against the
@@ -849,3 +917,66 @@ flags are the **whole** surface, because every extra flag is a contract Phase 7'
   would pass against a document the chart stage never writes.
 
 No test may reach the network; every transport is injected or forbidden.
+
+
+### 8.10 `report.pdf` - the optional PDF rendering (Phase 9)
+
+`report.pdf` is a **second rendering of the same report**, not a second report. It carries
+the same numbers and the same localized strings as `report.md`; only the layout differs,
+because the 11-column metrics table cannot fit A4's 17.5 cm of usable width. §8.1.1's
+`formats[]` rule is what admits it, and it is the only place the contract changed.
+
+| Property | Value |
+|---|---|
+| Engine | `pandoc --pdf-engine=typst`, with the committed template `scripts/wti-preamble.typ` |
+| Page | A4 portrait; margins 1.5 / 2.0 / 2.0 / 1.5 cm; a footer carrying the spec name, `as_of` and page N of M |
+| Images | the same `2N+1` inventory `report.md` references, at full content width |
+| Layout of the metrics section | one **card** per series, in place of the 11-column table |
+| Dependencies | **opt-in.** `requirements.txt` is unchanged at one line; `requirements-pdf.txt` holds `pypandoc-binary` and `PyYAML`. The `typst` binary is external and is NOT installable with pip |
+| Sections | the same six, in the same frozen order (`SECTION_TOKEN_KEYS`) |
+| Language | the same fail-closed dictionary gate as `report.md`; a language the report stage refuses is refused here identically |
+
+**Parity, stated mechanically.** The PDF shows exactly the numbers `report.md` shows:
+
+```python
+set(pdf.shown) == set(manifest["metrics_shown"])
+```
+
+Neither a subset nor a superset. Fewer would be a lossy rendering of a document whose whole
+purpose is to stand in for the Markdown; more would be a number no consumer's manifest
+attests to. This single equality is the whole of «паритет» and it is testable.
+
+**One deliberate deviation from byte-parity.** The PDF displays the article title
+**percent-decoded**; `report.md` prints it encoded. `metrics.json` stores it encoded and that
+is frozen - the stored slug is the resolver's AQS cache key and
+`fetch_pageviews.series_url` interpolates it unquoted. The decode is a **display-only**,
+lossless inverse applied on the way into the document: it introduces no number (ANAL-06 is
+untouched), touches neither `metrics.json` nor the cache key, and is not one of the localized
+row strings. On disk, in the manifest, and in `report.md` the slug is still encoded.
+
+**`report.v1` CLI contract for the PDF stage.** Three flags, like every other stage:
+
+```bash
+# normal
+python scripts/build_pdf.py --spec out/spec.json --out out
+
+# part of the pipeline, as the fifth stage
+python scripts/run_all.py --spec out/spec.json --out out --pdf
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | published, and `formats[]` now names it |
+| 1 | a local input, the toolchain, or an integrity failure - missing `pypandoc`, missing `typst`, no installable font family, a chart that could not be fetched, a stale `metrics_sha256`; the message names the action |
+| 2 | an invalid spec, and ONLY from `common.load_and_validate_spec`'s own `SystemExit(2)`, inherited uncaught so a spec problem is indistinguishable at the call site from a spec problem in any other stage |
+
+There is no exit 3. A PDF has no partial result worth naming, and publication is atomic: a
+temporary file in the same directory, then `os.replace`, so a failed render leaves any
+previous `report.pdf` byte-identical and no half-written document behind.
+
+**The render is not allowed to report its own success.** Measured: a bare image name with no
+`--resource-path` makes the converter log `Could not fetch resource`, exit **0**, and produce
+a complete report with that chart replaced by its alt text. Two independent refusals catch
+it - the converter's own logger, which names the missing file, and an exact image-marker
+count measured at two markers per chart - and either alone is sufficient. A report without its
+evidence is worse than no report.

@@ -1,12 +1,18 @@
 [project]
 name = "wikipedia-trend-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Wikipedia Pageviews trend analysis agent skill (stdlib-thin: matplotlib is the sole runtime dependency)"
 requires-python = ">=3.11"
 dependencies = ["matplotlib>=3.11"]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0", "ruff", "mypy"]
+dev = ["pytest>=9.0", "ruff", "mypy", "pypdf>=5.0"]
+# Phase 9's PDF stage. OPTIONAL by construction: `requirements.txt` stays exactly one
+# line so the skill's install contract remains "one package, no resolution step", and a
+# user opts into pandoc deliberately. `pypdf` is NOT here - it is dev-only, because the
+# exact image count is asserted in the integration test and asserting it at runtime would
+# promote a test-only need into the install contract.
+pdf = ["pypandoc-binary", "PyYAML"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -23,7 +29,22 @@ target-version = "py311"
 
 [tool.mypy]
 python_version = "3.11"
-mypy_path = ["scripts"]
+# `typings` is Phase 9's: it holds `pypandoc/__init__.pyi`, a local stub declaring the
+# four-argument surface this project uses. It is a POSITIVE statement of that surface
+# rather than a suppression, and it types the import when `pypandoc` is not installed.
+#
+# NO new `[[tool.mypy.overrides]]` block was added for it, and that is a measured result
+# rather than an oversight. `pypandoc` is installed in the phase-local .venv without a
+# `py.typed` marker, which normally makes mypy raise `import-untyped` — a code
+# `ignore_missing_imports` does not cover, and a per-module `disable_error_code` does not
+# cover either, because an import error is reported at the IMPORT SITE. All three escape
+# hatches were tried and all three were found to be solving a problem that did not exist:
+# with `no_site_packages = true` — the line 05-06 identified as load-bearing — mypy never
+# sees the installed package at all, so `import-untyped` never arises. The gate needed to
+# be RUN FROM THIS DIRECTORY to see that; run from the repository root it picks up no
+# configuration whatsoever and reports an error that has nothing to do with this project.
+# See `mypy_path` above and STATE.md's standing constraint on verification records.
+mypy_path = ["scripts", "typings"]
 no_site_packages = true
 
 # Typing gate: `mypy scripts --strict` must reach and check THIS project's
@@ -73,3 +94,19 @@ no_site_packages = true
 module = ["matplotlib", "matplotlib.*"]
 follow_imports = "skip"
 ignore_missing_imports = true
+
+# Phase 9 adds a SECOND third-party import, which makes the "matplotlib is the only
+# third-party import anywhere in scripts/" claim in the comment above FALSE as of 09-04.
+# The claim is corrected here rather than left to rot: a documented invariant that has
+# quietly stopped being true is how the next reader stops trusting this file.
+#
+# `pypandoc` needs NO override block at all: `typings/pypandoc.pyi` (on `mypy_path`
+# above) declares the four-argument surface this project uses, which is a POSITIVE
+# statement where `ignore_missing_imports`, a per-module `disable_error_code`, and a
+# global `follow_untyped_imports` were each measured and each rejected. The reasoning, and
+# the trade this accepts, are in that stub's docstring.
+#
+# What IS load-bearing here is that the import stays LAZY, inside `render_pdf`:
+# `pypandoc` is absent from the phase-local .venv by default, so a module-level import
+# would break pytest COLLECTION for every test that imports `build_pdf`. An AST test
+# enforces the laziness.
