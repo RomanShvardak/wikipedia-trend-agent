@@ -48,7 +48,7 @@ with code 2 (D-08).
 |---|---|---|
 | `id` | yes | Stable series id; becomes `series_id` in `metrics.json` (see §3) |
 | `project` | yes | Project code, e.g. `pl.wikipedia`, `uk.wikipedia`, `cs.wikipedia` |
-| `article` | yes | Article slug with underscores, no project prefix (e.g. `Post_przerywany`) |
+| `article` | yes | Article slug with underscores, no project prefix (e.g. `Intermittent_fasting`; percent-encoded when the title has non-ASCII characters, exactly as §6.3 emits it) |
 | `label` | yes | Human-readable label for charts/report, e.g. `"Польська: інтервальне голодування"` |
 | `language` | yes | Language code, e.g. `"pl"`, `"cs"` |
 
@@ -334,17 +334,23 @@ serialization, the **last completed atomic replace wins**.
 # run 1 — discovery
 python scripts/resolve_articles.py --topic "intermittent fasting" \
   --projects en.wikipedia --projects pl.wikipedia \
-  --topic-for pl.wikipedia="Post przerywany" \
+  --topic-for pl.wikipedia="Głodówka lecznicza" \
   --out out/resolved.json --ttl-hours 24
 
 # run 2 — offline confirmation
 python scripts/resolve_articles.py --topic "intermittent fasting" \
   --projects en.wikipedia --projects pl.wikipedia \
-  --topic-for pl.wikipedia="Post przerywany" \
+  --topic-for pl.wikipedia="Głodówka lecznicza" \
   --out out/resolved.json \
   --select en.wikipedia=Intermittent_fasting \
-  --select pl.wikipedia=Post_przerywany
+  --select pl.wikipedia=G%C5%82od%C3%B3wka_lecznicza
 ```
+
+Both `pl.wikipedia` strings are probe-verified live: `Post przerywany` is not an
+article in pl.wikipedia at all, and `Głodówka lecznicza` (pageid 74017) is the
+nearest existing one. Candidates carry the **percent-encoded** title
+(`quote(title, safe="")`) and that encoded form is what `--select` and
+`spec.series[].article` both take.
 
 Flags: required `--topic`; ordered `--projects`; repeatable `--topic-for
 PROJECT=QUERY` and `--select PROJECT=ARTICLE`; `--out` (default

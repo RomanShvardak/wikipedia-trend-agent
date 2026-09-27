@@ -40,7 +40,7 @@ _VALID_GRANULARITIES = {"daily"}
 _SERIES_FIELD_FIX = {
     "id": 'add "id" like "pl-post-przerywany"',
     "project": 'add "project" like "pl.wikipedia"',
-    "article": 'add "article" like "Post_przerywany"',
+    "article": 'add "article" like "Intermittent_fasting"',
     "label": 'add "label" like "Польська: інтервальне голодування"',
     "language": 'add "language" like "pl"',
 }
