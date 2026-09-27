@@ -85,7 +85,12 @@ The spec is committed: `assets/example.intermittent-fasting.json`.
 The output below is **real output from the shipped report stage**, rendered
 over the committed regression corpus (`tests/fixtures/series.example.csv` +
 `metrics.example.json`) — a synthetic, deterministic dataset, *not* a live
-capture. Reproducing it against the real API takes one command:
+capture. The two article names in it are the *contract fixture's* labels
+(`tests/fixtures/spec.example.json`) over invented numbers, so they are not
+probe-verified live articles either; this block exists to show the document's
+shape, and `tests/test_publish.py` re-renders it on every test run to prove it
+is not hand-typed. **For what the real API says about these two Wikipedias,
+read the live run below.** Reproducing that takes one command:
 
 ```bash
 python scripts/run_all.py --spec assets/example.intermittent-fasting.json --out out
@@ -145,6 +150,71 @@ the raw and the spike-excluded one-year readings agree in direction, not that
 interest is rising. `н/д` is "not computable", never zero. For what
 `confidence` and its reasons mean, and what you may say out loud, read
 [`references/INTERPRETATION.md`](references/INTERPRETATION.md).
+
+### What the live API actually says
+
+The block above is a shape demonstration. This one is the **live run** of the
+command above, against Wikimedia on 2026-09-27, for the committed
+`assets/example.intermittent-fasting.json` — `## Графіки` and
+`## Обмеження та припущення` omitted for length, every other line verbatim from
+`out/report.md`:
+
+```markdown
+# Аналіз переглядів Wikipedia
+
+## Висновок
+
+- Польська: голодування загалом (найближча наявна стаття, не інтервальне) · 3M вікно: +9.1% · на основі 8.0 Переглядів/день
+- Польська: голодування загалом (найближча наявна стаття, не інтервальне) · 1Y вікно: -38.5% · на основі 8.0 Переглядів/день
+- Польська: голодування загалом (найближча наявна стаття, не інтервальне) · 2Y вікно: н/д (недостатньо спостережень в одному або в обох однакових за довжиною вікнах) · на основі 8.0 Переглядів/день
+- Чеська: інтервальне голодування · 3M вікно: -24.4% · на основі 9.2 Переглядів/день
+- Чеська: інтервальне голодування · 1Y вікно: -44.5% · на основі 9.2 Переглядів/день
+- Чеська: інтервальне голодування · 2Y вікно: н/д (недостатньо спостережень в одному або в обох однакових за довжиною вікнах) · на основі 9.2 Переглядів/день
+
+## Метрики
+
+Дані станом на 2026-09-20
+
+| Тема | Проєкт | Стаття | Мова | Період | Усього переглядів | Переглядів/день | Зростання | Напрям | Впевненість | Частка аномалій |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Польська: голодування загалом (найближча наявна стаття, не інтервальне) | pl.wikipedia | G%C5%82od%C3%B3wka_lecznicza | pl | 2024-09-23..2026-09-20 (728) | 5,814 | 8.0 | 3M +9.1% / 1Y -38.5% / 2Y н/д (недостатньо спостережень в одному або в обох однакових за довжиною вікнах) | шум | низька | 0.017881705639614855 |
+| Чеська: інтервальне голодування | cs.wikipedia | P%C5%99eru%C5%A1ovan%C3%BD_p%C5%AFst | cs | 2024-09-23..2026-09-20 (728) | 6,708 | 9.2 | 3M -24.4% / 1Y -44.5% / 2Y н/д (недостатньо спостережень в одному або в обох однакових за довжиною вікнах) | шум | низька | 0.03310344827586207 |
+
+## Наскільки можна довіряти
+
+- Польська: голодування загалом (найближча наявна стаття, не інтервальне): гіпотеза: низька — період щонайменше 91 день; переглядів за 30 днів менше 1000; частка аномалій у межах 5 відсотків; низька впевненість: трактуйте значення як гіпотезу
+- Чеська: інтервальне голодування: гіпотеза: низька — період щонайменше 91 день; переглядів за 30 днів менше 1000; частка аномалій у межах 5 відсотків; низька впевненість: трактуйте значення як гіпотезу
+```
+
+**Both series land in `low` confidence, and that is the correct answer.** At
+8.0 and 9.2 views/day they are roughly 215 and 248 views a month — well under
+the 1000-per-month noise floor — so `шум` (noise) is what the analyzer is
+supposed to return, and the percentages above are reported only so the reader
+can see *why* they should not be quoted. The `-38.5%` and `-44.5%` one-year
+figures are what a 3-views-a-day series does when a single popular week moves
+across the window boundary. Do not report them as declines in fasting
+interest; `references/INTERPRETATION.md` says what a `low` reading licenses you
+to say.
+
+**The two series are not the same topic, and the spec says so.**
+`cs.wikipedia/Přerušovaný půst` is a dedicated intermittent-fasting article.
+`pl.wikipedia` has **no** intermittent-fasting article at all — the resolver
+searches for `post przerywany`, `głodzenie przerywane`, `głodówka przerywana`,
+`przerywany` and `16:8` and finds no matching title, and the Action API reports
+`missing` for each candidate. The nearest article that exists is
+`Głodówka lecznicza` ("therapeutic fasting"), which covers fasting in general
+and says so itself. So this example measures interest in **adjacent topics**,
+not two renderings of one schedule, and the spec's `assumptions` say exactly
+that in the words a reader of `out/report.md` will see. The `request` field
+keeps the user's original question verbatim, because that field is *the user's
+request* — the caveat about what could actually be measured belongs in
+`assumptions`, not in the user's mouth.
+
+This is the honest version of the example. A specification that quietly
+swapped in higher-volume articles to make the numbers look better would be
+answering a different question than the one asked, and the whole point of the
+`low` verdict is that the pipeline refuses to dress up a reading it cannot
+support.
 
 ## The honesty contract
 

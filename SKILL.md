@@ -116,7 +116,7 @@ Discovery:
 python scripts/resolve_articles.py \
   --topic "intermittent fasting" \
   --projects en.wikipedia --projects pl.wikipedia \
-  --topic-for pl.wikipedia="Post przerywany" \
+  --topic-for pl.wikipedia="głodówka" \
   --out out/resolved.json --ttl-hours 24
 ```
 
@@ -126,11 +126,22 @@ Offline confirmation:
 python scripts/resolve_articles.py \
   --topic "intermittent fasting" \
   --projects en.wikipedia --projects pl.wikipedia \
-  --topic-for pl.wikipedia="Post przerywany" \
+  --topic-for pl.wikipedia="głodówka" \
   --out out/resolved.json \
   --select en.wikipedia=Intermittent_fasting \
-  --select pl.wikipedia=Post_przerywany
+  --select pl.wikipedia=G%C5%82od%C3%B3wka_lecznicza
 ```
+
+`--select PROJECT=ARTICLE` is **candidate-bounded**: the article must be one the
+saved discovery run offered, or confirmation is refused. That is why the
+`--topic-for` query and the `--select` value above are a pair — a slug you
+remember (`Post_przerywany`) may name no article at all, and selecting it would
+be rejected rather than silently creating one. Note also that pl.wikipedia has
+no dedicated intermittent-fasting article: `Głodówka lecznicza` is fasting in
+general, so a spec built from it must say in its `assumptions` that the two
+series are not the same topic. Candidates carry the article **percent-encoded**
+(`quote(title, safe="")`), and that encoded form is what goes verbatim into
+`spec.series[].article`.
 
 Resolver flags: required `--topic`; ordered `--projects`; repeatable
 `--topic-for` and `--select`; `--out` (default `out/resolved.json`);
