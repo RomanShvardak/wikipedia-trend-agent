@@ -4,21 +4,25 @@
   "language": "uk",
   "window": { "start": "20240923", "end": "20260920", "granularity": "daily" },
   "assumptions": [
-    "тема представлена однією статтею в кожному розділі",
-    "слаги статей перевірені через resolve_articles.py"
+    "тема представлена однією статтею в кожному розділі — для cs.wikipedia це так, для pl.wikipedia ні (див. наступний пункт)",
+    "слаги статей перевірені через resolve_articles.py: обидва існують (action=query&titles= повертає pageid, AQS відповідає 200)",
+    "у pl.wikipedia немає окремої статті про інтервальне голодування. Пошук за post przerywany / głodzenie przerywane / głodówka przerywana / przerywany / 16:8 не повертає відповідної статті, а action=query&titles= повідомляє missing для Post_przerywany, Głodzenie_przerywane, Głodówka_przerywana, Post_przerywany_(dieta). Найближча наявна стаття — Głodówka_lecznicza, і вона описує голодування загалом (у т.ч. лікувальне), а не інтервальний розклад",
+    "обидва слаги відтворюють те, що видає resolve_articles.py (percent-encoded, safe=\"\"), і передаються у AQS URL без жодного перекодування",
+    "дві серії вимірюють НЕ строго однакову тему: cs.wikipedia/Přerušovaný půst — окрема стаття саме про інтервальне голодування, тоді як pl.wikipedia/Głodówka lecznicza — про голодування загалом. Порівняння вимірює інтерес до суміжних тем, а не до одного й того самого розкладу",
+    "обидві серії нижчі за поріг шуму 1000 переглядів на місяць, тому результат низької впевненості є очікуваним і не є виправом специфікації"
   ],
   "series": [
     {
       "id": "pl-post-przerywany",
       "project": "pl.wikipedia",
-      "article": "Post_przerywany",
-      "label": "Польська: інтервальне голодування",
+      "article": "G%C5%82od%C3%B3wka_lecznicza",
+      "label": "Польська: голодування загалом (найближча наявна стаття, не інтервальне)",
       "language": "pl"
     },
     {
       "id": "cs-pust-prerusovany",
       "project": "cs.wikipedia",
-      "article": "P%C5%AFst_p%C5%99eru%C5%A1ovan%C3%BD",
+      "article": "P%C5%99eru%C5%A1ovan%C3%BD_p%C5%AFst",
       "label": "Чеська: інтервальне голодування",
       "language": "cs"
     }
